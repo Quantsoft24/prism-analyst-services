@@ -1,0 +1,42 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ──
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Environment ──
+.env
+.env.local
+.env.production
+
+# ── SSL certs ──
+*.pem
+*.crt
+*.key
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Test/Coverage ──
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ── Docker ──
+docker-compose.override.yml

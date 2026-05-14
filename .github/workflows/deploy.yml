@@ -1,0 +1,64 @@
+name: 🚀 Deploy Backend to Production
+
+on:
+  push:
+    branches: [production]
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+
+    steps:
+      - name: 🔐 Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          command_timeout: 10m
+          script: |
+            set -e
+
+            echo "═══════════════════════════════════════════"
+            echo "  PRISM Backend — Production Deployment"
+            echo "═══════════════════════════════════════════"
+
+            cd ~/PRISM/prism-analyst-services
+
+            echo "📥 Pulling latest production code..."
+            git fetch origin production
+            git checkout production
+            git pull origin production
+
+            echo "🔨 Building Docker image..."
+            docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml build --no-cache backend
+
+            echo "🚀 Restarting backend..."
+            docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml up -d backend
+
+            echo "⏳ Waiting for health check..."
+            sleep 5
+
+            echo "🩺 Verifying backend..."
+            if curl -sf http://localhost:8000/health | grep -q '"status":"ok"'; then
+              echo "✅ Backend is healthy"
+            else
+              echo "❌ Backend health check failed!"
+              docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml logs backend --tail 30
+              exit 1
+            fi
+
+            echo "🧹 Cleaning old images..."
+            docker image prune -f
+
+            echo ""
+            echo "═══════════════════════════════════════════"
+            echo "  ✅ Backend deployment complete!"
+            echo "═══════════════════════════════════════════"
