@@ -13,7 +13,6 @@ jobs:
     name: Deploy to EC2
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    environment: production
 
     steps:
       - name: 🔐 Deploy via SSH
@@ -43,8 +42,8 @@ jobs:
             echo "🚀 Restarting backend..."
             docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml up -d backend
 
-            echo "⏳ Waiting for health check..."
-            sleep 5
+            echo "⏳ Waiting for backend to start..."
+            sleep 10
 
             echo "🩺 Verifying backend..."
             if curl -sf http://localhost:8000/health | grep -q '"status":"ok"'; then
