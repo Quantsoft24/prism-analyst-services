@@ -19,6 +19,8 @@ Contract with the sidecar (see docling-service/app.py):
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath, PureWindowsPath
+
 import httpx
 
 from src.config import settings
@@ -38,7 +40,11 @@ class DoclingParser(PdfParser):
         self._timeout = timeout or settings.DOCLING_TIMEOUT_SECONDS
 
     async def parse(self, pdf_bytes: bytes, *, filename: str | None = None) -> ParsedDocument:
-        files = {"file": (filename or "document.pdf", pdf_bytes, "application/pdf")}
+        # Send ONLY a basename — never directory components. The sidecar writes
+        # the upload to ``tmp_dir / filename``; a key like "TCS/abc.pdf" would
+        # need a non-existent subdir and fail. Strip both posix + windows seps.
+        safe_name = _basename(filename) or "document.pdf"
+        files = {"file": (safe_name, pdf_bytes, "application/pdf")}
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 resp = await client.post(f"{self._url}/parse", files=files)
@@ -81,3 +87,15 @@ class DoclingParser(PdfParser):
                 return resp.status_code == 200
         except httpx.HTTPError:
             return False
+
+
+def _basename(name: str | None) -> str:
+    """Strip any directory components (posix OR windows) from ``name``.
+
+    The storage key we pass around uses ``/`` separators (e.g. "TCS/abc.pdf");
+    we must never let that reach a filesystem-path join on the sidecar.
+    """
+    if not name:
+        return ""
+    # Take the last component under either separator convention.
+    return PureWindowsPath(PurePosixPath(name).name).name

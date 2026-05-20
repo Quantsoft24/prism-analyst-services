@@ -13,10 +13,33 @@ When scheduled multi-source ingestion becomes operationally critical
 their internals.
 """
 
+from src.services.ingestion.chunker import Chunk, Chunker
+from src.services.ingestion.fetcher import FetchedDocument, fetch_document
+from src.services.ingestion.parser import (
+    ParsedDocument,
+    ParsedPage,
+    PdfParser,
+    get_parser,
+)
+from src.services.ingestion.pipeline import IngestionResult, IngestionService
 from src.services.ingestion.registry import (
     FilingsRegistry,
     IngestionSource,
     load_registry,
 )
 
-__all__ = ["FilingsRegistry", "IngestionSource", "load_registry"]
+__all__ = [
+    "FilingsRegistry",
+    "IngestionSource",
+    "load_registry",
+    "Chunk",
+    "Chunker",
+    "PdfParser",
+    "ParsedDocument",
+    "ParsedPage",
+    "get_parser",
+    "fetch_document",
+    "FetchedDocument",
+    "IngestionService",
+    "IngestionResult",
+]

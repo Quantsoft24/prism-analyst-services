@@ -18,5 +18,6 @@ company lookup tools.
 """
 
 from src.tools.company_tools import COMPANY_TOOLS
+from src.tools.filing_tools import FILING_TOOLS
 
-__all__ = ["COMPANY_TOOLS"]
+__all__ = ["COMPANY_TOOLS", "FILING_TOOLS"]

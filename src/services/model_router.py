@@ -190,6 +190,40 @@ class ModelRouter:
 
         return LiteLlm(model=virtual_model_name(tier))
 
+    async def acomplete(
+        self,
+        tier: Tier,
+        messages: list[dict],
+        *,
+        temperature: float = 0.2,
+        response_json: bool = False,
+    ) -> str:
+        """Single chat completion via a tier — for non-agent structured calls.
+
+        Used by deterministic generators (e.g. BMC Phase 2 Lite's per-block
+        summarization) that want one grounded LLM call, not a full agent loop.
+        Goes through ``litellm.Router.acompletion`` so it gets the same
+        multi-key load balancing + 429 cooldown + fallback as everything else.
+
+        Returns the assistant message text. ``response_json=True`` requests
+        JSON output where the provider supports it (best-effort — callers
+        should still parse defensively).
+        """
+        if self._router is None:
+            raise RuntimeError("ModelRouter.build() must be called before acomplete().")
+
+        kwargs: dict[str, Any] = {
+            "model": virtual_model_name(tier),
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if response_json:
+            # Gemini honors this; harmless where unsupported.
+            kwargs["response_format"] = {"type": "json_object"}
+
+        response = await self._router.acompletion(**kwargs)
+        return response.choices[0].message.content or ""
+
     async def aembed(self, texts: list[str], *, dimensions: int | None = None) -> list[list[float]]:
         """Embed a batch of texts via the ``embedding`` tier.
 

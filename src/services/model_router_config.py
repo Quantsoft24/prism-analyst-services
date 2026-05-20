@@ -89,9 +89,18 @@ TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
         "tpm": 200_000,
     },
     "embedding": {
-        "description": "Vector embedding for retrieval (Slice 5 consumer).",
+        # IMPORTANT: exactly ONE embedding model. Mixing embedding models
+        # corrupts the shared vector space (cosine distances across models are
+        # meaningless), which silently wrecks retrieval. Resilience comes from
+        # the router replicating this ONE model across multiple API keys — NOT
+        # from falling back to a different model. To change the embedding model
+        # you must re-embed the whole corpus (a migration), never hot-swap.
+        #
+        # ``gemini-embedding-001`` is the current GA Gemini embedding model on
+        # the Developer API (verified available; supports output_dimensionality
+        # truncation to settings.EMBEDDING_DIMENSION via Matryoshka).
+        "description": "Vector embedding for retrieval. Single model, multi-key for resilience.",
         "models": [
-            "gemini/gemini-embedding-002",      # 100 RPM / 1k RPD per key
             "gemini/gemini-embedding-001",
         ],
         "rpm": 80,

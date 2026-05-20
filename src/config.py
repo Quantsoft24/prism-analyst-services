@@ -125,9 +125,11 @@ class Settings(BaseSettings):
     PARSER_BACKEND: str = "pdfplumber"
     # URL of the docling sidecar service (only used when PARSER_BACKEND=docling).
     DOCLING_SERVICE_URL: str = "http://localhost:8100"
-    # Timeout for a single parse request to the sidecar (financial PDFs +
-    # layout models can be slow on first model load).
-    DOCLING_TIMEOUT_SECONDS: int = 180
+    # Timeout for a single parse request to the sidecar. docling on CPU is
+    # SLOW (observed ~400s for a fact sheet incl. first-call model download),
+    # so this is generous. On GPU it drops to seconds. pdfplumber (the default)
+    # ignores this entirely.
+    DOCLING_TIMEOUT_SECONDS: int = 600
 
     # ── Chunking (Slice 5B) ──
     # Target chunk size in tokens. ~512 balances retrieval granularity against

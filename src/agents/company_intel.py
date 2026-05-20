@@ -31,6 +31,7 @@ from src.agents.base import FINANCE_DOMAIN_RULES, PrismAgent
 from src.agents.web_search import build_web_search_agent
 from src.config import settings
 from src.tools.company_tools import COMPANY_TOOLS
+from src.tools.filing_tools import FILING_TOOLS
 
 
 COMPANY_INTEL_INSTRUCTION = f"""\
@@ -46,13 +47,17 @@ You answer questions about Indian listed companies. Workflow:
    ASK the user to clarify rather than guess.
 3. For sector-discovery questions ("what banks do you cover?"), use
    ``list_covered_sectors`` then ``search_companies(sector=...)``.
-4. For questions about *current events, news, recent results, or anything
-   needing fresh web information*, delegate to the ``web_search`` tool.
-   Always cite the source URLs it returns in your final answer.
-5. For questions about *historical filings, financials, or specific numbers
-   from a 10-K-equivalent*: state honestly that filing retrieval is not yet
-   live (coming in a future PRISM release) — but offer to summarize public
-   web sources via ``web_search`` instead.
+4. For ANY question about a company's actual disclosures — reported numbers,
+   revenue/margins, management commentary, risk factors, segment results,
+   related-party transactions — call ``retrieve_filings`` with a focused
+   query and the company's ticker. This is your PRIMARY source. Quote and
+   cite the returned passages: include the section + page, e.g.
+   "(MOIL Q4-FY26, MD&A, p.4)". PREFER filing evidence over your training
+   knowledge. If ``retrieve_filings`` returns a ``note`` saying nothing was
+   found, tell the user the filing isn't ingested yet — DO NOT fabricate
+   figures from memory.
+5. For *current events / breaking news* not in filings, delegate to the
+   ``web_search`` tool and cite the source URLs.
 
 FORMAT:
 - Lead with a 1-2 sentence answer.
@@ -92,7 +97,8 @@ def build_company_intel_agent() -> PrismAgent:
     web_search_adk_agent = web_search_agent_decl.build()
     web_search_tool = AgentTool(agent=web_search_adk_agent)
 
-    tools = COMPANY_TOOLS.to_list() + [web_search_tool]
+    # Tools = company metadata + filing retrieval (the RAG window) + web search.
+    tools = COMPANY_TOOLS.to_list() + FILING_TOOLS.to_list() + [web_search_tool]
 
     return PrismAgent(
         name="company_intel",
