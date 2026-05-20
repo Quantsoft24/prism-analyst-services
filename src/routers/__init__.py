@@ -1,8 +1,13 @@
-"""PRISM Routers — FastAPI route handlers.
+"""FastAPI routers — one module per resource.
 
-This package will contain:
-- chat.py: POST /api/v1/ask (SSE streaming)
-- companies.py: GET /api/v1/companies
-- search.py: POST /api/v1/search
-- citations.py: GET /api/v1/citations/{ref}
+Each router is mounted under ``settings.API_PREFIX`` (``/api/v1``) in
+``src/main.py``. All routes are documented via FastAPI's auto-generated
+OpenAPI spec at ``/docs`` (dev) — that spec is the contract third-party
+consumers depend on.
 """
+
+from src.routers.chat import router as chat_router
+from src.routers.companies import router as companies_router
+from src.routers.router_health import router as router_health_router
+
+__all__ = ["companies_router", "chat_router", "router_health_router"]

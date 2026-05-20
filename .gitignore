@@ -40,3 +40,7 @@ htmlcov/
 
 # ── Docker ──
 docker-compose.override.yml
+
+# ── Local filing storage (raw PDFs ingested in dev) ──
+# Production uses S3; dev writes here via FILINGS_STORAGE_URL=file://./.data/filings
+.data/

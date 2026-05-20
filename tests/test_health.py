@@ -1,24 +1,22 @@
-"""Test suite for PRISM Analyst Services health check."""
+"""Smoke tests for system endpoints."""
 
-from fastapi.testclient import TestClient
+from __future__ import annotations
 
-from src.main import app
-
-client = TestClient(app)
+import pytest
 
 
-def test_health_check():
-    """Health check endpoint returns ok status."""
-    response = client.get("/health")
+@pytest.mark.asyncio
+async def test_health_check(client):
+    response = await client.get("/health")
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
     assert data["service"] == "prism-analyst-services"
 
 
-def test_root_endpoint():
-    """Root endpoint returns service metadata."""
-    response = client.get("/")
+@pytest.mark.asyncio
+async def test_root_endpoint(client):
+    response = await client.get("/")
     assert response.status_code == 200
     data = response.json()
     assert data["service"] == "PRISM Analyst Services"

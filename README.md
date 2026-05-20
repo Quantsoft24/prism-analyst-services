@@ -1,143 +1,200 @@
 # PRISM Analyst Services
 
 > **AI-powered equity research platform — backend API.**
-> Provides health checks, agent orchestration, and data services for the PRISM frontend.
+> FastAPI + PostgreSQL + Google ADK (Phase 3). India-first agentic workspace
+> for financial analysts.
 
 ## Architecture
 
 ```
-api.thequantsoft.co.in → Nginx → FastAPI (:8000)
+api.thequantsoft.co.in → Nginx → FastAPI (:8000) → PostgreSQL (Neon / RDS)
 ```
 
-Part of the PRISM platform:
+Companion repos in the PRISM platform:
 - **Frontend**: [prism-analyst-platform](https://github.com/Quantsoft24/prism-analyst-platform) — Next.js 15
-- **Backend**: This repo — FastAPI
 - **Landing**: Bundled in frontend repo — Express.js
 
-## Tech Stack
+## Tech stack
 
-| Layer     | Technology                                    |
-|-----------|-----------------------------------------------|
-| Framework | FastAPI, Pydantic Settings                    |
-| Agent     | Google ADK (Phase 2+)                         |
-| LLM       | Gemini (primary) → OpenRouter (fallback)      |
-| Database  | PostgreSQL — provider-agnostic (optional)      |
-| Language  | Python 3.12+                                  |
-| Infra     | Docker, GitHub Actions, Nginx (via frontend)  |
+| Layer | Choice |
+|-------|--------|
+| Web framework | FastAPI + Pydantic v2 |
+| ORM / migrations | SQLAlchemy 2.x (async) + Alembic |
+| Database | PostgreSQL 16 (Neon for dev/staging, AWS RDS for prod) |
+| Agent runtime | Google ADK (Phase 3) |
+| LLM routing | Gemini (primary) → OpenRouter (fallback) via LiteLLM (Phase 2) |
+| Tests | pytest + httpx async client + real Postgres |
+| CI | GitHub Actions (lint + migrate + test against Postgres service) |
+| Language | Python 3.12+ |
 
-## Project Structure
+## Project structure
 
 ```
 prism-analyst-services/
 ├── src/
-│   ├── main.py              # FastAPI app entrypoint
-│   ├── config.py            # Pydantic Settings (all env vars)
-│   ├── agents/              # Google ADK agent definitions (Phase 2)
-│   ├── tools/               # ADK tool functions (Phase 2)
-│   ├── routers/             # FastAPI route handlers (Phase 2)
-│   ├── services/            # Business logic layer (Phase 2)
-│   ├── repositories/        # Data access layer (Phase 2)
-│   ├── schemas/             # Pydantic request/response models (Phase 2)
-│   └── core/                # Infrastructure (DB, middleware, logging)
-├── tests/                   # pytest test suite
+│   ├── main.py              # FastAPI app entrypoint + lifespan
+│   ├── config.py            # Pydantic Settings (env-driven)
+│   ├── core/
+│   │   ├── database.py      # Async engine, session factory, FastAPI dep
+│   │   └── auth.py          # Auth dependency (dev-mode stub for now)
+│   ├── models/              # SQLAlchemy ORM models
+│   │   ├── base.py          # Declarative base + mixins
+│   │   ├── firm.py          # Firm (tenant)
+│   │   ├── user.py          # User, FirmMembership
+│   │   └── company.py       # Company, CompanyAlias
+│   ├── repositories/        # Data access layer
+│   │   └── company_repo.py
+│   ├── schemas/             # Pydantic request/response shapes
+│   │   ├── common.py        # Pagination envelope
+│   │   └── company.py
+│   ├── routers/             # FastAPI route modules
+│   │   └── companies.py     # GET /api/v1/companies (+ /{id_or_ticker})
+│   ├── agents/              # Google ADK agents (Phase 3)
+│   ├── tools/               # Agent-callable tools (Phase 2+)
+│   └── services/            # Business logic layer (Phase 2+)
+├── alembic/
+│   ├── env.py
+│   └── versions/            # Numbered migration files
+├── tests/
+│   ├── conftest.py          # Async DB fixtures (savepoint rollback)
+│   ├── test_health.py
+│   └── test_companies.py    # End-to-end against real Postgres
 ├── .github/workflows/
-│   ├── ci.yml               # Lint + test on PR
-│   └── deploy.yml           # Auto-deploy on push to production
-├── Dockerfile               # Production image (python:3.12-slim + uvicorn)
-├── pyproject.toml            # Dependencies + dev tools config
-└── .env.example              # Environment template
+│   ├── ci.yml               # Lint + Alembic + pytest with PG service
+│   └── deploy.yml           # SSH deploy on push to production
+├── alembic.ini
+├── Dockerfile
+├── pyproject.toml
+└── .env.example
 ```
 
-## Local Development
+## Local development
 
 ### Prerequisites
+
 - Python 3.12+
-- pip
+- PostgreSQL 16 (one of):
+  - **[Neon](https://neon.tech)** — free tier, recommended for dev/staging.
+    Sign up, create a project, copy the connection string.
+  - **Local Docker:** `docker run -e POSTGRES_PASSWORD=postgres -p 5432:5432 -d postgres:16-alpine`
 
 ### Setup
+
 ```bash
 git clone https://github.com/Quantsoft24/prism-analyst-services.git
 cd prism-analyst-services
 
 python -m venv .venv
 .venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS/Linux
+# source .venv/bin/activate     # macOS / Linux
 
 pip install -e ".[dev]"
 
 cp .env.example .env
-# Edit .env with your credentials (database is optional)
+# Edit .env — at minimum set DATABASE_URL.
 ```
 
-### Run
+### Apply migrations + run
+
 ```bash
+alembic upgrade head           # Creates schema + seeds 10 NSE companies
 uvicorn src.main:app --reload --port 8000
 ```
 
-Visit [http://localhost:8000/health](http://localhost:8000/health)
+Open:
+- API: <http://localhost:8000/api/v1/companies>
+- Health: <http://localhost:8000/health>
+- Swagger UI: <http://localhost:8000/docs> (DEBUG=true only)
 
-### Test
+### Tests
+
+Tests hit a **real** Postgres — no mocks. Locally, create a separate test DB:
+
 ```bash
+# One-time: create the test database
+createdb prism_test
+# (or via docker: docker exec -it <pg-container> psql -U postgres -c "CREATE DATABASE prism_test")
+
+# Apply migrations to the test DB
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/prism_test \
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/prism_test \
+alembic upgrade head
+
+# Run tests
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/prism_test \
 pytest tests/ -v
+```
+
+CI does the same automatically against a Postgres service container.
+
+### Lint
+
+```bash
 ruff check src/ tests/
+ruff format src/ tests/
 ```
 
-## Environment Variables
+## Database
 
-```env
-# Required
-HOST=0.0.0.0
-PORT=8000
-DEBUG=false
-CORS_ORIGINS=["https://prism.thequantsoft.co.in"]
-AUTH_ENABLED=false
+### Migrations
 
-# Database (OPTIONAL — any PostgreSQL provider)
-# DB_HOST=your-host.rds.amazonaws.com
-# DB_PORT=5432
-# DB_NAME=postgres
-# DB_USER=postgres
-# DB_PASSWORD=your-password
-# DB_SSL_MODE=verify-ca
-# DB_SSL_ROOT_CERT=/app/global-bundle.pem
-
-# LLM Keys (Phase 2)
-# GEMINI_API_KEY=your-key
-# OPENROUTER_API_KEY=your-key
-
-# Web Search (Phase 2)
-# TAVILY_API_KEY=your-key
+```bash
+alembic upgrade head                            # apply all
+alembic downgrade -1                            # roll back one
+alembic revision --autogenerate -m "add foo"    # create a new migration
 ```
 
-## Production Deployment
+Migrations are numbered with the date prefix (e.g. `20260517_0001_*`) for
+chronological clarity. Both schema and seed migrations live in
+`alembic/versions/`.
 
-### Docker (standalone)
+### Provider notes
+
+- **Neon (recommended for dev/staging).** `DATABASE_URL` is a single string;
+  enable `?sslmode=require`. Set `DB_SSL_MODE=require`. pgvector is
+  pre-installed when we need it in Phase 2.
+- **AWS RDS (prod).** Set `DB_SSL_MODE=verify-ca` and download the AWS RDS
+  CA bundle. Use `ap-south-1` (Mumbai) for data residency.
+
+## API endpoints (Phase 1)
+
+| Method | Path | Description | Auth |
+|--------|------|-------------|------|
+| GET | `/health` | Load-balancer health probe | none |
+| GET | `/` | Service metadata | none |
+| GET | `/docs` | Swagger UI | DEBUG only |
+| GET | `/api/v1/companies` | Paginated list with search / sector / exchange filters | firm context |
+| GET | `/api/v1/companies/{id_or_ticker}` | Detail (UUID or NSE ticker) | firm context |
+
+Auth is a dev-mode stub in Slice 1 — set `X-Dev-Firm: QUANTSOFT` header, or
+omit and we default to `DEV_FIRM_ID`. Phase 1 W3 wires real Clerk JWT.
+
+## Production deployment
+
+### Docker
+
 ```bash
 docker build -t prism-backend .
 docker run -p 8000:8000 --env-file .env prism-backend
 ```
 
-### Docker Compose (with full platform)
-Managed by `docker-compose.prod.yml` in the [frontend repo](https://github.com/Quantsoft24/prism-analyst-platform).
+### Docker Compose (full platform)
+
+Managed by `docker-compose.prod.yml` in the
+[frontend repo](https://github.com/Quantsoft24/prism-analyst-platform).
 
 ```bash
 cd ~/PRISM/prism-analyst-platform
 docker compose -f docker-compose.prod.yml up -d backend
 ```
 
-### CI/CD
-- **CI**: `ruff check` + `pytest` on every PR to `main`/`production`
-- **Deploy**: Auto-deploy on push to `production` branch via SSH → Docker rebuild → health check
+The deploy workflow does NOT auto-run migrations yet (Phase 1 follow-up).
+Run `alembic upgrade head` manually after deploy for now.
 
-## API Endpoints
+### CI / CD
 
-| Method | Path      | Description          | Status   |
-|--------|-----------|----------------------|----------|
-| GET    | `/health` | Health check         | ✅ Live  |
-| GET    | `/`       | Service metadata     | ✅ Live  |
-| GET    | `/docs`   | Swagger UI (debug)   | Debug only |
-| POST   | `/chat`   | Agent chat (Phase 2) | Planned  |
-| GET    | `/stream` | SSE stream (Phase 2) | Planned  |
+- **CI** (`.github/workflows/ci.yml`): ruff lint → Alembic upgrade head → pytest with coverage, all against a Postgres 16 service container.
+- **Deploy** (`.github/workflows/deploy.yml`): SSH into EC2 on push to `production` → git pull → docker rebuild → health check.
 
 ## License
 
