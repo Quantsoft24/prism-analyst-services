@@ -41,6 +41,7 @@ from src.agents.bmc import (
     build_bmc_reconciler_agent,
     parse_contradictions,
 )
+from src.config import settings
 from src.models.bmc import BMCAnalysis, BMCBlock, BMCEvidence
 from src.models.company import Company
 from src.repositories.bmc_repo import BMCRepository
@@ -50,9 +51,7 @@ from src.services.retrieval import HybridRetrievalService, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
-_BLOCK_CONCURRENCY = 3
-_CHUNKS_PER_BLOCK = 6
-_MODEL_LABEL = "prism-quality"  # blocks + reconciler run on the quality tier
+_MODEL_LABEL = "prism-fast+quality"  # blocks → fast tier, reconciler → quality tier
 
 
 @dataclass(slots=True)
@@ -86,7 +85,7 @@ class BMCGenerator:
                                        detail=f"{ticker} not in coverage universe.")
 
         # 1. Generate all blocks via sub-agents, bounded concurrency.
-        sem = asyncio.Semaphore(_BLOCK_CONCURRENCY)
+        sem = asyncio.Semaphore(max(1, settings.BMC_BLOCK_CONCURRENCY))
 
         async def _one(block_def: BMCBlockDef) -> _BlockResult:
             async with sem:
@@ -152,7 +151,9 @@ class BMCGenerator:
         # the chunk set + numbering so citations stay exact.
         try:
             chunks = await self._retriever.retrieve(
-                block_def.retrieval_query, company_id=company.id, limit=_CHUNKS_PER_BLOCK
+                block_def.retrieval_query,
+                company_id=company.id,
+                limit=settings.BMC_CHUNKS_PER_BLOCK,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("BMC retrieval failed for %s/%s: %s", company.ticker, block_def.block_id, exc)
@@ -161,8 +162,9 @@ class BMCGenerator:
         if not chunks:
             return _BlockResult(block_def, [], None, 0.0, "evidence_missing", [])
 
+        cap = settings.BMC_CHUNK_CHAR_CAP
         numbered = "\n\n".join(
-            f"[{i}] (p.{c.page_number}) {c.text[:1200]}" for i, c in enumerate(chunks, start=1)
+            f"[{i}] (p.{c.page_number}) {c.text[:cap]}" for i, c in enumerate(chunks, start=1)
         )
         user_message = (
             f"Company: {company.name} ({company.exchange}:{company.ticker})\n\n"
@@ -209,7 +211,10 @@ class BMCGenerator:
 
     async def _reconcile(self, company: Company, results: list[_BlockResult]) -> list[dict]:
         """Run the CrossBlockReconciler over the OK blocks. Best-effort — a
-        reconciler failure must never fail the whole canvas."""
+        reconciler failure must never fail the whole canvas. Skipped entirely
+        when ``BMC_RECONCILER_ENABLED`` is off (saves 1 quality-tier call/BMC)."""
+        if not settings.BMC_RECONCILER_ENABLED:
+            return []
         ok_blocks = [r for r in results if r.status == "ok" and r.bullets]
         if len(ok_blocks) < 2:
             return []

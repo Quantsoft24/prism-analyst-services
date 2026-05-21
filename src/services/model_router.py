@@ -107,10 +107,11 @@ class ModelRouter:
             fallbacks=fallbacks,
             routing_strategy=settings.MODEL_ROUTER_STRATEGY,
             cooldown_time=settings.MODEL_ROUTER_COOLDOWN_SECONDS,
-            # ``num_retries`` is per-deployment retries before LiteLLM treats
-            # the deployment as failed and tries the next. 1 is enough — the
-            # router itself does the cross-deployment retry via fallbacks.
-            num_retries=1,
+            # Retries across DIFFERENT healthy deployments in the group on a
+            # retryable error (429/503). Free-tier 503s are common, so 2 gives
+            # the request a couple of shots at other models/keys before the
+            # cross-tier fallback kicks in.
+            num_retries=2,
             # Don't crash the whole router if a single model in the list is
             # unrecognized (Gemini may rename a model). Log + skip.
             set_verbose=False,
@@ -159,13 +160,17 @@ class ModelRouter:
                         }
                     )
 
-        # Inter-tier fallback: if every deployment in ``prism-quality`` cools
-        # down (e.g., all 3 Flash models 429-rate-limited at once), route the
-        # request to ``prism-fast`` rather than failing the user. The reverse
-        # is NOT configured — quality fallback is acceptable, but classify
-        # shouldn't bleed into quality (we'd waste quota).
+        # Inter-tier fallback. Free-tier Gemini returns transient 503 ("model
+        # overloaded") and 429 constantly, so each generative tier MUST be able
+        # to spill into another rather than failing the user (this is what
+        # dropped a BMC block in the first live run). Both fast↔quality
+        # directions are wired since both support tool-calling; classify (no
+        # tools) spills into fast. Embedding is deliberately NOT in any chain —
+        # mixing embedding models would corrupt the vector space.
         fallbacks: list[dict] = [
+            {"prism-fast": ["prism-quality"]},
             {"prism-quality": ["prism-fast"]},
+            {"prism-classify": ["prism-fast"]},
         ]
         return model_list, fallbacks
 

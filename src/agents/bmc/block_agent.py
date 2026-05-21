@@ -60,7 +60,11 @@ def build_bmc_block_agent(block_def: BMCBlockDef) -> PrismAgent:
     return PrismAgent(
         name=f"bmc_block_{block_def.block_id}",
         description=f"Generates the '{block_def.title}' BMC block from filing excerpts.",
-        model_tier="quality",
+        # Per-block extraction is "summarize + cite these excerpts" — the fast
+        # tier (Gemma 4 + flash-lite, tool-capable) handles it well and gives
+        # ~6x the free-tier RPD of `quality`, so 9 parallel blocks don't trip
+        # rate limits. Cross-block REASONING stays on `quality` (see reconciler).
+        model_tier="fast",
         instruction=_instruction(block_def),
         tools=NRE_TOOLS.to_list(),
         max_iterations=settings.AGENT_MAX_ITERATIONS,

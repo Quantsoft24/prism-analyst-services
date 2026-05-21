@@ -141,6 +141,27 @@ class Settings(BaseSettings):
     # the estimate is close enough for budgeting.
     CHUNK_TOKENIZER: str = "cl100k_base"
 
+    # ── Business Model Canvas (Phase 3 agentic) ──
+    # Cost/latency knobs. All tunable from .env without code changes.
+    #
+    # How many of the 9 block sub-agents run at once. This does NOT change
+    # token usage — it changes how many LLM calls fire SIMULTANEOUSLY. Lower =
+    # gentler on free-tier per-minute rate limits (fewer concurrent 429 risks),
+    # but slower overall. 2 is a safe default for the free tier + feedback users.
+    BMC_BLOCK_CONCURRENCY: int = 2
+    # Filing chunks fed to each block agent. THIS is the real token lever —
+    # fewer chunks = fewer input tokens per block (×9 blocks). 4 keeps enough
+    # evidence to cite while cutting ~33% of input vs the old 6.
+    BMC_CHUNKS_PER_BLOCK: int = 4
+    # Max characters of each chunk included in the prompt. Trims long table
+    # dumps. 800 chars ≈ ~200 tokens/chunk. Lower to save more tokens.
+    BMC_CHUNK_CHAR_CAP: int = 800
+    # The CrossBlockReconciler is +1 LLM call per BMC (quality tier). It catches
+    # cross-block contradictions (a differentiator) but isn't free. Set to false
+    # to skip it entirely — e.g. during a high-traffic feedback window where
+    # every saved call matters for staying under rate limits.
+    BMC_RECONCILER_ENABLED: bool = True
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     def _build_url(self, driver: str, strip_sslmode: bool) -> str:

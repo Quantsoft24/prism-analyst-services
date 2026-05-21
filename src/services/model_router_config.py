@@ -55,15 +55,17 @@ class TierConfig(TypedDict):
 # configured keys at startup. Conservative — sits ~20% below published
 # Gemini AI Studio limits to absorb burst + clock drift.
 TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
+    # NOTE: every model ID below is verified against the live AI Studio
+    # ListModels for this account (2026-05). Do NOT add a model name without
+    # confirming it exists — a 404 is non-retryable and kills the request with
+    # no fallback. `gemini-3-flash` (no suffix) does NOT exist; the real names
+    # are `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3.1-flash-lite`.
     "fast": {
         "description": "Tool-using agent steps, intent detection, Q&A. Function-calling required.",
         "models": [
-            "gemini/gemini-3.1-flash-lite",     # 15 RPM / 500 RPD per key — best free workhorse
-            "gemini/gemma-4-31b-it",            # 15 RPM / 1.5k RPD per key — tool calling supported
-            "gemini/gemma-4-26b-a4b-it",        # 15 RPM / 1.5k RPD per key — tool calling supported
-            "gemini/gemini-2.5-flash-lite",     # 10 RPM / 20 RPD per key — burst capacity
-            "gemini/gemini-3-flash",            # 5 RPM / 20 RPD per key — last resort
-            "gemini/gemini-2.5-flash",          # 5 RPM / 20 RPD per key — last resort
+            "gemini/gemini-2.5-flash-lite",     # primary free workhorse — fast, function-calling
+            "gemini/gemini-2.5-flash",          # more capable flash — burst capacity
+            "gemini/gemini-3.1-flash-lite",     # newer-gen flash-lite — extra capacity
         ],
         "rpm": 12,
         "tpm": 200_000,
@@ -71,9 +73,9 @@ TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
     "quality": {
         "description": "Final answer composition, BMC drafting, multi-step reasoning.",
         "models": [
-            "gemini/gemini-3-flash",            # Flagship Flash gen, free tier
-            "gemini/gemini-2.5-flash",
-            "gemini/gemini-3.1-flash-lite",     # Fallback so quality never 100% fails
+            "gemini/gemini-2.5-flash",          # proven, strong for drafting
+            "gemini/gemini-2.5-pro",            # highest quality (low free RPD — used as needed)
+            "gemini/gemini-2.5-flash-lite",     # last resort so quality never 100% fails
         ],
         "rpm": 4,
         "tpm": 200_000,
@@ -81,9 +83,9 @@ TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
     "classify": {
         "description": "Pure classification/tagging — no tools. Cheap + abundant.",
         "models": [
-            "gemini/gemma-4-26b-a4b-it",        # Highest RPD, unlimited TPM
+            "gemini/gemini-2.5-flash-lite",     # cheap + reliable
+            "gemini/gemma-4-26b-a4b-it",        # high RPD, no tools needed here
             "gemini/gemma-4-31b-it",
-            "gemini/gemini-3.1-flash-lite",
         ],
         "rpm": 12,
         "tpm": 200_000,
@@ -132,15 +134,14 @@ def tier_from_virtual(name: str) -> Tier | None:
 # Vertex AI / Bedrock and the router prepends premium models to a tier.
 # Used by ``AgentRunner._estimate_cost_usd``.
 MODEL_PRICING_USD_PER_1M: Final[dict[str, tuple[float, float]]] = {
-    # ── Free (Gemini AI Studio + Gemma) ──
-    "gemini/gemini-3.1-flash-lite": (0.0, 0.0),
-    "gemini/gemini-3-flash": (0.0, 0.0),
+    # ── Free (Gemini AI Studio + Gemma) — all verified to exist (2026-05) ──
     "gemini/gemini-2.5-flash": (0.0, 0.0),
     "gemini/gemini-2.5-flash-lite": (0.0, 0.0),
+    "gemini/gemini-2.5-pro": (0.0, 0.0),
+    "gemini/gemini-3.1-flash-lite": (0.0, 0.0),
     "gemini/gemma-4-26b-a4b-it": (0.0, 0.0),
     "gemini/gemma-4-31b-it": (0.0, 0.0),
     "gemini/gemini-embedding-001": (0.0, 0.0),
-    "gemini/gemini-embedding-002": (0.0, 0.0),
     # ── Paid (Vertex AI, Mumbai region) — fill when migrating to paid ──
     # "vertex_ai/gemini-2.5-pro": (1.25, 5.00),
     # "vertex_ai/gemini-3.1-pro": (1.25, 5.00),
