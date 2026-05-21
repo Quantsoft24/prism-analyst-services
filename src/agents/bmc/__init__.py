@@ -19,6 +19,14 @@ The generation is exposed BOTH as an agent tool (``bmc.generate``) and a
 user-facing surface (``@bmc TICKER`` / sidebar), per the approved plan.
 """
 
+from src.agents.bmc.block_agent import build_bmc_block_agent
 from src.agents.bmc.blocks import BMC_BLOCKS, BMCBlockDef
+from src.agents.bmc.reconciler import build_bmc_reconciler_agent, parse_contradictions
 
-__all__ = ["BMC_BLOCKS", "BMCBlockDef"]
+__all__ = [
+    "BMC_BLOCKS",
+    "BMCBlockDef",
+    "build_bmc_block_agent",
+    "build_bmc_reconciler_agent",
+    "parse_contradictions",
+]

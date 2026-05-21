@@ -17,7 +17,9 @@ Tools are shared across agents — BMC, Writer, Modelling will all reuse these
 company lookup tools.
 """
 
+from src.tools.bmc_tools import BMC_TOOLS
 from src.tools.company_tools import COMPANY_TOOLS
 from src.tools.filing_tools import FILING_TOOLS
+from src.tools.nre_tools import NRE_TOOLS
 
-__all__ = ["COMPANY_TOOLS", "FILING_TOOLS"]
+__all__ = ["COMPANY_TOOLS", "FILING_TOOLS", "BMC_TOOLS", "NRE_TOOLS"]

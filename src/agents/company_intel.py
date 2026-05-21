@@ -30,8 +30,10 @@ from __future__ import annotations
 from src.agents.base import FINANCE_DOMAIN_RULES, PrismAgent
 from src.agents.web_search import build_web_search_agent
 from src.config import settings
+from src.tools.bmc_tools import BMC_TOOLS
 from src.tools.company_tools import COMPANY_TOOLS
 from src.tools.filing_tools import FILING_TOOLS
+from src.tools.nre_tools import NRE_TOOLS
 
 
 COMPANY_INTEL_INSTRUCTION = f"""\
@@ -58,6 +60,9 @@ You answer questions about Indian listed companies. Workflow:
    figures from memory.
 5. For *current events / breaking news* not in filings, delegate to the
    ``web_search`` tool and cite the source URLs.
+6. NEVER do arithmetic in your head. To compute growth %, CAGR, margins,
+   ratios, or "what % of revenue", call the matching ``compute_*`` tool with
+   the raw numbers you read from filings, and report the tool's result.
 
 FORMAT:
 - Lead with a 1-2 sentence answer.
@@ -68,8 +73,8 @@ FORMAT:
 REFUSE:
 - Buy/sell/hold recommendations. ("PRISM produces research, not investment
   advice. The published research from your firm's analysts is the call.")
-- Arithmetic on numbers the LLM is asked to do mentally — wait for the
-  Numerical Reasoning Engine in a later release.
+- Mental arithmetic. Use the ``compute_*`` (Numerical Reasoning Engine) tools
+  for every calculation — never compute a percentage or ratio yourself.
 """
 
 
@@ -97,8 +102,15 @@ def build_company_intel_agent() -> PrismAgent:
     web_search_adk_agent = web_search_agent_decl.build()
     web_search_tool = AgentTool(agent=web_search_adk_agent)
 
-    # Tools = company metadata + filing retrieval (the RAG window) + web search.
-    tools = COMPANY_TOOLS.to_list() + FILING_TOOLS.to_list() + [web_search_tool]
+    # Tools = company metadata + filing retrieval (RAG) + BMC read + NRE math
+    # + web search.
+    tools = (
+        COMPANY_TOOLS.to_list()
+        + FILING_TOOLS.to_list()
+        + BMC_TOOLS.to_list()
+        + NRE_TOOLS.to_list()
+        + [web_search_tool]
+    )
 
     return PrismAgent(
         name="company_intel",

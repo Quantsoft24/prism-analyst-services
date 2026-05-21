@@ -61,6 +61,11 @@ class BMCAnalysis(UUIDPKMixin, TimestampMixin, Base):
     cost_usd: Mapped[float] = mapped_column(Numeric(10, 6), server_default="0", nullable=False)
     model: Mapped[str | None] = mapped_column(String(64))
 
+    # Cross-block contradictions found by the CrossBlockReconciler (Phase 3).
+    # List of {block_a, block_b, issue}. Advisory — surfaced to the analyst,
+    # never auto-resolved.
+    contradictions: Mapped[list | None] = mapped_column(JSONB, server_default="[]")
+
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
     )

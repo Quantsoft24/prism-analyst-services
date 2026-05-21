@@ -1,22 +1,26 @@
 """BMCGenerator — produces a filing-grounded Business Model Canvas.
 
-Phase 2 Lite algorithm (per the approved plan):
+Phase 3 (agentic) algorithm:
 
     for each of the 9 blocks (bounded concurrency):
-        1. retrieve top-K filing chunks for this block's query, scoped to the company
-        2. one LLM call: summarize the block in 2-4 cited bullets using ONLY those chunks
-        3. parse JSON → bullets + which chunk markers were cited
+        1. retrieve top-K filing chunks for this block's query (WE control
+           retrieval + numbering so citations map exactly to chunks)
+        2. run the block's ADK SUB-AGENT on the numbered excerpts. The agent
+           writes 2-4 cited bullets and calls the NRE ``compute_*`` tools for
+           any derived figure (growth %, margin, ...) — math is deterministic.
+        3. parse JSON → bullets + cited markers → evidence rows
+        4. confidence = deterministic evidence-anchored floor blended with the
+           agent's self-rating (NOT pure LLM self-rating)
+    run the CrossBlockReconciler over all blocks → store contradictions
     persist analysis + blocks + evidence as a new version
 
-Grounding contract (what makes this different from every other BMC tool):
-  * The LLM sees ONLY retrieved filing chunks, numbered [1], [2], ...
-  * It must cite the chunk markers it used; we map those back to real
-    ``filing_chunks`` rows → ``bmc_evidence`` with page numbers.
-  * If a block has no supporting chunks, it's marked ``evidence_missing`` —
-    we never fabricate. (The old PRISM_ANALYST hallucinated here.)
+Grounding contract (unchanged from Lite, the thing that beats every competitor):
+  * The agent sees ONLY retrieved filing chunks, numbered [1], [2], ...
+  * Cited markers map back to real ``filing_chunks`` → ``bmc_evidence`` w/ page.
+  * No evidence → ``evidence_missing``. We never fabricate.
 
-Concurrency is bounded (default 3) so 9 blocks don't blow free-tier RPM.
-The router's multi-key fallback absorbs the rest.
+Concurrency is bounded (default 3) so 9 sub-agents don't blow free-tier RPM;
+the router's multi-key fallback absorbs bursts.
 """
 
 from __future__ import annotations
@@ -30,19 +34,25 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agents.bmc.blocks import BMC_BLOCKS, BMCBlockDef
+from src.agents.bmc import (
+    BMC_BLOCKS,
+    BMCBlockDef,
+    build_bmc_block_agent,
+    build_bmc_reconciler_agent,
+    parse_contradictions,
+)
 from src.models.bmc import BMCAnalysis, BMCBlock, BMCEvidence
 from src.models.company import Company
 from src.repositories.bmc_repo import BMCRepository
 from src.repositories.company_repo import CompanyRepository
-from src.services.model_router import get_router
+from src.services.bmc.agent_exec import run_agent_to_text
 from src.services.retrieval import HybridRetrievalService, RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
 _BLOCK_CONCURRENCY = 3
 _CHUNKS_PER_BLOCK = 6
-_LLM_TIER = "quality"  # block summaries want the better tier; volume is low (9/canvas)
+_MODEL_LABEL = "prism-quality"  # blocks + reconciler run on the quality tier
 
 
 @dataclass(slots=True)
@@ -53,32 +63,8 @@ class BMCGenerationResult:
     version: int | None
     blocks_ok: int
     blocks_total: int
+    contradictions: int = 0
     detail: str = ""
-
-
-_SYSTEM_PROMPT = """\
-You are PRISM's Business Model Canvas analyst for Indian listed companies.
-You will be given a company name and a set of NUMBERED excerpts from its
-filings. Summarize ONE Business Model Canvas block.
-
-HARD RULES:
-- Use ONLY the provided excerpts. Do NOT use outside knowledge.
-- Every bullet MUST cite the excerpt(s) it draws from using [n] markers.
-- If the excerpts contain no relevant information for this block, return an
-  empty bullets list and set "evidence_missing": true. NEVER invent facts.
-- 2 to 4 short bullets. Each bullet one sentence. No preamble.
-- Indian context: ₹ amounts, FY ending 31 March.
-
-Respond with STRICT JSON only, no markdown fences:
-{
-  "bullets": ["Serves BFSI clients across North America [1].", ...],
-  "key_insights": ["optional 1-2 word tags"],
-  "evidence_missing": false,
-  "confidence": 0.0-1.0
-}
-confidence reflects how well the excerpts support the block (more relevant
-excerpts + specific figures = higher).
-"""
 
 
 class BMCGenerator:
@@ -99,7 +85,7 @@ class BMCGenerator:
             return BMCGenerationResult(None, ticker, "failed", None, 0, len(BMC_BLOCKS),
                                        detail=f"{ticker} not in coverage universe.")
 
-        # Generate all blocks with bounded concurrency.
+        # 1. Generate all blocks via sub-agents, bounded concurrency.
         sem = asyncio.Semaphore(_BLOCK_CONCURRENCY)
 
         async def _one(block_def: BMCBlockDef) -> _BlockResult:
@@ -108,7 +94,10 @@ class BMCGenerator:
 
         block_results = await asyncio.gather(*[_one(b) for b in BMC_BLOCKS])
 
-        # Persist as a new version.
+        # 2. CrossBlockReconciler — review the assembled canvas for contradictions.
+        contradictions = await self._reconcile(company, block_results)
+
+        # 3. Persist as a new version.
         version = await self._bmc.next_version(firm_id, ticker)
         confidences = [r.confidence for r in block_results if r.status == "ok"]
         overall = round(sum(confidences) / len(confidences), 3) if confidences else 0.0
@@ -127,7 +116,8 @@ class BMCGenerator:
             fiscal_period=fiscal_period,
             status=status,
             overall_confidence=overall,
-            model=f"prism-{_LLM_TIER}",
+            model=_MODEL_LABEL,
+            contradictions=contradictions,
         )
         await self._bmc.add(analysis)
 
@@ -151,13 +141,15 @@ class BMCGenerator:
         return BMCGenerationResult(
             bmc_id=analysis.id, ticker=ticker, status=status, version=version,
             blocks_ok=blocks_ok, blocks_total=len(BMC_BLOCKS),
-            detail=f"v{version} · overall confidence {overall}",
+            contradictions=len(contradictions),
+            detail=f"v{version} · overall confidence {overall} · {len(contradictions)} contradiction(s)",
         )
 
-    # ── Per-block generation ──────────────────────────────────────────────
+    # ── Per-block generation (agentic) ────────────────────────────────────
 
     async def _generate_block(self, company: Company, block_def: BMCBlockDef) -> _BlockResult:
-        # 1. Retrieve evidence for this block, scoped to the company.
+        # Retrieve evidence for this block, scoped to the company. WE control
+        # the chunk set + numbering so citations stay exact.
         try:
             chunks = await self._retriever.retrieve(
                 block_def.retrieval_query, company_id=company.id, limit=_CHUNKS_PER_BLOCK
@@ -169,38 +161,29 @@ class BMCGenerator:
         if not chunks:
             return _BlockResult(block_def, [], None, 0.0, "evidence_missing", [])
 
-        # 2. LLM summarize using only the numbered chunks.
         numbered = "\n\n".join(
             f"[{i}] (p.{c.page_number}) {c.text[:1200]}" for i, c in enumerate(chunks, start=1)
         )
-        user_prompt = (
-            f"Company: {company.name} ({company.exchange}:{company.ticker})\n"
-            f"Block: {block_def.title}\n"
-            f"What this block captures: {block_def.focus}\n\n"
+        user_message = (
+            f"Company: {company.name} ({company.exchange}:{company.ticker})\n\n"
             f"Filing excerpts:\n{numbered}"
         )
+
+        # Run the per-block sub-agent (it may call NRE compute_* tools).
         try:
-            raw = await get_router().acomplete(
-                _LLM_TIER,
-                [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.1,
-                response_json=True,
-            )
+            agent = build_bmc_block_agent(block_def)
+            raw = await run_agent_to_text(agent, user_message)
             parsed = _parse_block_json(raw)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("BMC LLM failed for %s/%s: %s", company.ticker, block_def.block_id, exc)
+            logger.warning("BMC sub-agent failed for %s/%s: %s", company.ticker, block_def.block_id, exc)
             return _BlockResult(block_def, [], None, 0.0, "failed", [])
 
         if parsed.get("evidence_missing") or not parsed.get("bullets"):
             return _BlockResult(block_def, [], parsed.get("key_insights"), 0.0, "evidence_missing", [])
 
         bullets: list[str] = parsed["bullets"]
-        confidence = float(parsed.get("confidence", 0.5))
 
-        # 3. Map cited [n] markers back to real chunks → evidence rows.
+        # Map cited [n] markers back to real chunks → evidence rows.
         cited_markers = _extract_markers(bullets)
         evidence: list[dict] = []
         for marker_num in sorted(cited_markers):
@@ -216,9 +199,32 @@ class BMCGenerator:
                     }
                 )
 
-        return _BlockResult(
-            block_def, bullets, parsed.get("key_insights"), confidence, "ok", evidence
+        confidence = _compute_confidence(
+            llm_confidence=float(parsed.get("confidence", 0.5)),
+            cited_count=len(evidence),
         )
+        return _BlockResult(block_def, bullets, parsed.get("key_insights"), confidence, "ok", evidence)
+
+    # ── Reconciler ─────────────────────────────────────────────────────────
+
+    async def _reconcile(self, company: Company, results: list[_BlockResult]) -> list[dict]:
+        """Run the CrossBlockReconciler over the OK blocks. Best-effort — a
+        reconciler failure must never fail the whole canvas."""
+        ok_blocks = [r for r in results if r.status == "ok" and r.bullets]
+        if len(ok_blocks) < 2:
+            return []
+        rendered = "\n\n".join(
+            f"{r.block_def.title} ({r.block_def.block_id}):\n"
+            + "\n".join(f"- {b}" for b in r.bullets)
+            for r in ok_blocks
+        )
+        message = f"Company: {company.name}\n\nBlocks:\n{rendered}"
+        try:
+            raw = await run_agent_to_text(build_bmc_reconciler_agent(), message)
+            return parse_contradictions(raw)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("BMC reconciler failed for %s: %s", company.ticker, exc)
+            return []
 
 
 @dataclass(slots=True)
@@ -231,6 +237,23 @@ class _BlockResult:
     evidence: list[dict]
 
 
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _compute_confidence(*, llm_confidence: float, cited_count: int) -> float:
+    """Blend the agent's self-rating with a DETERMINISTIC, evidence-anchored
+    score so confidence isn't pure LLM self-assessment (the plan's "deterministic
+    floor"). More cited sources → higher deterministic component; we weight it
+    above the self-rating so a confident-but-thinly-sourced block can't score high.
+
+    deterministic = min(1, cited_count / 3)   (0, .33, .67, 1.0 for 0..3+ cites)
+    final = 0.6 * deterministic + 0.4 * llm_confidence
+    """
+    llm = max(0.0, min(1.0, llm_confidence))
+    deterministic = min(1.0, cited_count / 3.0)
+    return round(0.6 * deterministic + 0.4 * llm, 3)
+
+
 def _parse_block_json(raw: str) -> dict:
     """Parse the model's JSON, tolerating accidental markdown fences."""
     text = raw.strip()
@@ -240,9 +263,16 @@ def _parse_block_json(raw: str) -> dict:
 
 
 def _extract_markers(bullets: list[str]) -> set[int]:
-    """Pull the integers out of [n] citation markers across all bullets."""
+    """Pull every integer out of citation markers across all bullets.
+
+    Handles BOTH single markers (``[2]``) and grouped markers the LLM often
+    emits (``[1, 2, 3]`` / ``[3,4]``). Missing the grouped form silently
+    drops evidence links — which breaks the "show your work" contract — so we
+    parse any ``[...]`` containing digits + commas.
+    """
     markers: set[int] = set()
     for b in bullets:
-        for m in re.findall(r"\[(\d+)\]", b):
-            markers.add(int(m))
+        for group in re.findall(r"\[([\d,\s]+)\]", b):
+            for num in re.findall(r"\d+", group):
+                markers.add(int(num))
     return markers

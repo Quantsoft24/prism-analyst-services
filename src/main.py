@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.config import settings
 from src.core.database import dispose_engine, init_engine
 from src.routers import (
+    bmc_router,
     chat_router,
     companies_router,
     filings_router,
@@ -134,6 +135,7 @@ async def root() -> dict[str, str]:
 app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(filings_router, prefix=settings.API_PREFIX)
+app.include_router(bmc_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).
 # We mount unconditionally so the route table is consistent.
 app.include_router(router_health_router, prefix=settings.API_PREFIX)
