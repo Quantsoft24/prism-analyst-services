@@ -28,9 +28,15 @@ dependencies = [
     # pyyaml drives the declarative integration registry (config/integrations.yml).
     "pyyaml>=6.0.2",
     # RAG stack retired with the read-on-demand cutover (2026-05-24):
-    #   pgvector / fsspec / numpy / pdfplumber / tiktoken — removed.
+    #   fsspec / numpy / pdfplumber / tiktoken — removed.
     # BMC export and BMC-specific renderers also retired — the external bmc
     # service now owns export (openpyxl/fpdf2 dropped).
+    # NOTE: pgvector stays as a dep even though the runtime no longer uses it.
+    # Historical migrations (0001_initial_schema, 0004_filings_and_chunks) still
+    # import `from pgvector.sqlalchemy import Vector`. Alembic loads every
+    # migration module on startup to compute the chain, so the import must
+    # resolve. Squashing those migrations is the cleaner long-term fix.
+    "pgvector>=0.3.6",
 ]
 
 [project.optional-dependencies]

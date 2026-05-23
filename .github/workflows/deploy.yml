@@ -54,6 +54,20 @@ jobs:
               exit 1
             fi
 
+            echo "📦 Applying database migrations (alembic upgrade head)..."
+            # The new image ships the latest migration files; run them against
+            # the live DB so the schema matches the code. Idempotent (no-op if
+            # already at head). Backend is already up + healthy so the DB
+            # connection settings are known good.
+            if docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml \
+                 exec -T backend alembic upgrade head; then
+              echo "✅ Migrations up to date — $(docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml exec -T backend alembic current 2>/dev/null | tail -1)"
+            else
+              echo "❌ Alembic upgrade failed — see logs above"
+              docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml logs backend --tail 30
+              exit 1
+            fi
+
             echo "🧹 Cleaning old images..."
             docker image prune -f
 

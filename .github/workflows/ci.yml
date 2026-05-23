@@ -4,7 +4,8 @@ on:
   pull_request:
     branches: [main, production]
   push:
-    branches: [main]
+    # Also run CI on production pushes so direct hotfixes don't bypass gates.
+    branches: [main, production]
 
 jobs:
   lint-and-test:
@@ -37,6 +38,16 @@ jobs:
       # Disable SSL on the local CI Postgres
       DB_SSL_MODE: disable
       DEBUG: "true"
+      # External-service URLs — typed wrappers degrade gracefully when these
+      # are unreachable, but setting them keeps test logs predictable and
+      # lets future integration tests skip cleanly via reachability checks.
+      BMC_URL: http://localhost:8012
+      STOCK_CHAT_URL: http://localhost:8011
+      # CATALOG_DATABASE_URL deliberately UNSET — when blank, the catalog
+      # engine doesn't initialise and /api/v1/companies + lookup_company
+      # raise a clean RuntimeError. Tests that don't exercise the catalog
+      # path are unaffected.
+      CATALOG_DATABASE_URL: ""
 
     steps:
       - uses: actions/checkout@v4
