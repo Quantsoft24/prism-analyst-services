@@ -88,24 +88,6 @@ class Settings(BaseSettings):
     # "latency-based-routing" (paid tier when SLO matters).
     MODEL_ROUTER_STRATEGY: str = "usage-based-routing-v2"
 
-    # ── RAG / Filings ingestion (Slice 5) ──
-    # Storage URL for raw filing PDFs — uses fsspec scheme dispatch.
-    # Dev:  "file://./.data/filings"   (local disk, gitignored)
-    # Prod: "s3://prism-filings-ap-south-1/filings"  (when paid tier is on)
-    # Anything fsspec supports works (gcs://, az://, http(s)://, etc.).
-    FILINGS_STORAGE_URL: str = "file://./.data/filings"
-
-    # Embedding dimension produced by the embedding-tier model.
-    # Gemini text-embedding-004 / gemini-embedding-002 default to 768; both
-    # support 3072 via Matryoshka representations. Higher = better recall +
-    # 4x storage. 768 is the well-balanced choice for finance-domain text.
-    EMBEDDING_DIMENSION: int = 768
-
-    # Where the declarative ingestion source registry lives. YAML for now;
-    # migrates to a DB table (``ingestion_sources``) in Slice 5C without
-    # changing any consumer code — ``FilingsRegistry`` is the seam.
-    INGESTION_REGISTRY_PATH: str = "config/ingestion_sources.yml"
-
     # ── Integrations (agent tools / MCP / sub-agents) ──
     # Declarative registry of agent-callable resources. Same YAML→DB migration
     # seam as the ingestion registry. See docs/INTEGRATION_INTAKE.md.
@@ -114,61 +96,29 @@ class Settings(BaseSettings):
     # network-restricted). Referenced by the stock-chat integration tool.
     STOCK_CHAT_URL: str = "http://localhost:8011"
 
-    # Hybrid retrieval — Reciprocal Rank Fusion (RRF) parameters.
-    # ``k`` is the standard RRF constant (60 is the value used in the
-    # original RRF paper; rarely needs tuning).
-    RETRIEVAL_RRF_K: int = 60
-    # Per-source candidate pool size before fusion. Larger = better recall,
-    # more compute. 50 is a strong default; raise to 100+ when reranker lands.
-    RETRIEVAL_TOP_K_DENSE: int = 50
-    RETRIEVAL_TOP_K_SPARSE: int = 50
-    # Final results returned after fusion.
-    RETRIEVAL_TOP_K_FINAL: int = 10
-
-    # ── PDF parsing (Slice 5B) ──
-    # Which parser backend to use:
-    #   "pdfplumber" — lightweight, in-process, pure Python. Works immediately.
-    #   "docling"    — best-in-class table extraction, runs as a Docker sidecar.
-    # Same ``PdfParser`` interface either way; flip when you start the sidecar.
-    PARSER_BACKEND: str = "pdfplumber"
-    # URL of the docling sidecar service (only used when PARSER_BACKEND=docling).
-    DOCLING_SERVICE_URL: str = "http://localhost:8100"
-    # Timeout for a single parse request to the sidecar. docling on CPU is
-    # SLOW (observed ~400s for a fact sheet incl. first-call model download),
-    # so this is generous. On GPU it drops to seconds. pdfplumber (the default)
-    # ignores this entirely.
-    DOCLING_TIMEOUT_SECONDS: int = 600
-
-    # ── Chunking (Slice 5B) ──
-    # Target chunk size in tokens. ~512 balances retrieval granularity against
-    # embedding cost and context budget. Overlap preserves cross-boundary context.
-    CHUNK_TARGET_TOKENS: int = 512
-    CHUNK_OVERLAP_TOKENS: int = 64
-    # Tokenizer for chunk sizing — tiktoken encoding name. cl100k_base is a
-    # good model-agnostic proxy; Gemini's true tokenizer differs slightly but
-    # the estimate is close enough for budgeting.
+    # RAG / pdf-parsing / chunking settings retired with the read-on-demand
+    # cutover (2026-05-24) — PRISM no longer maintains its own embedding/chunk
+    # index. Filings narrative Q&A comes via stock-chat's read-on-demand tools.
     CHUNK_TOKENIZER: str = "cl100k_base"
 
-    # ── Business Model Canvas (Phase 3 agentic) ──
-    # Cost/latency knobs. All tunable from .env without code changes.
-    #
-    # How many of the 9 block sub-agents run at once. This does NOT change
-    # token usage — it changes how many LLM calls fire SIMULTANEOUSLY. Lower =
-    # gentler on free-tier per-minute rate limits (fewer concurrent 429 risks),
-    # but slower overall. 2 is a safe default for the free tier + feedback users.
-    BMC_BLOCK_CONCURRENCY: int = 2
-    # Filing chunks fed to each block agent. THIS is the real token lever —
-    # fewer chunks = fewer input tokens per block (×9 blocks). 4 keeps enough
-    # evidence to cite while cutting ~33% of input vs the old 6.
-    BMC_CHUNKS_PER_BLOCK: int = 4
-    # Max characters of each chunk included in the prompt. Trims long table
-    # dumps. 800 chars ≈ ~200 tokens/chunk. Lower to save more tokens.
-    BMC_CHUNK_CHAR_CAP: int = 800
-    # The CrossBlockReconciler is +1 LLM call per BMC (quality tier). It catches
-    # cross-block contradictions (a differentiator) but isn't free. Set to false
-    # to skip it entirely — e.g. during a high-traffic feedback window where
-    # every saved call matters for staying under rate limits.
-    BMC_RECONCILER_ENABLED: bool = True
+    # ── BMC (external service) ──
+    # PRISM's own RAG-based BMC is retired; the teammate-built `bmc` service
+    # (FastAPI on port 8012, owns its own 5 tables in the shared Postgres) is
+    # the source of truth. PRISM's /api/v1/bmc/* router is a thin proxy here;
+    # the chat agent also reaches it via the integration registry (typed
+    # wrappers in src/integrations/tools/bmc.py). No caller auth — must be
+    # network-restricted to the PRISM backend's IP. Dev: localhost; prod: VM IP.
+    BMC_URL: str = "http://localhost:8012"
+
+    # ── Catalog DB (READ-ONLY secondary engine pointing at the stock_chat
+    # Postgres). PRISM's company lookup tools + /api/v1/companies router read
+    # from `company_industry` here (4,773 rows) instead of maintaining a
+    # duplicate `companies` table in PRISM's primary DB. Same for any future
+    # read against `filings_index` / `document_texts`. NEVER write through
+    # this engine — those tables are owned by the stock-chat / bmc services.
+    # If left blank, falls back to ``POSTGRES_URL`` (the teammate's env-var name).
+    CATALOG_DATABASE_URL: str = ""
+    POSTGRES_URL: str = ""  # back-compat: read teammate's .env if set
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -215,6 +165,24 @@ class Settings(BaseSettings):
         does, which is exactly what managed providers like Neon expect.
         """
         return self._build_url("psycopg", strip_sslmode=False)
+
+    @property
+    def async_catalog_database_url(self) -> str:
+        """Async URL for the read-only catalog DB (stock_chat Postgres).
+        Prefers ``CATALOG_DATABASE_URL``; falls back to ``POSTGRES_URL`` (the
+        teammate's existing env-var name). Returns "" if neither is set —
+        callers should handle gracefully (catalog features just don't load).
+        Strips ``sslmode`` and normalizes the driver to asyncpg (same logic
+        as the primary URL builder)."""
+        raw = self.CATALOG_DATABASE_URL or self.POSTGRES_URL
+        if not raw:
+            return ""
+        url = raw
+        for prefix in ("postgresql://", "postgres://"):
+            if url.startswith(prefix):
+                url = f"postgresql+asyncpg://" + url[len(prefix):]
+                break
+        return _strip_sslmode(url)
 
     @property
     def db_connect_args(self) -> dict:

@@ -29,6 +29,28 @@
   config:
     entrypoint: "src.integrations.tools.stock_chat:STOCK_CHAT_TOOLS"
 
+# ── Live: bmc (teammate read-on-demand 9-block canvas; replaces PRISM RAG BMC) ──
+# Six agent-routable endpoints exposed as typed wrappers (get / generate /
+# library / get_version / block_chat / diff). The export endpoint is binary
+# and surfaced through the UI proxy at /api/v1/bmc/{ticker}/{version}/export,
+# not as an agent tool. Base URL via env BMC_URL; no caller auth (network-
+# restricted to PRISM backend's IP on :8012).
+- name: bmc
+  source: python
+  enabled: true
+  description: >
+    Citation-grounded Business Model Canvas for an Indian NSE/BSE-listed
+    company — 9 canonical Osterwalder blocks read on-demand from the
+    company's own Annual Report + Investor Presentation + latest Result. Also
+    per-block drill-down chat, JSON/PDF export, and temporal diff between two
+    fiscal periods. Use for "business model" / "BMC <ticker>" / "compare X's
+    business model FY24 vs FY26". Not for exact numbers (those go to PRISM
+    compute_*); not for one-shot questions about a single filing (those go
+    to stock_filings_read).
+  tags: [bmc, research]
+  config:
+    entrypoint: "src.integrations.tools.bmc:BMC_TOOLS"
+
 # ── Commented examples — copy/uncomment to add each type ─────────────────────
 #
 # OpenAPI service (auto-generate a tool per operation; tool_filter restricts):

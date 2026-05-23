@@ -5,18 +5,10 @@ for HTTP concerns (those belong in routers) and never for business policy
 (those belong in services / agents).
 """
 
-from src.repositories.bmc_repo import BMCRepository
 from src.repositories.company_repo import CompanyRepository
-from src.repositories.filing_repo import (
-    ChunkHit,
-    FilingChunkRepository,
-    FilingRepository,
-)
+from src.repositories.integration_repo import IntegrationRepository
 
 __all__ = [
     "CompanyRepository",
-    "FilingRepository",
-    "FilingChunkRepository",
-    "ChunkHit",
-    "BMCRepository",
+    "IntegrationRepository",
 ]

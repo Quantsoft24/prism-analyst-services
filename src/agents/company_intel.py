@@ -30,9 +30,7 @@ from __future__ import annotations
 from src.agents.base import FINANCE_DOMAIN_RULES, PrismAgent
 from src.agents.web_search import build_web_search_agent
 from src.config import settings
-from src.tools.bmc_tools import BMC_TOOLS
 from src.tools.company_tools import COMPANY_TOOLS
-from src.tools.filing_tools import FILING_TOOLS
 from src.tools.nre_tools import NRE_TOOLS
 
 
@@ -49,20 +47,23 @@ You answer questions about Indian listed companies. Workflow:
    ASK the user to clarify rather than guess.
 3. For sector-discovery questions ("what banks do you cover?"), use
    ``list_covered_sectors`` then ``search_companies(sector=...)``.
-4. For ANY question about a company's actual disclosures — reported numbers,
-   revenue/margins, management commentary, risk factors, segment results,
-   related-party transactions — call ``retrieve_filings`` with a focused
-   query and the company's ticker. This is your PRIMARY source. Quote and
-   cite the returned passages: include the section + page, e.g.
-   "(MOIL Q4-FY26, MD&A, p.4)". PREFER filing evidence over your training
-   knowledge. If ``retrieve_filings`` returns a ``note`` saying nothing was
-   found, tell the user the filing isn't ingested yet — DO NOT fabricate
-   figures from memory.
-5. For *current events / breaking news* not in filings, delegate to the
+4. For NARRATIVE questions about what a company said or disclosed (strategy,
+   risks, MD&A, sustainability, governance, board decisions, dividends),
+   call ``stock_filings_read`` with a focused question and the company name.
+   It reads the actual PDFs and returns synthesised answers + cited
+   evidence with ``[Company | p.N]`` citations. Preserve those citation
+   strings verbatim. For "which filings exist" use ``stock_filings_lookup``
+   (pure metadata, no LLM). For live price / RSI / MA / 52-week, use
+   ``stock_technicals``.
+5. For "show me the business model canvas" / "@bmc <ticker>" / "business
+   overview", try ``bmc_get`` first (cheap cached read); fall back to
+   ``bmc_generate`` only if no canvas exists. The 9-block result has its
+   own inline citations.
+6. For *current events / breaking news* not in filings, delegate to the
    ``web_search`` tool and cite the source URLs.
-6. NEVER do arithmetic in your head. To compute growth %, CAGR, margins,
+7. NEVER do arithmetic in your head. To compute growth %, CAGR, margins,
    ratios, or "what % of revenue", call the matching ``compute_*`` tool with
-   the raw numbers you read from filings, and report the tool's result.
+   the raw numbers you got from a tool result, and report the tool's value.
 
 FORMAT:
 - Lead with a 1-2 sentence answer.
@@ -108,15 +109,13 @@ def build_company_intel_agent(integrations: str | list[str] | None = "*") -> Pri
     web_search_adk_agent = web_search_agent_decl.build()
     web_search_tool = AgentTool(agent=web_search_adk_agent)
 
-    # Built-in tools = company metadata + filing retrieval (RAG) + BMC read +
-    # NRE math + web search. Registered integrations (stock-chat, MCP servers,
-    # ...) are merged in by PrismAgent.build() via ``integrations="*"`` — all
-    # firm-wide tools, since Part-A imposes no per-agent restriction and the LLM
-    # picks dynamically.
+    # Built-in tools = catalog-backed company lookups + deterministic NRE math
+    # + web search. RAG/filings and BMC are now external services wired
+    # through the integration registry (config/integrations.yml) — picked up
+    # via `integrations="*"` below so the agent has stock_filings_read,
+    # stock_filings_lookup, stock_technicals, and the 6 bmc_* tools.
     tools = (
         COMPANY_TOOLS.to_list()
-        + FILING_TOOLS.to_list()
-        + BMC_TOOLS.to_list()
         + NRE_TOOLS.to_list()
         + [web_search_tool]
     )

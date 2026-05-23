@@ -6,25 +6,19 @@ model module so that all tables are registered against ``Base.metadata``.
 
 from src.models.agent_run import AgentRun
 from src.models.base import Base
-from src.models.bmc import BMCAnalysis, BMCBlock, BMCEvidence
-from src.models.company import Company, CompanyAlias
-from src.models.filing import Filing, FilingChunk
 from src.models.firm import Firm
 from src.models.integration import FirmIntegration
 from src.models.user import FirmMembership, User
+
+# Catalog DB models (read-only, separate Base — kept out of Alembic's metadata).
+from src.models.catalog import CompanyIndustry  # noqa: F401
 
 __all__ = [
     "Base",
     "Firm",
     "User",
     "FirmMembership",
-    "Company",
-    "CompanyAlias",
     "AgentRun",
-    "Filing",
-    "FilingChunk",
-    "BMCAnalysis",
-    "BMCBlock",
-    "BMCEvidence",
     "FirmIntegration",
+    "CompanyIndustry",
 ]

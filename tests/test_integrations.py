@@ -70,7 +70,8 @@ def test_load_specs_non_list_rejected(tmp_path):
 def test_shipped_registry_is_valid():
     """config/integrations.yml must always parse — guards a malformed PR edit."""
     specs = load_specs("config/integrations.yml")
-    assert any(s.name == "stock-chat" for s in specs)
+    names = {s.name for s in specs}
+    assert {"stock-chat", "bmc"}.issubset(names)
     for s in specs:
         assert isinstance(s, IntegrationSpec)
 
@@ -95,6 +96,26 @@ def test_registry_builds_stock_chat_tools():
     assert len(reg.tools()) == 3
     assert len(reg.tools_for(["stock-chat"])) == 3
     assert reg.tools_for(["does-not-exist"]) == []
+
+
+def test_registry_builds_bmc_tools():
+    """The new BMC integration (external service) exposes 6 typed tools."""
+    spec = IntegrationSpec(
+        name="bmc", source="python",
+        config={"entrypoint": "src.integrations.tools.bmc:BMC_TOOLS"},
+    )
+    reg = IntegrationRegistry([spec])
+    asyncio.run(reg.build())
+
+    health = reg.health()
+    assert health[0]["status"] == "ok"
+    assert health[0]["tool_count"] == 6
+    assert len(reg.tools_for(["bmc"])) == 6
+    # Sanity: each is a FunctionTool with one of the canonical names.
+    tool_names = {getattr(t, "name", None) for t in reg.tools()}
+    expected = {"bmc_get", "bmc_generate", "bmc_library", "bmc_get_version",
+                "bmc_block_chat", "bmc_diff"}
+    assert expected == tool_names
 
 
 def test_registry_disabled_spec_skipped():

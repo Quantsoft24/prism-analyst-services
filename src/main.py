@@ -18,13 +18,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
+from src.core.catalog_database import (
+    dispose_catalog_engine,
+    init_catalog_engine,
+    is_catalog_configured,
+)
 from src.core.database import dispose_engine, init_engine
 from src.integrations import dispose_registry, init_registry
 from src.routers import (
     bmc_router,
     chat_router,
     companies_router,
-    filings_router,
     integrations_router,
     router_health_router,
 )
@@ -66,9 +70,21 @@ def _configure_adk_env() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize DB pool + ModelRouter on startup; dispose cleanly on shutdown."""
+    """Initialize DB pools + ModelRouter on startup; dispose cleanly on shutdown."""
     _configure_adk_env()
     init_engine()
+
+    # Secondary read-only engine for the catalog DB (stock_chat Postgres) —
+    # powers /api/v1/companies + the chat agent's company lookup tools.
+    # Skipped silently if the URL isn't set (keeps tests / minimal deploys
+    # working). Failures here log + continue; companies endpoints will 503
+    # if accessed without the catalog being up.
+    if is_catalog_configured():
+        try:
+            init_catalog_engine()
+            logger.info("Catalog DB engine initialized (read-only).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Catalog DB engine failed to initialize: %s", exc)
 
     # Build the ModelRouter if enabled — collects all GEMINI_API_KEY* values
     # from settings and hands them to the singleton. Disabling lets us run
@@ -97,6 +113,7 @@ async def lifespan(app: FastAPI):
     finally:
         dispose_registry()
         dispose_router()
+        await dispose_catalog_engine()
         await dispose_engine()
 
 
@@ -145,7 +162,6 @@ async def root() -> dict[str, str]:
 # ── Versioned API routers ──
 app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
-app.include_router(filings_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).

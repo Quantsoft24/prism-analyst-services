@@ -25,27 +25,12 @@ dependencies = [
     # NOTE: pin ≥1.83.0 — versions 1.82.7 and 1.82.8 had a PyPI supply-chain
     # compromise (March 2026). Do not regress this floor without security review.
     "litellm>=1.83.0",
-    # Slice 5 — RAG foundation:
-    # * pgvector — SQLAlchemy ``Vector`` column type for embeddings
-    # * fsspec  — filesystem abstraction (local ↔ S3 with the same code path)
-    # * pyyaml  — declarative ingestion source registry
-    # * numpy   — embedding math (RRF fusion, similarity ops)
-    "pgvector>=0.3.6",
-    "fsspec>=2025.0.0",
+    # pyyaml drives the declarative integration registry (config/integrations.yml).
     "pyyaml>=6.0.2",
-    "numpy>=2.0.0",
-    # Slice 5B — parsing + chunking:
-    # * pdfplumber — lightweight pure-Python PDF text extraction (default parser).
-    #                The heavy docling parser runs in a Docker sidecar, so its
-    #                deps are NOT listed here — the backend only needs an HTTP client.
-    # * tiktoken   — token counting for chunk sizing (model-agnostic BPE estimate).
-    "pdfplumber>=0.11.4",
-    "tiktoken>=0.8.0",
-    # Phase 3 BMC export — pure-Python, no system deps:
-    # * openpyxl — XLSX workbooks (canvas + audit sheets)
-    # * fpdf2    — PDF generation (no Pandoc/LaTeX system dependency)
-    "openpyxl>=3.1.5",
-    "fpdf2>=2.8.1",
+    # RAG stack retired with the read-on-demand cutover (2026-05-24):
+    #   pgvector / fsspec / numpy / pdfplumber / tiktoken — removed.
+    # BMC export and BMC-specific renderers also retired — the external bmc
+    # service now owns export (openpyxl/fpdf2 dropped).
 ]
 
 [project.optional-dependencies]

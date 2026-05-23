@@ -1,250 +1,244 @@
-"""Business Model Canvas endpoints.
+"""BMC router — thin proxy to the external BMC service (``BMC_URL``).
 
-  POST /api/v1/bmc/{ticker}/run        — generate a NEW grounded canvas version
-  GET  /api/v1/bmc/{ticker}            — latest canvas (9 blocks + citations)
-  GET  /api/v1/bmc/{ticker}/library    — all versions (headers)
-  GET  /api/v1/bmc/{ticker}/{version}  — a specific version
+PRISM's own RAG-based BMC was retired (2026-05-24); the teammate-built ``bmc``
+HTTP service (FastAPI on port 8012, read-on-demand, owns its own 5 tables in
+the shared Postgres) is now the source of truth. This router preserves the
+``/api/v1/bmc/*`` API surface our frontend already speaks (BMCView, 3D
+explorer, evidence panel, export buttons, @bmc chat intent) so nothing in the
+UI changes — every call passes through to ``BMC_URL`` and the upstream
+response is forwarded verbatim.
 
-Generation is synchronous here (9 grounded LLM calls, ~15-40s). For Phase 2
-Lite that's acceptable for an explicit user action. Phase 3 can move it to a
-streamed/async job if needed. The agent-facing path stays the FAST read tool
-(``get_company_bmc``) — see ``src/tools/bmc_tools.py``.
+Endpoints forwarded (per the intake spec):
+
+  POST /{ticker}/run                            — generate + persist
+  GET  /{ticker}                                — latest (cheap, no LLM)
+  GET  /{ticker}/library                        — all versions
+  GET  /{ticker}/{version}                      — specific version
+  POST /{ticker}/blocks/{block_id}/chat         — per-block drill-down chat
+  GET  /{ticker}/{version}/export?format=...    — json | pdf  (xlsx → 501)
+  POST /{ticker}/diff                           — temporal diff
+
+Tenant: the PRISM backend's authenticated firm is injected as ``firm_id`` into
+every BMC service request body / query param so per-firm canvas history stays
+consistent across services.
+
+Why proxy at all (vs frontend → BMC_URL direct)?
+  * Single CORS/auth surface (PRISM)  — when real auth lands, BMC inherits it.
+  * Single audit-log surface          — BMC calls show up in PRISM's logs.
+  * No new env var leaked to the browser bundle.
 """
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy.ext.asyncio import AsyncSession
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from pydantic import BaseModel
 
+from src.config import settings
 from src.core.auth import get_current_firm_id
-from src.core.database import get_session
-from src.models.bmc import BMCAnalysis
-from src.repositories.bmc_repo import BMCRepository
-from src.agents.bmc.block_chat import build_bmc_block_chat_agent
-from src.agents.bmc.blocks import BMC_BLOCKS_BY_ID
-from src.schemas.bmc import (
-    BMCBlockRead,
-    BMCChatRequest,
-    BMCChatResponse,
-    BMCContradiction,
-    BMCEvidenceRead,
-    BMCRead,
-    BMCRunRequest,
-    BMCVersionSummary,
-)
-from src.services.bmc import BMCGenerator
-from src.services.bmc.agent_exec import run_agent_to_text
-from src.services.bmc.exporter import EXPORT_FORMATS, export_bmc, filename_for
 
 router = APIRouter(prefix="/bmc", tags=["Business Model Canvas"])
 
+# Timeouts per the intake spec. /run + /diff can cold-build (downloads + reads +
+# LLM extraction); the rest are DB-only and snappy.
+_HEAVY_TIMEOUT = 180.0   # POST /run, POST /diff
+_LIGHT_TIMEOUT = 30.0    # everything else
 
-def _to_read(analysis: BMCAnalysis) -> BMCRead:
-    """Serialize an analysis (with blocks + evidence) into the API shape,
-    blocks ordered for the 3x3 grid."""
-    ordered = sorted(analysis.blocks, key=lambda b: b.order)
-    return BMCRead(
-        id=analysis.id,
-        ticker=analysis.ticker,
-        company_id=analysis.company_id,
-        version=analysis.version,
-        fiscal_period=analysis.fiscal_period,
-        status=analysis.status,
-        overall_confidence=analysis.overall_confidence,
-        model=analysis.model,
-        created_at=analysis.created_at,
-        blocks=[
-            BMCBlockRead(
-                block_id=b.block_id,
-                title=b.title,
-                order=b.order,
-                summary_bullets=b.summary_bullets,
-                key_insights=b.key_insights,
-                confidence=b.confidence,
-                status=b.status,
-                evidence=[BMCEvidenceRead.model_validate(e) for e in b.evidence],
-            )
-            for b in ordered
-        ],
-        contradictions=[
-            BMCContradiction(**c) for c in (analysis.contradictions or [])
-        ],
+
+def _bmc_url(path: str) -> str:
+    return f"{settings.BMC_URL.rstrip('/')}{path}"
+
+
+async def _forward_json(
+    method: str,
+    path: str,
+    *,
+    timeout: float,
+    body: dict | None = None,
+    params: dict | None = None,
+) -> Any:
+    """Call the BMC service and forward the JSON response. Upstream status codes
+    propagate to the caller verbatim so the frontend can distinguish 404 from
+    422 from 502 the same way it would talking directly to the service."""
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.request(method, _bmc_url(path), json=body, params=params)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"BMC service unreachable: {exc}",
+        ) from exc
+    if resp.status_code >= 400:
+        detail: Any
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:  # noqa: BLE001
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return resp.json()
+
+
+# ── Request models — match the upstream API; we inject firm_id ────────────────
+
+
+class BMCRunRequest(BaseModel):
+    fiscal_period: str | None = None
+
+
+class BMCChatRequest(BaseModel):
+    user_message: str
+    user_id: str | None = None
+    version: int | None = None
+
+
+class BMCDiffRequest(BaseModel):
+    period_a: str
+    period_b: str
+    refresh: bool = False
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+
+@router.post("/{ticker}/run", summary="Generate a new BMC version (read-on-demand)")
+async def run_bmc(
+    ticker: str,
+    body: BMCRunRequest,
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> Any:
+    return await _forward_json(
+        "POST",
+        f"/bmc/{ticker}/run",
+        body={**body.model_dump(exclude_none=True), "firm_id": firm_id},
+        timeout=_HEAVY_TIMEOUT,
+    )
+
+
+@router.get("/{ticker}", summary="Latest persisted BMC for this firm + ticker")
+async def get_latest_bmc(
+    ticker: str,
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> Any:
+    return await _forward_json(
+        "GET", f"/bmc/{ticker}", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
+    )
+
+
+@router.get("/{ticker}/library", summary="All saved versions (header-level)")
+async def list_versions(
+    ticker: str,
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> Any:
+    return await _forward_json(
+        "GET", f"/bmc/{ticker}/library", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
     )
 
 
 @router.post(
-    "/{ticker}/run",
-    response_model=BMCRead,
-    summary="Generate a new filing-grounded Business Model Canvas",
-    description=(
-        "Runs grounded generation across all 9 Osterwalder blocks for the "
-        "company, citing the filing chunks each claim draws from. Creates a "
-        "new version (never overwrites — enables temporal diffing later). "
-        "Synchronous; takes ~15-40s. Requires the company to have ingested "
-        "filings, else most blocks return 'evidence_missing'."
-    ),
-    responses={404: {"description": "Company not in coverage universe."}},
-)
-async def run_bmc(
-    ticker: str,
-    body: BMCRunRequest,
-    session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
-) -> BMCRead:
-    generator = BMCGenerator(session)
-    result = await generator.generate(firm_id, ticker, fiscal_period=body.fiscal_period)
-
-    if result.status == "failed" and result.bmc_id is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=result.detail)
-
-    # Reload with blocks + evidence for the response.
-    analysis = await BMCRepository(session).get_by_id(result.bmc_id)  # type: ignore[arg-type]
-    assert analysis is not None
-    return _to_read(analysis)
-
-
-@router.get(
-    "/{ticker}",
-    response_model=BMCRead,
-    summary="Latest Business Model Canvas for a company",
-    responses={404: {"description": "No canvas generated yet."}},
-)
-async def get_latest_bmc(
-    ticker: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
-) -> BMCRead:
-    analysis = await BMCRepository(session).get_latest(firm_id, ticker.upper())
-    if analysis is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No BMC generated for {ticker.upper()} yet. POST /bmc/{ticker}/run to create one.",
-        )
-    return _to_read(analysis)
-
-
-@router.post(
     "/{ticker}/blocks/{block_id}/chat",
-    response_model=BMCChatResponse,
-    summary="Drill-down chat about one BMC block",
-    description=(
-        "Ask a follow-up question about a specific block. The answer is grounded "
-        "ONLY in that block's evidence excerpts (with NRE math), so it stays "
-        "consistent with the canvas. Stateless — pass the prior thread in `history`."
-    ),
-    responses={404: {"description": "No canvas or block not found."}},
+    summary="Drill-down chat scoped to one BMC block",
 )
 async def chat_about_block(
     ticker: str,
     block_id: str,
     body: BMCChatRequest,
-    session: Annotated[AsyncSession, Depends(get_session)],
     firm_id: Annotated[str, Depends(get_current_firm_id)],
-) -> BMCChatResponse:
-    analysis = await BMCRepository(session).get_latest(firm_id, ticker.upper())
-    if analysis is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No BMC generated for {ticker.upper()} yet.",
-        )
-    block = next((b for b in analysis.blocks if b.block_id == block_id), None)
-    if block is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Block {block_id!r} not found in {ticker.upper()}'s canvas.",
-        )
-
-    block_def = BMC_BLOCKS_BY_ID.get(block_id)
-    focus = block_def.focus if block_def else block.title
-
-    # Numbered evidence excerpts backing this block.
-    numbered_evidence = "\n\n".join(
-        f"[{i}] (p.{ev.page_number}) {ev.excerpt}"
-        for i, ev in enumerate(block.evidence, start=1)
-    ) or "(no evidence excerpts on file for this block)"
-
-    # Render prior thread + the block's current bullets for context.
-    bullets = "\n".join(f"- {b}" for b in block.summary_bullets)
-    history = "\n".join(f"{m.role}: {m.content}" for m in body.history)
-    message = (
-        f"Block: {block.title}\n"
-        f"Current bullets:\n{bullets}\n\n"
-        f"Evidence excerpts:\n{numbered_evidence}\n\n"
-        + (f"Conversation so far:\n{history}\n\n" if history else "")
-        + f"Analyst question: {body.message}"
+) -> Any:
+    payload = body.model_dump(exclude_none=True)
+    # The upstream tracks chat history in `bmc_chats`. Until real users exist,
+    # key the thread to the firm so users in the same firm share continuity.
+    payload.setdefault("user_id", firm_id)
+    return await _forward_json(
+        "POST",
+        f"/bmc/{ticker}/blocks/{block_id}/chat",
+        body={**payload, "firm_id": firm_id},
+        timeout=_LIGHT_TIMEOUT,
     )
 
-    agent = build_bmc_block_chat_agent(block.title, focus)
-    answer = await run_agent_to_text(agent, message)
-    return BMCChatResponse(answer=answer or "I couldn't find an answer in this block's evidence.")
+
+@router.post("/{ticker}/diff", summary="Temporal diff between two fiscal periods")
+async def diff_bmc(
+    ticker: str,
+    body: BMCDiffRequest,
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> Any:
+    return await _forward_json(
+        "POST",
+        f"/bmc/{ticker}/diff",
+        body={**body.model_dump(), "firm_id": firm_id},
+        timeout=_HEAVY_TIMEOUT,
+    )
 
 
 @router.get(
     "/{ticker}/export",
-    summary="Export the latest canvas as JSON / XLSX / PDF",
-    description="Download a self-documenting export (includes the Sources audit trail).",
-    responses={404: {"description": "No canvas generated yet."}, 400: {"description": "Bad format."}},
+    summary="Export the latest canvas (JSON | PDF; XLSX is 501 upstream)",
 )
-async def export_bmc_endpoint(
+async def export_latest(
     ticker: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
     firm_id: Annotated[str, Depends(get_current_firm_id)],
-    format: str = "pdf",
+    format: str = Query("pdf", pattern="^(json|pdf|xlsx)$"),
 ) -> Response:
-    fmt = format.lower()
-    if fmt not in EXPORT_FORMATS:
+    """Fetch latest version then forward the export bytes."""
+    latest = await _forward_json(
+        "GET", f"/bmc/{ticker}", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
+    )
+    version = latest.get("version")
+    if version is None:
+        raise HTTPException(status_code=404, detail=f"No BMC yet for {ticker}.")
+    return await _export_version(ticker, int(version), firm_id, format)
+
+
+@router.get(
+    "/{ticker}/{version}/export",
+    summary="Export a specific canvas version (JSON | PDF; XLSX is 501 upstream)",
+)
+async def export_version(
+    ticker: str,
+    version: int,
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    format: str = Query("pdf", pattern="^(json|pdf|xlsx)$"),
+) -> Response:
+    return await _export_version(ticker, version, firm_id, format)
+
+
+async def _export_version(ticker: str, version: int, firm_id: str, fmt: str) -> Response:
+    """Forward export bytes verbatim — the upstream sets the right Content-Type
+    (application/pdf, application/json, or returns 501 for xlsx)."""
+    url = _bmc_url(f"/bmc/{ticker}/{version}/export")
+    try:
+        async with httpx.AsyncClient(timeout=_LIGHT_TIMEOUT) as client:
+            resp = await client.get(url, params={"format": fmt, "firm_id": firm_id})
+    except httpx.RequestError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported format {format!r}. Valid: {list(EXPORT_FORMATS)}",
-        )
-    analysis = await BMCRepository(session).get_latest(firm_id, ticker.upper())
-    if analysis is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No BMC generated for {ticker.upper()} yet.",
-        )
-    bmc = _to_read(analysis)
-    data = export_bmc(bmc, fmt)
-    media_type = EXPORT_FORMATS[fmt][0]
+            status_code=502, detail=f"BMC service unreachable: {exc}"
+        ) from exc
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:  # noqa: BLE001
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
     return Response(
-        content=data,
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename_for(bmc, fmt)}"'},
+        content=resp.content,
+        media_type=resp.headers.get("content-type", "application/octet-stream"),
+        headers={"Content-Disposition": resp.headers.get("content-disposition", "")},
     )
 
 
-@router.get(
-    "/{ticker}/library",
-    response_model=list[BMCVersionSummary],
-    summary="All canvas versions for a company (headers only)",
-)
-async def list_bmc_versions(
-    ticker: str,
-    session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
-) -> list[BMCVersionSummary]:
-    versions = await BMCRepository(session).list_versions(firm_id, ticker.upper())
-    return [BMCVersionSummary.model_validate(v) for v in versions]
-
-
-@router.get(
-    "/{ticker}/{version}",
-    response_model=BMCRead,
-    summary="A specific canvas version",
-    responses={404: {"description": "Version not found."}},
-)
-async def get_bmc_version(
+# Specific-version GET — declared AFTER /library and /export so the path
+# doesn't capture those literals (FastAPI matches in declaration order).
+@router.get("/{ticker}/{version}", summary="Specific persisted version")
+async def get_version(
     ticker: str,
     version: int,
-    session: Annotated[AsyncSession, Depends(get_session)],
     firm_id: Annotated[str, Depends(get_current_firm_id)],
-) -> BMCRead:
-    analysis = await BMCRepository(session).get_version(firm_id, ticker.upper(), version)
-    if analysis is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"BMC version {version} for {ticker.upper()} not found.",
-        )
-    return _to_read(analysis)
+) -> Any:
+    return await _forward_json(
+        "GET",
+        f"/bmc/{ticker}/{version}",
+        params={"firm_id": firm_id},
+        timeout=_LIGHT_TIMEOUT,
+    )

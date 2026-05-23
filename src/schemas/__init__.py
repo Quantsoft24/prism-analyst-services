@@ -31,3 +31,4 @@ __all__ = [
     "FinalEvent",
     "ErrorEvent",
 ]
+# Filings schemas retired with the RAG layer (2026-05-24).
