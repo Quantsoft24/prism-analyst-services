@@ -10,6 +10,7 @@ from src.models.bmc import BMCAnalysis, BMCBlock, BMCEvidence
 from src.models.company import Company, CompanyAlias
 from src.models.filing import Filing, FilingChunk
 from src.models.firm import Firm
+from src.models.integration import FirmIntegration
 from src.models.user import FirmMembership, User
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "BMCAnalysis",
     "BMCBlock",
     "BMCEvidence",
+    "FirmIntegration",
 ]

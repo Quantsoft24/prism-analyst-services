@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # changing any consumer code — ``FilingsRegistry`` is the seam.
     INGESTION_REGISTRY_PATH: str = "config/ingestion_sources.yml"
 
+    # ── Integrations (agent tools / MCP / sub-agents) ──
+    # Declarative registry of agent-callable resources. Same YAML→DB migration
+    # seam as the ingestion registry. See docs/INTEGRATION_INTAKE.md.
+    INTEGRATIONS_REGISTRY_PATH: str = "config/integrations.yml"
+    # Base URL for the teammate-built stock-chat filings service (no caller auth;
+    # network-restricted). Referenced by the stock-chat integration tool.
+    STOCK_CHAT_URL: str = "http://localhost:8011"
+
     # Hybrid retrieval — Reciprocal Rank Fusion (RRF) parameters.
     # ``k`` is the standard RRF constant (60 is the value used in the
     # original RRF paper; rarely needs tuning).

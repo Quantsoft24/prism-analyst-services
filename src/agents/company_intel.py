@@ -78,8 +78,14 @@ REFUSE:
 """
 
 
-def build_company_intel_agent() -> PrismAgent:
+def build_company_intel_agent(integrations: str | list[str] | None = "*") -> PrismAgent:
     """Construct the Company Intelligence agent declaration.
+
+    Args:
+        integrations: which registered integrations to attach — ``"*"`` (all,
+            the default) or a list of integration names. Callers with a firm
+            context (the chat router) pass the firm's *enabled* names so a
+            firm-disabled tool isn't offered to the LLM. See ``firm_state``.
 
     Lazily-bound: actual ADK Agent object is built when ``.build()`` is
     called, so this function is safe to call in any context (tests, CLI,
@@ -102,8 +108,11 @@ def build_company_intel_agent() -> PrismAgent:
     web_search_adk_agent = web_search_agent_decl.build()
     web_search_tool = AgentTool(agent=web_search_adk_agent)
 
-    # Tools = company metadata + filing retrieval (RAG) + BMC read + NRE math
-    # + web search.
+    # Built-in tools = company metadata + filing retrieval (RAG) + BMC read +
+    # NRE math + web search. Registered integrations (stock-chat, MCP servers,
+    # ...) are merged in by PrismAgent.build() via ``integrations="*"`` — all
+    # firm-wide tools, since Part-A imposes no per-agent restriction and the LLM
+    # picks dynamically.
     tools = (
         COMPANY_TOOLS.to_list()
         + FILING_TOOLS.to_list()
@@ -124,5 +133,6 @@ def build_company_intel_agent() -> PrismAgent:
         model_tier="fast",
         instruction=COMPANY_INTEL_INSTRUCTION,
         tools=tools,
+        integrations=integrations,  # "*" = all; chat passes the firm's enabled names
         max_iterations=settings.AGENT_MAX_ITERATIONS,
     )

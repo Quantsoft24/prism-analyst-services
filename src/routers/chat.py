@@ -28,10 +28,13 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from src.agents import build_company_intel_agent
 from src.core.auth import get_current_firm_id
+from src.core.database import get_session
+from src.integrations.firm_state import enabled_integration_names
 from src.schemas.chat import ChatRunRequest
 from src.services.agent_runner import AgentRunner, ChatEvent
 
@@ -65,12 +68,15 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 )
 async def run_agent(
     body: ChatRunRequest,
+    session: Annotated[AsyncSession, Depends(get_session)],
     firm_id: Annotated[str, Depends(get_current_firm_id)],
 ) -> EventSourceResponse:
     # Resolve the agent. Only one is registered in Slice 3 — but the
     # Literal on ``body.agent`` constrains valid values at the Pydantic layer.
     if body.agent == "company_intel":
-        agent = build_company_intel_agent()
+        # Attach only the integrations this firm has enabled (default ON).
+        enabled = await enabled_integration_names(firm_id, session)
+        agent = build_company_intel_agent(integrations=enabled)
     else:  # pragma: no cover — Pydantic Literal blocks this path
         raise ValueError(f"Unknown agent: {body.agent}")
 

@@ -19,11 +19,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
 from src.core.database import dispose_engine, init_engine
+from src.integrations import dispose_registry, init_registry
 from src.routers import (
     bmc_router,
     chat_router,
     companies_router,
     filings_router,
+    integrations_router,
     router_health_router,
 )
 from src.services.model_router import dispose_router, init_router
@@ -82,9 +84,18 @@ async def lifespan(app: FastAPI):
                 "Agent endpoints will fail until a key is configured."
             )
 
+    # Build the integration registry AFTER the router (agent-source integrations
+    # need the router to build their sub-agents). Failures are isolated per
+    # integration and surfaced via GET /integrations — never block startup.
+    try:
+        await init_registry(settings.INTEGRATIONS_REGISTRY_PATH)
+    except Exception as exc:  # noqa: BLE001 — registry must never block boot
+        logger.warning("Integration registry failed to initialize: %s", exc)
+
     try:
         yield
     finally:
+        dispose_registry()
         dispose_router()
         await dispose_engine()
 
@@ -136,6 +147,7 @@ app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(filings_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
+app.include_router(integrations_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).
 # We mount unconditionally so the route table is consistent.
 app.include_router(router_health_router, prefix=settings.API_PREFIX)

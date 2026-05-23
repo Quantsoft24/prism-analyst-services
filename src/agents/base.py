@@ -56,6 +56,14 @@ class PrismAgent:
     tools:
         ADK-compatible tool objects (``FunctionTool`` instances, ``google_search``,
         etc.). Empty list = a pure-LLM agent (no tools).
+    integrations:
+        Which registered integrations (from ``config/integrations.yml``) this
+        agent gets, resolved through the registry at ``.build()`` time:
+          * ``None``  → no integration tools (default — keeps tightly-scoped
+            sub-agents like the BMC block agents clean).
+          * ``"*"``   → ALL enabled integration tools (firm-wide; the main
+            user-facing agent uses this — Part-A: no per-agent restriction).
+          * ``[names]`` → only those named integrations (future per-agent control).
     description:
         Short human-readable summary surfaced in the OpenAPI spec.
     max_iterations:
@@ -67,6 +75,7 @@ class PrismAgent:
     model_tier: str = "fast"
     model: str | None = None  # explicit override; None = use model_tier via router
     tools: list[Any] = field(default_factory=list)
+    integrations: str | list[str] | None = None
     description: str = ""
     max_iterations: int = 10
 
@@ -85,14 +94,32 @@ class PrismAgent:
         from google.adk.agents import Agent as AdkAgent
 
         model_arg = self._resolve_model()
+        tools = list(self.tools) + self._integration_tools()
 
         return AdkAgent(
             name=self.name,
             model=model_arg,
             instruction=self.instruction,
             description=self.description or self.name,
-            tools=list(self.tools),
+            tools=tools,
         )
+
+    def _integration_tools(self) -> list[Any]:
+        """Resolve ``self.integrations`` against the registry (see field docs).
+        Registry-agnostic at import time; returns [] if the registry isn't built
+        (tests, registry disabled) so agents always build."""
+        if self.integrations is None:
+            return []
+        from src.integrations import get_registry
+
+        registry = get_registry()
+        if registry is None:
+            return []
+        if self.integrations == "*":
+            return registry.tools()
+        if isinstance(self.integrations, list):
+            return registry.tools_for(self.integrations)
+        return []
 
     def _resolve_model(self) -> Any:
         """Pick the model object/string for this agent — see ``build()`` docstring."""
