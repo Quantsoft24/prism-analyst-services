@@ -73,9 +73,10 @@ def test_cagr_zero_periods_raises():
 
 
 def test_margin_basic():
-    # Operating margin = 668380 / 2670210 * 100 ≈ 25.03% (TCS FY26 fact sheet).
+    # Operating margin = 668380 / 2670210 * 100 = 25.0309 (rounded to 4 dp).
+    # TCS FY26 fact sheet rounds to 25.0% in the printed PDF.
     r = engine.margin_pct(668380, 2670210)
-    assert r.result == pytest.approx(25.0291, abs=1e-3)
+    assert r.result == pytest.approx(25.0309, abs=1e-4)
 
 
 def test_margin_zero_denominator_raises():
