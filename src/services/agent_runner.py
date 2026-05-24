@@ -44,7 +44,7 @@ from src.schemas.chat import (
 )
 
 if TYPE_CHECKING:
-    from google.adk.runners import Runner
+    pass
 
 logger = logging.getLogger(__name__)
 

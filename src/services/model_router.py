@@ -339,12 +339,11 @@ def _install_litellm_shim(router: "Router") -> None:
     if _litellm_patched:
         return
 
-    import litellm
-
     # Force ADK's lazy loader to populate its module globals so we can patch
     # them. The import is cheap (LiteLlm class only) but triggers the
     # ``_ensure_litellm_imported`` path on some ADK versions.
     import google.adk.models.lite_llm as adk_lite_llm  # noqa: F401
+    import litellm
 
     if hasattr(adk_lite_llm, "_ensure_litellm_imported"):
         try:
@@ -392,8 +391,8 @@ def _uninstall_litellm_shim() -> None:
     global _original_adk_acompletion, _original_adk_completion
     if not _litellm_patched:
         return
-    import litellm
     import google.adk.models.lite_llm as adk_lite_llm
+    import litellm
 
     if _original_acompletion is not None:
         litellm.acompletion = _original_acompletion  # type: ignore[assignment]

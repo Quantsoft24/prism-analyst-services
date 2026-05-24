@@ -29,7 +29,6 @@ if TYPE_CHECKING:
     # Avoid importing ADK at module load time so the rest of the app can
     # boot even if google-adk isn't installed yet (tests, CI lint, etc.).
     from google.adk.agents import Agent as AdkAgent
-    from google.adk.tools import BaseTool
 
 
 @dataclass(slots=True)

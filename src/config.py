@@ -180,7 +180,7 @@ class Settings(BaseSettings):
         url = raw
         for prefix in ("postgresql://", "postgres://"):
             if url.startswith(prefix):
-                url = f"postgresql+asyncpg://" + url[len(prefix):]
+                url = "postgresql+asyncpg://" + url[len(prefix):]
                 break
         return _strip_sslmode(url)
 

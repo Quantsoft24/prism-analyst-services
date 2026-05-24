@@ -35,7 +35,6 @@ from __future__ import annotations
 from src.agents.base import PrismAgent
 from src.config import settings
 
-
 WEB_SEARCH_INSTRUCTION = """\
 You are PRISM's web search agent. You have ONE job: take the user's query,
 run it through Google Search, and return a concise factual summary with

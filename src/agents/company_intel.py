@@ -33,7 +33,6 @@ from src.config import settings
 from src.tools.company_tools import COMPANY_TOOLS
 from src.tools.nre_tools import NRE_TOOLS
 
-
 COMPANY_INTEL_INSTRUCTION = f"""\
 {FINANCE_DOMAIN_RULES}
 

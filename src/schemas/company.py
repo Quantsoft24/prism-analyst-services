@@ -15,7 +15,6 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 _ID_NAMESPACE = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
