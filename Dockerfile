@@ -14,11 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 
-# Source + migrations + alembic config.
+# Source + migrations + alembic config + integration registry.
 # Alembic is shipped in the image so production can run `alembic upgrade head`
-# without rebuilding (see deploy.yml — migration step lands in Phase 1 W1).
+# without rebuilding (see deploy.yml).
+# `config/` carries the integration registry (`integrations.yml`) — without
+# this COPY, the registry loads zero tools and `/api/v1/integrations` returns
+# an empty list. The path is set by ``settings.INTEGRATIONS_REGISTRY_PATH``.
 COPY src/ src/
 COPY alembic/ alembic/
+COPY config/ config/
 COPY alembic.ini .
 
 EXPOSE 8000
