@@ -40,3 +40,9 @@ htmlcov/
 
 # ── Docker ──
 docker-compose.override.yml
+
+# ── Local filing storage (legacy RAG dev dir; kept ignored for safety) ──
+.data/
+
+# ── Local server logs (uvicorn etc.) — never commit ──
+*.log

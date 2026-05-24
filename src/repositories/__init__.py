@@ -1,9 +1,14 @@
-"""PRISM Repositories — Data access layer.
+"""Data access layer — thin async repositories over SQLAlchemy 2.x.
 
-This package will contain:
-- base.py: Async connection pool management
-- company_repo.py: master_companies queries
-- chunk_repo.py: document_chunks + hybrid search
-- citation_repo.py: Citation resolution
-- metric_repo.py: financial_metrics queries
+Repositories are responsible for queries, ordering, and pagination — never
+for HTTP concerns (those belong in routers) and never for business policy
+(those belong in services / agents).
 """
+
+from src.repositories.company_repo import CompanyRepository
+from src.repositories.integration_repo import IntegrationRepository
+
+__all__ = [
+    "CompanyRepository",
+    "IntegrationRepository",
+]

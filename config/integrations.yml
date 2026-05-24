@@ -1,0 +1,83 @@
+# PRISM Integration Registry
+#
+# One entry per agent-callable resource. Adding a tool = a reviewed PR here —
+# no agent code changes. See docs/INTEGRATION_INTAKE.md for the per-tool form.
+#
+# Fields:
+#   name        unique id
+#   source      python | openapi | mcp | agent
+#   enabled     true/false (Part-A default: ON)
+#   description shown in Settings → Tools & Capabilities + GET /integrations
+#   auth        {type: none|api_key|bearer, env: VAR_NAME, header: X-API-Key}
+#                 secret is read from the env var — NEVER inline a secret here
+#   config      source-specific (entrypoint / spec_url / transport+url / ...)
+
+# ── Live: stock-chat (teammate REST service; we wire ONLY POST /tools/read) ──
+# Intake said the agent must use exactly one endpoint, so we expose a single
+# typed tool (a python wrapper) rather than auto-generating every endpoint from
+# its OpenAPI spec. Base URL via env STOCK_CHAT_URL; the service has no caller
+# auth (network-restricted).
+- name: stock-chat
+  source: python
+  enabled: true
+  description: >
+    Indian NSE/BSE filings service (649k catalog). Exposes three tools:
+    filings narrative Q&A (reads PDFs, cited evidence), catalog lookup (which
+    filings exist), and live technicals (price/RSI/MACD). Narrative + market
+    data; exact financials still go through PRISM's own retrieval + NRE.
+  tags: [filings, research, market-data]
+  config:
+    entrypoint: "src.integrations.tools.stock_chat:STOCK_CHAT_TOOLS"
+
+# ── Live: bmc (teammate read-on-demand 9-block canvas; replaces PRISM RAG BMC) ──
+# Six agent-routable endpoints exposed as typed wrappers (get / generate /
+# library / get_version / block_chat / diff). The export endpoint is binary
+# and surfaced through the UI proxy at /api/v1/bmc/{ticker}/{version}/export,
+# not as an agent tool. Base URL via env BMC_URL; no caller auth (network-
+# restricted to PRISM backend's IP on :8012).
+- name: bmc
+  source: python
+  enabled: true
+  description: >
+    Citation-grounded Business Model Canvas for an Indian NSE/BSE-listed
+    company — 9 canonical Osterwalder blocks read on-demand from the
+    company's own Annual Report + Investor Presentation + latest Result. Also
+    per-block drill-down chat, JSON/PDF export, and temporal diff between two
+    fiscal periods. Use for "business model" / "BMC <ticker>" / "compare X's
+    business model FY24 vs FY26". Not for exact numbers (those go to PRISM
+    compute_*); not for one-shot questions about a single filing (those go
+    to stock_filings_read).
+  tags: [bmc, research]
+  config:
+    entrypoint: "src.integrations.tools.bmc:BMC_TOOLS"
+
+# ── Commented examples — copy/uncomment to add each type ─────────────────────
+#
+# OpenAPI service (auto-generate a tool per operation; tool_filter restricts):
+# - name: credit-scorer
+#   source: openapi
+#   enabled: true
+#   description: External credit-scoring API.
+#   auth: { type: bearer, env: CREDIT_API_KEY }
+#   config:
+#     spec_url: "https://credit.internal/openapi.json"
+#     tool_filter: ["score_company"]   # only expose these operations
+#
+# MCP server (Streamable HTTP is the production transport; sse / stdio also ok):
+# - name: market-data-mcp
+#   source: mcp
+#   enabled: true
+#   description: Market-data MCP server.
+#   auth: { type: bearer, env: MARKET_MCP_TOKEN }
+#   config:
+#     transport: streamable_http
+#     url: "https://mcp.internal/mcp"
+#     tool_filter: ["get_quote", "get_ohlc"]
+#
+# Specialist sub-agent exposed as a tool:
+# - name: modelling-agent
+#   source: agent
+#   enabled: true
+#   description: DCF / valuation modelling sub-agent.
+#   config:
+#     entrypoint: "src.agents.modelling:build_modelling_agent"
