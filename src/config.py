@@ -123,22 +123,31 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     def _build_url(self, driver: str, strip_sslmode: bool) -> str:
-        """Build a SQLAlchemy URL for a given DBAPI driver.
+        """Build a SQLAlchemy URL for the requested DBAPI driver.
 
-        Drivers:
-          * ``asyncpg`` — used by the FastAPI app at runtime. Doesn't accept
-            ``sslmode=`` in the URL; we pass SSL through ``connect_args``.
+        Normalises ANY scheme prefix to ``postgresql+{driver}://``, including:
+          * bare ``postgresql://`` / ``postgres://``       (env-var convention)
+          * already-driver-tagged ``postgresql+asyncpg://`` / ``+psycopg://``
+            (so Alembic gets the SYNC driver even when CI passes an async URL)
+
+        Drivers we care about:
+          * ``asyncpg`` — FastAPI runtime. Doesn't accept ``sslmode=`` in the
+            URL; SSL goes through ``connect_args``.
           * ``psycopg`` — psycopg3, used by Alembic for migrations. Accepts
-            standard libpq URL params including ``sslmode``, so we preserve
-            them.
+            libpq URL params (``sslmode=...``) directly.
         """
         if self.DATABASE_URL:
             url = self.DATABASE_URL
-            # Normalize both postgres:// and postgresql:// to the explicit driver.
-            for prefix in ("postgresql://", "postgres://"):
-                if url.startswith(prefix):
-                    url = f"postgresql+{driver}://" + url[len(prefix):]
-                    break
+            # Any existing scheme → the requested driver.
+            if url.startswith("postgresql+"):
+                # postgresql+asyncpg://... or postgresql+psycopg://... — strip
+                # the driver, re-attach the requested one.
+                _, _, rest = url.partition("://")
+                url = f"postgresql+{driver}://{rest}"
+            elif url.startswith("postgresql://"):
+                url = f"postgresql+{driver}://" + url[len("postgresql://"):]
+            elif url.startswith("postgres://"):
+                url = f"postgresql+{driver}://" + url[len("postgres://"):]
             return _strip_sslmode(url) if strip_sslmode else url
 
         return (
