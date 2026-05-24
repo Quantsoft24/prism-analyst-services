@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "prism-analyst-services"
 version = "0.1.0"
@@ -6,18 +10,51 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
     "pydantic-settings>=2.6.0",
     "httpx>=0.28.0",
+    "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.0",
+    "alembic>=1.14.0",
+    "greenlet>=3.1.0",
     "python-dotenv>=1.0.0",
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
+    "sse-starlette>=2.1.0",
+    # NOTE: pin ≥1.83.0 — versions 1.82.7 and 1.82.8 had a PyPI supply-chain
+    # compromise (March 2026). Do not regress this floor without security review.
+    "litellm>=1.83.0",
+    # pyyaml drives the declarative integration registry (config/integrations.yml).
+    "pyyaml>=6.0.2",
+    # RAG stack retired with the read-on-demand cutover (2026-05-24):
+    #   fsspec / numpy / pdfplumber / tiktoken — removed.
+    # BMC export and BMC-specific renderers also retired — the external bmc
+    # service now owns export (openpyxl/fpdf2 dropped).
+    # NOTE: pgvector stays as a dep even though the runtime no longer uses it.
+    # Historical migrations (0001_initial_schema, 0004_filings_and_chunks) still
+    # import `from pgvector.sqlalchemy import Vector`. Alembic loads every
+    # migration module on startup to compute the chain, so the import must
+    # resolve. Squashing those migrations is the cleaner long-term fix.
+    "pgvector>=0.3.6",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
     "ruff>=0.8.0",
+    "anyio>=4.6.0",
 ]
+
+# ── Package discovery ──
+# ``src`` is itself the top-level importable package (``src/__init__.py``
+# exists and code imports ``from src.xxx``). Without this, setuptools'
+# auto-discovery is ambiguous given the flat layout (src/ tests/ alembic/
+# config/ all at root) and ``pip install -e .`` won't expose ``src``.
+[tool.setuptools.packages.find]
+include = ["src*"]
 
 [tool.ruff]
 target-version = "py311"
@@ -29,3 +66,8 @@ select = ["E", "F", "I", "W"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+# Add the project root to sys.path so ``from src.xxx`` resolves during tests
+# even without an editable install. Belt-and-suspenders alongside the
+# setuptools package config above.
+pythonpath = ["."]
