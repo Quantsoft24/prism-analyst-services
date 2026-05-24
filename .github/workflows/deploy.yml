@@ -31,10 +31,14 @@ jobs:
 
             cd ~/PRISM/prism-analyst-services
 
-            echo "📥 Pulling latest production code..."
+            echo "📥 Syncing to latest production code..."
+            # Hard-sync to origin/production. The EC2 working tree is a
+            # deploy artifact, not a dev checkout — any local modifications
+            # are stale hotfixes and must yield to what's in git.
             git fetch origin production
             git checkout production
-            git pull origin production
+            git reset --hard origin/production
+            git clean -fd
 
             echo "🔨 Building Docker image..."
             docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml build --no-cache backend
