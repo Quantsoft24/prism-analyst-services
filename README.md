@@ -235,6 +235,13 @@ Don't run it by hand unless you're recovering from a failed deploy.
 
 ## Production deployment
 
+> **Full deployment guide:** see
+> [`DEPLOYMENT.md` in the platform repo](https://github.com/Quantsoft24/prism-analyst-platform/blob/main/DEPLOYMENT.md)
+> — covers every scenario (code changes, env var changes, secrets,
+> migrations, rollback, hotfixes), all the gotchas we've already hit, and
+> an honest assessment of where this setup is industry-standard vs where
+> the gaps are.
+
 ### Containers
 
 The 4-container stack (landing · frontend · backend · nginx) is orchestrated
