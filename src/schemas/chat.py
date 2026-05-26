@@ -58,7 +58,13 @@ class ToolCallEvent(BaseModel):
 
 
 class ToolResultEvent(BaseModel):
-    """Tool returned. ``ok=false`` carries an error message instead of a result."""
+    """Tool returned. ``ok=false`` carries an error message instead of a result.
+
+    ``error_code`` and ``next_action`` mirror the structured-error contract
+    (see ``src/integrations/tools/_errors.py``) — the UI uses them to render
+    icons / chips / hints. Both are optional for back-compat with legacy
+    tools that haven't been migrated.
+    """
 
     type: Literal["tool_result"] = "tool_result"
     call_id: str
@@ -66,6 +72,8 @@ class ToolResultEvent(BaseModel):
     ok: bool = True
     result_summary: str | None = None  # short human-readable, e.g. "found TCS · 8 fields"
     error: str | None = None
+    error_code: str | None = None
+    next_action: str | None = None  # one of NextAction (see _errors.py)
     latency_ms: int
 
 
@@ -76,11 +84,93 @@ class TokenEvent(BaseModel):
     text: str
 
 
+class AgentThoughtEvent(BaseModel):
+    """The agent surfaced a piece of reasoning the user can inspect.
+
+    Sent when ADK exposes thought / planning content parts. The UI renders
+    these as collapsible "Thinking…" cards above the eventual answer.
+
+    ``kind`` lets the UI default-expand the most useful kind:
+      • ``plan``     — initial step-list ("I'll first look up X, then …")
+      • ``reflect``  — mid-run reconsideration ("That tool returned …, so …")
+      • ``decision`` — branch chosen ("Using stock_filings_read because …")
+    """
+
+    type: Literal["agent_thought"] = "agent_thought"
+    text: str
+    kind: Literal["plan", "reflect", "decision"] = "decision"
+
+
+class ToolRetryEvent(BaseModel):
+    """The runner is re-invoking a tool after a transient failure.
+
+    Emitted between the failing ``tool_result`` and the next ``tool_call``
+    for the same ``call_id``. The frontend renders a ↻ retry indicator on
+    that tool's card.
+    """
+
+    type: Literal["tool_retry"] = "tool_retry"
+    call_id: str
+    tool: str
+    attempt: int  # 1-indexed: 2 means "second try"
+    reason: str  # short human reason ("upstream timeout", "503")
+
+
+class DataFreshnessEvent(BaseModel):
+    """A tool result carries a known data-freshness signal.
+
+    Emitted immediately after the corresponding ``tool_result`` when the
+    tool's response dict includes a ``data_freshness`` field (e.g. the
+    latest filing date in a ``stock_filings_*`` result, or ``"live"`` for
+    technicals). The UI shows a "data as of …" chip on the answer block
+    and the relevant tool card.
+    """
+
+    type: Literal["data_freshness"] = "data_freshness"
+    call_id: str
+    source: str  # short label e.g. "stock-chat filings"
+    as_of: str | None = None  # ISO date / "live" / null
+
+
+# ── Structured final-answer payload ───────────────────────────────────────
+
+
+class Citation(BaseModel):
+    """A single citation backing a fact in the final answer."""
+
+    label: str  # e.g. "Reliance Industries Q4 FY24 filing, p. 12"
+    url: str | None = None
+    source_kind: Literal["filing", "web", "bmc", "tool"] = "tool"
+    as_of: str | None = None  # ISO date or null
+    tool_call_id: str | None = None  # links to a ToolCallEvent.call_id
+
+
+class FinalAnswer(BaseModel):
+    """Structured answer payload. Replaces the bare string in ``FinalEvent.answer``.
+
+    The agent is instructed (see ``company_intel.py`` system prompt) to
+    return this shape on every successful turn. Older clients that consume
+    ``answer`` as a string still work via ``str(FinalAnswer)`` — but the
+    proper rendering path is to parse the structured fields.
+    """
+
+    text: str  # the prose answer (markdown allowed)
+    citations: list[Citation] = Field(default_factory=list)
+    confidence: Literal["high", "medium", "low"] = "medium"
+    data_freshness: str | None = None  # earliest source date present in the answer
+
+
 class FinalEvent(BaseModel):
-    """Terminal success event. ``cost_usd`` may be 0 on free-tier."""
+    """Terminal success event. ``cost_usd`` may be 0 on free-tier.
+
+    ``answer`` is the prose text (kept for back-compat); ``structured``
+    carries the FinalAnswer object when the agent emitted one — preferred
+    rendering path for the frontend.
+    """
 
     type: Literal["final"] = "final"
     answer: str
+    structured: FinalAnswer | None = None
     agent_run_id: uuid.UUID
     cost_usd: float
     input_tokens: int

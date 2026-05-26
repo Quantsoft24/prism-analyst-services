@@ -29,6 +29,7 @@ import logging
 import httpx
 
 from src.config import settings
+from src.integrations.tools._errors import make_error
 
 logger = logging.getLogger(__name__)
 
@@ -62,21 +63,55 @@ async def _request(method: str, path: str, *, timeout: float, body: dict | None 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(method, url, json=body, params=params)
+    except httpx.TimeoutException as exc:
+        logger.warning("BMC service timed out at %s: %s", url, exc)
+        return make_error(
+            message="The BMC service timed out building the canvas. Try again in a moment.",
+            code="bmc_timeout",
+            next_action="ask_user_to_retry_later",
+            retriable=True,
+            detail=str(exc),
+        )
     except httpx.RequestError as exc:
         logger.warning("BMC service unreachable at %s: %s", url, exc)
-        return {"error": f"bmc service unreachable ({method} {path}): {exc}"}
+        return make_error(
+            message="The BMC service is unreachable.",
+            code="bmc_unreachable",
+            next_action="ask_user_to_retry_later",
+            retriable=True,
+            detail=f"{method} {path}: {exc}",
+        )
+    if resp.status_code == 404:
+        return make_error(
+            message="No business model canvas exists yet for this ticker. Use bmc_generate to build one.",
+            code="bmc_not_found",
+            next_action="try_alternate_tool",
+            retriable=False,
+            detail=resp.text,
+        )
+    if resp.status_code >= 500:
+        return make_error(
+            message="The BMC service returned an internal error.",
+            code=f"bmc_http_{resp.status_code}",
+            next_action="ask_user_to_retry_later",
+            retriable=True,
+            detail=resp.text,
+        )
     if resp.status_code != 200:
-        return {
-            "error": f"bmc {method} {path} returned HTTP {resp.status_code}",
-            "detail": resp.text[:500],
-        }
+        return make_error(
+            message=f"The BMC service returned HTTP {resp.status_code}.",
+            code=f"bmc_http_{resp.status_code}",
+            next_action="give_up_gracefully",
+            retriable=False,
+            detail=resp.text,
+        )
     return resp.json()
 
 
 def _trim_bmc(data: dict) -> dict:
     """Strip bulky operational fields from a full BMC response so the LLM gets
     the model output, not the service's diagnostics."""
-    if "error" in data:
+    if data.get("ok") is False or "error" in data:
         return data
     return {
         "ticker": data.get("ticker"),
@@ -162,7 +197,7 @@ async def bmc_library(ticker: str) -> dict:
         "overall_confidence", "created_at", "bmc_id"}]}`` or ``{"error": ...}``.
     """
     data = await _request("GET", f"/bmc/{ticker}/library", timeout=_LIGHT_TIMEOUT)
-    if "error" in data:
+    if data.get("ok") is False or "error" in data:
         return data
     # The upstream may return a bare list or a dict — normalize.
     if isinstance(data, list):
@@ -201,7 +236,11 @@ async def bmc_block_chat(
         "history"}`` or ``{"error": ...}``.
     """
     if block_id not in BMC_BLOCK_IDS:
-        return {"error": f"Invalid block_id {block_id!r}. Must be one of {list(BMC_BLOCK_IDS)}."}
+        return make_error(
+            message=f"Invalid block_id {block_id!r}. Must be one of {list(BMC_BLOCK_IDS)}.",
+            code="bmc_invalid_block_id",
+            next_action="ask_user_to_clarify",
+        )
     body: dict = {"user_message": user_message}
     if version is not None:
         body["version"] = version
@@ -226,7 +265,11 @@ async def bmc_diff(ticker: str, period_a: str, period_b: str) -> dict:
         "from_cache"}`` or ``{"error": ...}``.
     """
     if period_a == period_b:
-        return {"error": "period_a and period_b must differ"}
+        return make_error(
+            message="period_a and period_b must be different fiscal years for a diff.",
+            code="bmc_diff_same_period",
+            next_action="ask_user_to_clarify",
+        )
     return await _request(
         "POST",
         f"/bmc/{ticker}/diff",
