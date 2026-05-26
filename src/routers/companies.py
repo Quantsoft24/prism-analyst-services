@@ -61,9 +61,10 @@ def _to_detail(c: CompanyIndustry) -> CompanyDetail:
     summary="List companies (Indian NSE/BSE catalog, 4,773 entries)",
     description=(
         "Paginated list backed by ``company_industry`` on the catalog DB. "
-        "Filter by ``search`` (matches ticker / scrip code / name), "
+        "Filter by ``search`` (typo-tolerant; matches ticker / scrip code / name), "
         "``sector`` (exact industry match), or ``exchange`` (accepted for "
-        "back-compat — the catalog itself is not exchange-partitioned)."
+        "back-compat — the catalog itself is not exchange-partitioned). "
+        "Pass ``fuzzy=false`` to revert to exact-substring matching."
     ),
 )
 async def list_companies(
@@ -74,11 +75,26 @@ async def list_companies(
     exchange: Annotated[str | None, Query(description="NSE | BSE (accepted, not enforced).")] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
+    fuzzy: Annotated[
+        bool,
+        Query(
+            description=(
+                "Fuzzy / typo-tolerant search (default). Set to false for "
+                "exact-substring ILIKE matching — useful for callers that "
+                "build their own ranking on top."
+            ),
+        ),
+    ] = True,
 ) -> Paginated[CompanyRead]:
     _ = firm_id  # auth-gated only; catalog is global
     repo = CompanyRepository(session)
     result = await repo.list(
-        search=search, sector=sector, exchange=exchange, limit=limit, offset=offset
+        search=search,
+        sector=sector,
+        exchange=exchange,
+        limit=limit,
+        offset=offset,
+        fuzzy=fuzzy,
     )
     return Paginated[CompanyRead](
         items=[_to_read(c) for c in result.items],

@@ -27,6 +27,11 @@ dependencies = [
     "litellm>=1.83.0",
     # pyyaml drives the declarative integration registry (config/integrations.yml).
     "pyyaml>=6.0.2",
+    # rapidfuzz powers typo-tolerant company search (search_companies tool +
+    # /api/v1/companies). 5MB wheel, MIT-licensed, no transitive deps. Used in
+    # repositories/company_repo.py as the Python-side fallback until pg_trgm
+    # is enabled on the shared catalog DB (see docs/CATALOG_DB_INDEXES.md).
+    "rapidfuzz>=3.10",
     # RAG stack retired with the read-on-demand cutover (2026-05-24):
     #   fsspec / numpy / pdfplumber / tiktoken — removed.
     # BMC export and BMC-specific renderers also retired — the external bmc

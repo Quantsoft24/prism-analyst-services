@@ -4,6 +4,10 @@
 Same API surface the LLM has always seen (``lookup_company``,
 ``search_companies``, ``list_covered_sectors``); the data source moved from
 PRISM's tiny curated table to the full Indian-markets catalog.
+
+Both ``lookup_company`` and ``search_companies`` are now **typo-tolerant**:
+they include a ``suggestions`` list of close-but-not-exact matches so the
+agent can surface "did you mean ...?" instead of confabulating.
 """
 
 from __future__ import annotations
@@ -11,10 +15,49 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from src.core.catalog_database import catalog_session_scope
+from src.models.catalog import CompanyIndustry
 from src.repositories.company_repo import CompanyRepository
 
 if TYPE_CHECKING:
     from google.adk.tools import FunctionTool
+
+
+# ── Shared formatters ──────────────────────────────────────────────────────
+
+
+def _to_full_row(c: CompanyIndustry) -> dict:
+    """Full record shape used by ``lookup_company``."""
+    return {
+        "found": True,
+        "ticker": c.code,
+        "name": c.company_name,
+        "legal_name": None,
+        "exchange": "NSE",
+        "sector": c.industry,
+        "industry": c.industry,
+        "country": "IN",
+        "isin": c.isin,
+        "cin": None,
+        "website": None,
+        "description": None,
+    }
+
+
+def _to_list_row(c: CompanyIndustry) -> dict:
+    """Compact record shape used by ``search_companies.items[]``."""
+    return {
+        "ticker": c.code,
+        "name": c.company_name,
+        "sector": c.industry,
+        "industry": c.industry,
+        "exchange": "NSE",
+    }
+
+
+def _to_suggestion(c: CompanyIndustry) -> dict:
+    """Minimal record shape used by the ``suggestions[]`` array — keeps the
+    payload small so the LLM doesn't burn tokens on near-misses."""
+    return {"ticker": c.code, "name": c.company_name}
 
 
 # ── Tool implementations ───────────────────────────────────────────────────
@@ -26,45 +69,59 @@ async def lookup_company(ticker: str) -> dict:
     Use this when the user mentions a specific ticker (e.g. "TCS", "RELIANCE",
     "MOIL") and you need verified metadata: company name, industry, ISIN.
 
-    Returns ``{"found": false}`` if the ticker isn't in the catalog — DO NOT
-    invent details. The catalog covers 4,773 Indian NSE/BSE-listed companies.
+    On a miss, returns ``{"found": false, "ticker": <input>,
+    "suggestions": [...]}`` — the suggestions list contains up to 3 of the
+    closest tickers/names by fuzzy match. If the user typed a typo
+    ("RELIACE"), the closest real ticker/name will be there; surface it as
+    "did you mean ...?" instead of inventing details.
+
+    The catalog covers 4,773 Indian NSE/BSE-listed companies.
 
     Args:
         ticker: Ticker symbol (uppercased internally), e.g. "TCS" or "RELIANCE".
 
     Returns:
-        Dict with ``found`` and on success ``ticker``, ``name``, ``exchange``
-        (always "NSE" in this catalog), ``sector``, ``industry``, ``country``
-        ("IN"), ``isin``. Fields not tracked by the catalog (legal_name, cin,
-        website, description) are returned as ``null``.
+        On hit: dict with ``found=true``, ``ticker``, ``name``, ``exchange``
+        ("NSE"), ``sector``, ``industry``, ``country`` ("IN"), ``isin``.
+        Fields not tracked by the catalog (legal_name, cin, website,
+        description) are returned as ``null``.
+
+        On miss: ``{"found": false, "ticker": <input>, "suggestions": [
+        {"ticker": "...", "name": "..."}, ...]}``.
     """
+    cleaned = ticker.strip().upper()
     async with catalog_session_scope() as session:
         repo = CompanyRepository(session)
-        c = await repo.get_by_ticker(ticker.strip().upper())
-        if c is None:
-            return {"found": False, "ticker": ticker}
+        c = await repo.get_by_ticker(cleaned)
+        if c is not None:
+            return _to_full_row(c)
+
+        # Miss → fuzzy-search the catalog for close matches so the LLM can
+        # offer "did you mean ...?" instead of inventing data.
+        result = await repo.list(search=cleaned, limit=3)
+        # Combine top items and suggestions for the surface — both are
+        # "close" matches even if some scored above the hit threshold.
+        near = (result.items or []) + (result.suggestions or [])
         return {
-            "found": True,
-            "ticker": c.code,
-            "name": c.company_name,
-            "legal_name": None,
-            "exchange": "NSE",
-            "sector": c.industry,
-            "industry": c.industry,
-            "country": "IN",
-            "isin": c.isin,
-            "cin": None,
-            "website": None,
-            "description": None,
+            "found": False,
+            "ticker": cleaned,
+            "suggestions": [_to_suggestion(c) for c in near[:3]],
         }
 
 
 async def search_companies(query: str, sector: str | None = None, limit: int = 10) -> dict:
     """Search the Indian-markets catalog by name, ticker, or sector.
 
+    Typo-tolerant: queries like "Reliac" or "Tata Consultanc" return the
+    correct companies. When the query is genuinely ambiguous or
+    misspelled, the response includes a ``suggestions`` list of the
+    nearest sub-threshold matches — surface them to the user as
+    "did you mean ...?" instead of confabulating.
+
     Use this when the user asks about a company by name and you're not sure
     of the ticker ("Tata Consultancy"), or wants to discover companies in a
-    sector ("show me banks").
+    sector ("show me banks"). Prefer ``lookup_company`` when you already
+    have the exact ticker.
 
     Args:
         query: Free-text search — matches ticker/scrip code or company name.
@@ -74,8 +131,13 @@ async def search_companies(query: str, sector: str | None = None, limit: int = 1
         limit: Max results (default 10, max 25).
 
     Returns:
-        Dict with ``total`` (int) and ``items`` (list of {ticker, name,
-        sector, industry, exchange}). 4,773 companies are searchable.
+        Dict with:
+          * ``total`` (int) — count of strong matches across the catalog.
+          * ``items`` (list) — up to ``limit`` strong matches, each
+            ``{ticker, name, sector, industry, exchange}``.
+          * ``suggestions`` (list) — up to 3 sub-threshold near-matches
+            (typo / partial name) — only populated when ``items`` is
+            empty or has ≤1 result. Use these for "did you mean ...?".
     """
     limit = max(1, min(limit, 25))
     async with catalog_session_scope() as session:
@@ -88,16 +150,8 @@ async def search_companies(query: str, sector: str | None = None, limit: int = 1
         )
         return {
             "total": result.total,
-            "items": [
-                {
-                    "ticker": c.code,
-                    "name": c.company_name,
-                    "sector": c.industry,
-                    "industry": c.industry,
-                    "exchange": "NSE",
-                }
-                for c in result.items
-            ],
+            "items": [_to_list_row(c) for c in result.items],
+            "suggestions": [_to_suggestion(c) for c in result.suggestions],
         }
 
 
