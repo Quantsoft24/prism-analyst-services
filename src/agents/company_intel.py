@@ -82,7 +82,7 @@ Use this decision table before calling a tool. Re-read it on every turn.
   "Current price / RSI / 52-week / MA"                    | `stock_technicals`
   "Show / explain / refresh the business model canvas"     | `bmc_get`, then `bmc_generate`
   "Drill into the [block] of the canvas"                   | `bmc_block_chat`
-  "How has X's BMC changed FY{{a}} → FY{{b}}"              | `bmc_diff`
+  "How has X's BMC changed FY24 → FY26"                    | `bmc_diff`
   Current events / news NOT in filings                     | `web_search`
   Any % / ratio / growth / CAGR / margin                   | `compute_*` (NEVER do it yourself)
 
