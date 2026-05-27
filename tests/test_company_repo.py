@@ -16,7 +16,6 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import text
 
-from src.core.catalog_database import CatalogBase
 from src.models.catalog import CompanyIndustry
 from src.repositories.company_repo import (
     CompanyRepository,
@@ -24,7 +23,6 @@ from src.repositories.company_repo import (
     _normalize_query,
     _rank_candidates,
 )
-
 
 # ── Pure unit tests — fuzzy-search helpers ─────────────────────────────────
 
@@ -137,6 +135,7 @@ class TestLookupCompanyPatternRouting:
         """US/GB ISINs should never reach the repo — they're refused
         synchronously on pattern recognition."""
         from unittest.mock import patch
+
         from src.tools.company_tools import lookup_company
 
         with patch("src.tools.company_tools.catalog_session_scope") as scope:
@@ -150,6 +149,7 @@ class TestLookupCompanyPatternRouting:
     async def test_bse_numeric_code_refused_without_db_call(self) -> None:
         """6-digit BSE codes should be refused before any DB call."""
         from unittest.mock import patch
+
         from src.tools.company_tools import lookup_company
 
         with patch("src.tools.company_tools.catalog_session_scope") as scope:
@@ -163,6 +163,7 @@ class TestLookupCompanyPatternRouting:
         """An IN-prefixed 12-char ISIN should call repo.get_by_isin."""
         from contextlib import asynccontextmanager
         from unittest.mock import AsyncMock, MagicMock, patch
+
         from src.models.catalog import CompanyIndustry
         from src.tools.company_tools import lookup_company
 
@@ -199,6 +200,7 @@ class TestLookupCompanyPatternRouting:
         """A plain alpha ticker like "TCS" should call get_by_ticker, not ISIN."""
         from contextlib import asynccontextmanager
         from unittest.mock import AsyncMock, MagicMock, patch
+
         from src.models.catalog import CompanyIndustry
         from src.tools.company_tools import lookup_company
 
@@ -233,6 +235,7 @@ class TestLookupCompanyPatternRouting:
         repo.list() for fuzzy resolution."""
         from contextlib import asynccontextmanager
         from unittest.mock import AsyncMock, MagicMock, patch
+
         from src.repositories.company_repo import CompanyListResult
         from src.tools.company_tools import lookup_company
 
@@ -263,6 +266,7 @@ class TestLookupCompanyPatternRouting:
         """Inputs > 200 chars are refused BEFORE hitting the repo.
         Protects rapidfuzz from a 10K-char fuzzy-match storm."""
         from unittest.mock import patch
+
         from src.tools.company_tools import lookup_company
 
         with patch("src.tools.company_tools.catalog_session_scope") as scope:
@@ -276,6 +280,7 @@ class TestLookupCompanyPatternRouting:
     async def test_search_companies_rejects_long_query(self) -> None:
         """search_companies guards `query` against the same length cap."""
         from unittest.mock import patch
+
         from src.tools.company_tools import search_companies
 
         with patch("src.tools.company_tools.catalog_session_scope") as scope:
@@ -288,6 +293,7 @@ class TestLookupCompanyPatternRouting:
     async def test_search_companies_rejects_long_sector(self) -> None:
         """search_companies guards `sector` against the same length cap."""
         from unittest.mock import patch
+
         from src.tools.company_tools import search_companies
 
         with patch("src.tools.company_tools.catalog_session_scope") as scope:
@@ -307,6 +313,7 @@ class TestFuzzySectorResolution:
     @pytest.mark.asyncio
     async def test_case_insensitive_exact_match(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
+
         from src.tools.company_tools import _resolve_sector
 
         mock_repo = MagicMock()
@@ -320,6 +327,7 @@ class TestFuzzySectorResolution:
     @pytest.mark.asyncio
     async def test_fuzzy_resolves_partial_hint(self) -> None:
         from unittest.mock import AsyncMock, MagicMock
+
         from src.tools.company_tools import _resolve_sector
 
         mock_repo = MagicMock()
@@ -335,6 +343,7 @@ class TestFuzzySectorResolution:
         """When no fuzzy candidate clears the threshold, we still surface
         the closest three as suggestions for the user."""
         from unittest.mock import AsyncMock, MagicMock
+
         from src.tools.company_tools import _resolve_sector
 
         mock_repo = MagicMock()
@@ -351,6 +360,7 @@ class TestFuzzySectorResolution:
         ``unknown_sector`` error with the closest sectors in `detail`."""
         from contextlib import asynccontextmanager
         from unittest.mock import AsyncMock, MagicMock, patch
+
         from src.tools.company_tools import search_companies
 
         mock_repo = MagicMock()
