@@ -96,6 +96,17 @@ class Settings(BaseSettings):
     # network-restricted). Referenced by the stock-chat integration tool.
     STOCK_CHAT_URL: str = "http://localhost:8011"
 
+    # ── Prism Financials (external numeric-Q&A service) ──
+    # Teammate-built text-to-SQL service over CMIE Prowess (FastAPI, prod
+    # `http://35.234.221.166:8000`). POST /ask turns a finance question into
+    # safe read-only Postgres SQL and returns structured rows + the SQL.
+    # Referenced by the prism-financials integration tool. The endpoint is
+    # currently open (no caller auth); PRISM_FINANCIALS_API_KEY stays empty
+    # until the service adds X-API-Key auth — the wrapper sends the header only
+    # when it's set, so no secret ever lands in git.
+    PRISM_FINANCIALS_URL: str = "http://localhost:8000"
+    PRISM_FINANCIALS_API_KEY: str = ""
+
     # RAG / pdf-parsing / chunking settings retired with the read-on-demand
     # cutover (2026-05-24) — PRISM no longer maintains its own embedding/chunk
     # index. Filings narrative Q&A comes via stock-chat's read-on-demand tools.

@@ -71,7 +71,7 @@ def test_shipped_registry_is_valid():
     """config/integrations.yml must always parse — guards a malformed PR edit."""
     specs = load_specs("config/integrations.yml")
     names = {s.name for s in specs}
-    assert {"stock-chat", "bmc"}.issubset(names)
+    assert {"stock-chat", "bmc", "prism-financials"}.issubset(names)
     for s in specs:
         assert isinstance(s, IntegrationSpec)
 
@@ -116,6 +116,22 @@ def test_registry_builds_bmc_tools():
     expected = {"bmc_get", "bmc_generate", "bmc_library", "bmc_get_version",
                 "bmc_block_chat", "bmc_diff"}
     assert expected == tool_names
+
+
+def test_registry_builds_prism_financials_tool():
+    """The prism-financials integration exposes one typed tool (financials_query)."""
+    spec = IntegrationSpec(
+        name="prism-financials", source="python",
+        config={"entrypoint": "src.integrations.tools.prism_financials:PRISM_FINANCIALS_TOOLS"},
+    )
+    reg = IntegrationRegistry([spec])
+    asyncio.run(reg.build())
+
+    health = reg.health()
+    assert health[0]["status"] == "ok"
+    assert health[0]["tool_count"] == 1
+    tool_names = {getattr(t, "name", None) for t in reg.tools()}
+    assert tool_names == {"financials_query"}
 
 
 def test_registry_disabled_spec_skipped():

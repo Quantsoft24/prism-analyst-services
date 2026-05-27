@@ -51,6 +51,26 @@
   config:
     entrypoint: "src.integrations.tools.bmc:BMC_TOOLS"
 
+# ── Live: prism-financials (teammate REST text-to-SQL over CMIE Prowess) ──────
+# One agent-relevant endpoint (POST /ask) exposed as a single typed wrapper —
+# no OpenAPI spec yet, and the surface is one endpoint. This is PRISM's
+# exact-numbers path (the NRE math tools stay unwired; this service reads the
+# real figures). Base URL via env PRISM_FINANCIALS_URL; no caller auth today
+# (open endpoint) — PRISM_FINANCIALS_API_KEY is sent only when set.
+- name: prism-financials
+  source: python
+  enabled: true
+  description: >
+    Numerical Q&A over Indian listed companies (CMIE Prowess) — balance sheet,
+    P&L, cash flow, quarterly, shareholding, market multiples (P/E, P/B, market
+    cap), and derived ratios (D/E, margins, CAGR, YoY, sector rank). Generates
+    safe read-only SQL and returns structured rows + the executed query. This
+    is the exact-figures / ranking / time-series path; filings narrative goes to
+    stock_filings_read and live prices to stock_technicals.
+  tags: [financials, numbers, research]
+  config:
+    entrypoint: "src.integrations.tools.prism_financials:PRISM_FINANCIALS_TOOLS"
+
 # ── Commented examples — copy/uncomment to add each type ─────────────────────
 #
 # OpenAPI service (auto-generate a tool per operation; tool_filter restricts):

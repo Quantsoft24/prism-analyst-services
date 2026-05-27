@@ -21,7 +21,9 @@ iterator of typed events for the router to consume.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -33,14 +35,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.agents.base import PrismAgent
 from src.config import settings
 from src.core.database import session_scope
+from src.integrations.tools._errors import (
+    extract_error_message,
+    is_error,
+)
 from src.models.agent_run import AgentRun
 from src.schemas.chat import (
+    AgentThoughtEvent,
+    ChartEvent,
+    DataFreshnessEvent,
     ErrorEvent,
+    FinalAnswer,
     FinalEvent,
     MetaEvent,
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolRetryEvent,
 )
 
 if TYPE_CHECKING:
@@ -64,7 +75,18 @@ _LEGACY_PRICING: dict[str, tuple[float, float]] = {
 
 
 # Type alias for the union of streamed events.
-ChatEvent = MetaEvent | ToolCallEvent | ToolResultEvent | TokenEvent | FinalEvent | ErrorEvent
+ChatEvent = (
+    MetaEvent
+    | ToolCallEvent
+    | ToolResultEvent
+    | TokenEvent
+    | AgentThoughtEvent
+    | ToolRetryEvent
+    | DataFreshnessEvent
+    | ChartEvent
+    | FinalEvent
+    | ErrorEvent
+)
 
 
 # Module-level cache so we don't rebuild the same ADK Runner on every request.
@@ -260,6 +282,43 @@ class AgentRunner:
                     response = getattr(fn_resp, "response", None) or {}
                     started = pending_calls.pop(call_id, (tool_name, time.perf_counter()))[1]
                     latency_ms = int((time.perf_counter() - started) * 1000)
+
+                    # Distinguish success from failure using the structured
+                    # error contract (see src/integrations/tools/_errors.py).
+                    if is_error(response):
+                        err_msg = extract_error_message(response) or "tool error"
+                        err_code = (
+                            response.get("error_code") if isinstance(response, dict) else None
+                        )
+                        next_action = (
+                            response.get("next_action") if isinstance(response, dict) else None
+                        )
+                        yield ToolResultEvent(
+                            call_id=call_id,
+                            tool=tool_name,
+                            ok=False,
+                            error=err_msg,
+                            error_code=err_code,
+                            next_action=next_action,
+                            latency_ms=latency_ms,
+                        )
+                        continue
+
+                    # Success path. Before the result event, emit a
+                    # ToolRetryEvent if the tool helper had to silently
+                    # retry a transient blip (see stock_chat._post /
+                    # bmc._request). The frontend shows ↻ on the tool
+                    # card so users know we recovered from a hiccup.
+                    if isinstance(response, dict):
+                        rc = response.get("retry_count")
+                        if isinstance(rc, int) and rc > 0:
+                            yield ToolRetryEvent(
+                                call_id=call_id,
+                                tool=tool_name,
+                                attempt=rc + 1,  # 1-indexed; rc=1 means we're on attempt 2
+                                reason="transient transport blip (auto-retried)",
+                            )
+
                     summary = _summarize_tool_response(response)
                     yield ToolResultEvent(
                         call_id=call_id,
@@ -268,6 +327,18 @@ class AgentRunner:
                         result_summary=summary,
                         latency_ms=latency_ms,
                     )
+                    # Surface data freshness when the tool gave us one (filings
+                    # tools return the latest announcement_dt; technicals
+                    # returns "live"). Frontend renders an "as of …" chip on
+                    # the corresponding tool card + the final answer.
+                    if isinstance(response, dict):
+                        freshness = response.get("data_freshness")
+                        if freshness:
+                            yield DataFreshnessEvent(
+                                call_id=call_id,
+                                source=_freshness_source_label(tool_name),
+                                as_of=str(freshness),
+                            )
                     continue
 
                 text = getattr(part, "text", None)
@@ -287,18 +358,38 @@ class AgentRunner:
                     pass
 
         # Compute cost + write final audit row.
-        final_answer = "".join(final_text_parts).strip()
+        raw_final = "".join(final_text_parts).strip()
+        prose, structured = _split_structured_answer(raw_final)
+
+        # Safety net: Gemini sometimes terminates a turn after a tool call
+        # without emitting any final text — typically when the tool result
+        # was ambiguous (e.g. search_companies returned multiple matches).
+        # The system prompt forbids this (Rule 0) but the model can still
+        # do it. Rather than show the user an empty answer, synthesize a
+        # short fallback that names the tools that DID run so they know
+        # something happened and can refine the question.
+        if not prose:
+            prose = _synthesize_empty_answer_fallback(self._tool_trace)
+            structured = None  # invalidate any partial structured payload
+            logger.warning(
+                "Agent run %s terminated with empty answer; %d tools called. "
+                "Surfacing fallback message.",
+                self._agent_run_id,
+                len(self._tool_trace),
+            )
+
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
 
         await self._close_run_row(
             status="complete",
-            final_answer=final_answer,
+            final_answer=prose,
             cost_usd=cost,
         )
 
         yield FinalEvent(
-            answer=final_answer,
+            answer=prose,
+            structured=structured,
             agent_run_id=self._agent_run_id,  # type: ignore[arg-type]
             cost_usd=cost,
             input_tokens=self._input_tokens,
@@ -388,20 +479,149 @@ class AgentRunner:
 
 
 def _summarize_tool_response(response: dict[str, Any]) -> str:
-    """Squash a tool response dict into a short human-readable summary line."""
+    """Squash a tool response dict into a short human-readable summary line.
+
+    Never inspects the error path — the runner branches on ``is_error()``
+    before calling this. Designed for the UI tool-call card: 80 chars max,
+    no trailing punctuation, no markdown.
+    """
     if not isinstance(response, dict):
         return str(response)[:120]
+    # Company list / filings list / generic items array
     if "items" in response and isinstance(response["items"], list):
         n = len(response["items"])
         total = response.get("total", n)
-        return f"{n} of {total} item(s)"
+        suggestions = response.get("suggestions") or []
+        suffix = f" · {len(suggestions)} near-match(es)" if suggestions else ""
+        return f"{n} of {total} item(s){suffix}"
+    if "filings" in response and isinstance(response["filings"], list):
+        n = len(response["filings"])
+        total = response.get("total", n)
+        return f"{n} of {total} filing(s)"
+    if "blocks" in response and isinstance(response["blocks"], list):
+        return f"{len(response['blocks'])}-block canvas"
     if response.get("found") is True:
         name = response.get("name") or response.get("ticker") or ""
         return f"found {name}".strip()
     if response.get("found") is False:
+        suggestions = response.get("suggestions") or []
+        if suggestions:
+            return f"not found · {len(suggestions)} suggestion(s)"
         return "not found"
-    keys = list(response.keys())[:4]
+    if "answer" in response and response["answer"]:
+        # Filings-read / block-chat — show a hint of the answer
+        snippet = str(response["answer"]).strip().split("\n", 1)[0][:60]
+        return f"answer: {snippet}…" if len(snippet) >= 60 else f"answer: {snippet}"
+    if "result" in response:
+        unit = response.get("unit", "")
+        return f"= {response['result']}{unit}".strip()
+    keys = [k for k in response.keys() if not k.startswith("_")][:4]
     return "ok · " + ", ".join(keys)
+
+
+# Regex anchored to the end of the answer so a stray ``<answer_meta>`` inside
+# the prose (unlikely but possible) doesn't get mistaken for the contract block.
+_ANSWER_META_RE = re.compile(
+    r"<answer_meta>\s*(?P<json>\{.*?\})\s*</answer_meta>\s*$",
+    re.DOTALL,
+)
+
+
+def _split_structured_answer(raw: str) -> tuple[str, FinalAnswer | None]:
+    """Extract an optional structured FinalAnswer block from the prose tail.
+
+    Contract: the agent MAY end its response with::
+
+        <answer_meta>{"citations":[...],"confidence":"high","data_freshness":"2026-Q4"}</answer_meta>
+
+    If present and parseable, returns ``(prose_without_block, FinalAnswer)``.
+    Otherwise returns ``(raw, None)`` — prose alone, the UI still renders.
+    Soft contract: never error on a malformed block, just degrade.
+    """
+    if not raw:
+        return raw, None
+    match = _ANSWER_META_RE.search(raw)
+    if not match:
+        return raw, None
+    prose = raw[: match.start()].rstrip()
+    payload = match.group("json")
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        logger.debug("answer_meta JSON parse failed; returning prose only")
+        return raw, None
+    # The contract: data may carry only citations/confidence/data_freshness —
+    # we synthesize a FinalAnswer with the prose as ``text``.
+    try:
+        structured = FinalAnswer(
+            text=prose,
+            citations=data.get("citations") or [],
+            confidence=data.get("confidence") or "medium",
+            data_freshness=data.get("data_freshness"),
+        )
+    except Exception:
+        logger.debug("answer_meta payload didn't validate; returning prose only")
+        return raw, None
+    return prose, structured
+
+
+def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:
+    """Produce a user-facing message when Gemini terminated a turn without
+    emitting any final text.
+
+    Heuristics tuned to the failure modes we've observed in prod:
+
+      • Single ``search_companies`` call → user query was probably ambiguous
+        ("Adani", "Tata"); LLM saw multiple matches and bailed. Tell the
+        user to pick one.
+      • Any other shape → generic fallback citing the tools that ran so the
+        user knows their question wasn't dropped.
+
+    The message stays short and points the user at a concrete next action.
+    Never refer to the LLM model name or internal failure — that's our
+    bug, not theirs.
+    """
+    if not tool_trace:
+        return (
+            "I couldn't put together an answer for that question. "
+            "Try a more specific query — e.g. a ticker like RELIANCE or "
+            "a company name like 'HDFC Bank'."
+        )
+
+    tool_names = [t.get("tool", "") for t in tool_trace]
+    only_search = (
+        len(tool_trace) == 1 and tool_names[0] == "search_companies"
+    )
+    if only_search:
+        args = tool_trace[0].get("args", {})
+        query = args.get("query", "your query") if isinstance(args, dict) else "your query"
+        return (
+            f"The search for **{query}** returned multiple companies — "
+            "I need you to pick which one to research. "
+            "Try again with a specific ticker (e.g. ADANIENT, ADANIPORTS, "
+            "ADANIGREEN) or a more complete name."
+        )
+
+    called = ", ".join(f"`{n}`" for n in tool_names)
+    return (
+        f"I ran {len(tool_trace)} tool(s) ({called}) but didn't have enough "
+        "to produce a confident answer. Try a more specific question — "
+        "for example a single ticker, a specific time period, or what you "
+        "want to know (filings vs. price vs. business model)."
+    )
+
+
+def _freshness_source_label(tool_name: str) -> str:
+    """Map a tool name to the short UI label shown in the freshness chip."""
+    if tool_name.startswith("stock_filings"):
+        return "filings catalog"
+    if tool_name == "stock_technicals":
+        return "market data"
+    if tool_name.startswith("bmc_"):
+        return "business model canvas"
+    if tool_name == "web_search":
+        return "web search"
+    return tool_name
 
 
 def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:

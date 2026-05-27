@@ -46,3 +46,10 @@ docker-compose.override.yml
 
 # ── Local server logs (uvicorn etc.) — never commit ──
 *.log
+
+# ── graphify (generated knowledge-graph artifacts; rebuild with `graphify update .`) ──
+graphify-out/
+
+# ── Per-machine Claude Code config (each teammate installs locally) ──
+CLAUDE.md
+.claude/
