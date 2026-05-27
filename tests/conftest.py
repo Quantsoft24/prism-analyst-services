@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from src.core.database import get_session
 from src.main import app
@@ -41,7 +42,12 @@ TEST_DATABASE_URL = os.environ.get(
 @pytest_asyncio.fixture(scope="session")
 async def engine():
     """Single async engine for the whole test session."""
-    eng = create_async_engine(TEST_DATABASE_URL, echo=False, future=True)
+    eng = create_async_engine(
+        TEST_DATABASE_URL,
+        echo=False,
+        future=True,
+        poolclass=NullPool,
+    )
     try:
         yield eng
     finally:

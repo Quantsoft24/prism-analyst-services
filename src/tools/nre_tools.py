@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from src.integrations.tools._errors import make_error
 from src.services.nre import engine
 
 if TYPE_CHECKING:
@@ -19,10 +20,20 @@ if TYPE_CHECKING:
 
 
 def _safe(fn, **kwargs) -> dict:
+    """Run a deterministic NRE engine function and return the standard
+    result/error shape. Computation errors (divide-by-zero, negative log
+    inputs) are surfaced as ``ask_user_to_clarify`` — the agent should ask
+    the user to recheck the numbers rather than retrying.
+    """
     try:
         return fn(**kwargs).to_dict()
     except engine.NREError as exc:
-        return {"error": str(exc)}
+        return make_error(
+            message=str(exc),
+            code="nre_invalid_inputs",
+            next_action="ask_user_to_clarify",
+            retriable=False,
+        )
 
 
 def compute_growth(start: float, end: float) -> dict:

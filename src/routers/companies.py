@@ -61,9 +61,10 @@ def _to_detail(c: CompanyIndustry) -> CompanyDetail:
     summary="List companies (Indian NSE/BSE catalog, 4,773 entries)",
     description=(
         "Paginated list backed by ``company_industry`` on the catalog DB. "
-        "Filter by ``search`` (matches ticker / scrip code / name), "
+        "Filter by ``search`` (typo-tolerant; matches ticker / scrip code / name), "
         "``sector`` (exact industry match), or ``exchange`` (accepted for "
-        "back-compat — the catalog itself is not exchange-partitioned)."
+        "back-compat — the catalog itself is not exchange-partitioned). "
+        "Pass ``fuzzy=false`` to revert to exact-substring matching."
     ),
 )
 async def list_companies(
@@ -74,11 +75,26 @@ async def list_companies(
     exchange: Annotated[str | None, Query(description="NSE | BSE (accepted, not enforced).")] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
+    fuzzy: Annotated[
+        bool,
+        Query(
+            description=(
+                "Fuzzy / typo-tolerant search (default). Set to false for "
+                "exact-substring ILIKE matching — useful for callers that "
+                "build their own ranking on top."
+            ),
+        ),
+    ] = True,
 ) -> Paginated[CompanyRead]:
     _ = firm_id  # auth-gated only; catalog is global
     repo = CompanyRepository(session)
     result = await repo.list(
-        search=search, sector=sector, exchange=exchange, limit=limit, offset=offset
+        search=search,
+        sector=sector,
+        exchange=exchange,
+        limit=limit,
+        offset=offset,
+        fuzzy=fuzzy,
     )
     return Paginated[CompanyRead](
         items=[_to_read(c) for c in result.items],
@@ -86,6 +102,30 @@ async def list_companies(
     )
 
 
+@router.get(
+    "/sectors",
+    response_model=list[str],
+    summary="Distinct industries / sectors in the catalog",
+    description=(
+        "Alphabetical list of every distinct ``industry`` value in the "
+        "catalog DB (the same field PRISM's vocabulary calls ``sector``). "
+        "Used by the frontend's sector filter on the Companies view so the "
+        "dropdown is data-driven instead of a hardcoded guess that won't "
+        "match the catalog's actual taxonomy."
+    ),
+)
+async def list_sectors(
+    session: Annotated[AsyncSession, Depends(get_catalog_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> list[str]:
+    _ = firm_id
+    repo = CompanyRepository(session)
+    return sorted(await repo.distinct_sectors(limit=500))
+
+
+# NOTE: ``/{id_or_ticker}`` is the catch-all — it MUST be declared after every
+# more specific path (``/sectors`` above) or FastAPI tries to match those as
+# id_or_ticker values and 404s.
 @router.get(
     "/{id_or_ticker}",
     response_model=CompanyDetail,
