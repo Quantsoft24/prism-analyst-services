@@ -42,6 +42,7 @@ from src.integrations.tools._errors import (
 from src.models.agent_run import AgentRun
 from src.schemas.chat import (
     AgentThoughtEvent,
+    ChartEvent,
     DataFreshnessEvent,
     ErrorEvent,
     FinalAnswer,
@@ -50,6 +51,7 @@ from src.schemas.chat import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolRetryEvent,
 )
 
 if TYPE_CHECKING:
@@ -79,7 +81,9 @@ ChatEvent = (
     | ToolResultEvent
     | TokenEvent
     | AgentThoughtEvent
+    | ToolRetryEvent
     | DataFreshnessEvent
+    | ChartEvent
     | FinalEvent
     | ErrorEvent
 )
@@ -300,7 +304,21 @@ class AgentRunner:
                         )
                         continue
 
-                    # Success path.
+                    # Success path. Before the result event, emit a
+                    # ToolRetryEvent if the tool helper had to silently
+                    # retry a transient blip (see stock_chat._post /
+                    # bmc._request). The frontend shows ↻ on the tool
+                    # card so users know we recovered from a hiccup.
+                    if isinstance(response, dict):
+                        rc = response.get("retry_count")
+                        if isinstance(rc, int) and rc > 0:
+                            yield ToolRetryEvent(
+                                call_id=call_id,
+                                tool=tool_name,
+                                attempt=rc + 1,  # 1-indexed; rc=1 means we're on attempt 2
+                                reason="transient transport blip (auto-retried)",
+                            )
+
                     summary = _summarize_tool_response(response)
                     yield ToolResultEvent(
                         call_id=call_id,
@@ -342,6 +360,24 @@ class AgentRunner:
         # Compute cost + write final audit row.
         raw_final = "".join(final_text_parts).strip()
         prose, structured = _split_structured_answer(raw_final)
+
+        # Safety net: Gemini sometimes terminates a turn after a tool call
+        # without emitting any final text — typically when the tool result
+        # was ambiguous (e.g. search_companies returned multiple matches).
+        # The system prompt forbids this (Rule 0) but the model can still
+        # do it. Rather than show the user an empty answer, synthesize a
+        # short fallback that names the tools that DID run so they know
+        # something happened and can refine the question.
+        if not prose:
+            prose = _synthesize_empty_answer_fallback(self._tool_trace)
+            structured = None  # invalidate any partial structured payload
+            logger.warning(
+                "Agent run %s terminated with empty answer; %d tools called. "
+                "Surfacing fallback message.",
+                self._agent_run_id,
+                len(self._tool_trace),
+            )
+
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
 
@@ -527,6 +563,52 @@ def _split_structured_answer(raw: str) -> tuple[str, FinalAnswer | None]:
         logger.debug("answer_meta payload didn't validate; returning prose only")
         return raw, None
     return prose, structured
+
+
+def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:
+    """Produce a user-facing message when Gemini terminated a turn without
+    emitting any final text.
+
+    Heuristics tuned to the failure modes we've observed in prod:
+
+      • Single ``search_companies`` call → user query was probably ambiguous
+        ("Adani", "Tata"); LLM saw multiple matches and bailed. Tell the
+        user to pick one.
+      • Any other shape → generic fallback citing the tools that ran so the
+        user knows their question wasn't dropped.
+
+    The message stays short and points the user at a concrete next action.
+    Never refer to the LLM model name or internal failure — that's our
+    bug, not theirs.
+    """
+    if not tool_trace:
+        return (
+            "I couldn't put together an answer for that question. "
+            "Try a more specific query — e.g. a ticker like RELIANCE or "
+            "a company name like 'HDFC Bank'."
+        )
+
+    tool_names = [t.get("tool", "") for t in tool_trace]
+    only_search = (
+        len(tool_trace) == 1 and tool_names[0] == "search_companies"
+    )
+    if only_search:
+        args = tool_trace[0].get("args", {})
+        query = args.get("query", "your query") if isinstance(args, dict) else "your query"
+        return (
+            f"The search for **{query}** returned multiple companies — "
+            "I need you to pick which one to research. "
+            "Try again with a specific ticker (e.g. ADANIENT, ADANIPORTS, "
+            "ADANIGREEN) or a more complete name."
+        )
+
+    called = ", ".join(f"`{n}`" for n in tool_names)
+    return (
+        f"I ran {len(tool_trace)} tool(s) ({called}) but didn't have enough "
+        "to produce a confident answer. Try a more specific question — "
+        "for example a single ticker, a specific time period, or what you "
+        "want to know (filings vs. price vs. business model)."
+    )
 
 
 def _freshness_source_label(tool_name: str) -> str:

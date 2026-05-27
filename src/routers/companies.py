@@ -103,6 +103,30 @@ async def list_companies(
 
 
 @router.get(
+    "/sectors",
+    response_model=list[str],
+    summary="Distinct industries / sectors in the catalog",
+    description=(
+        "Alphabetical list of every distinct ``industry`` value in the "
+        "catalog DB (the same field PRISM's vocabulary calls ``sector``). "
+        "Used by the frontend's sector filter on the Companies view so the "
+        "dropdown is data-driven instead of a hardcoded guess that won't "
+        "match the catalog's actual taxonomy."
+    ),
+)
+async def list_sectors(
+    session: Annotated[AsyncSession, Depends(get_catalog_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> list[str]:
+    _ = firm_id
+    repo = CompanyRepository(session)
+    return sorted(await repo.distinct_sectors(limit=500))
+
+
+# NOTE: ``/{id_or_ticker}`` is the catch-all — it MUST be declared after every
+# more specific path (``/sectors`` above) or FastAPI tries to match those as
+# id_or_ticker values and 404s.
+@router.get(
     "/{id_or_ticker}",
     response_model=CompanyDetail,
     summary="Get one company by id (uuid5) or NSE ticker / scrip code",

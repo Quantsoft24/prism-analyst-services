@@ -110,6 +110,307 @@ class TestRankCandidates:
             assert 0 <= s <= 100
 
 
+# ── Pure unit tests — lookup_company input-shape routing (no DB) ───────────
+
+
+class TestLookupCompanyPatternRouting:
+    """Verify ``lookup_company`` dispatches to the right code path based on
+    input shape: ISIN → repo.get_by_isin; ticker → repo.get_by_ticker;
+    BSE numeric → friendly refusal; foreign ISIN → friendly refusal;
+    empty → missing_input refusal; multi-word → falls through to fuzzy.
+
+    Uses ``unittest.mock`` to swap CompanyRepository so we never touch
+    Postgres — these tests run in <100ms and have zero infra requirements.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_input_returns_missing_input_error(self) -> None:
+        from src.tools.company_tools import lookup_company
+        for empty in ["", "   ", "\t\n"]:
+            result = await lookup_company(empty)
+            assert result.get("ok") is False
+            assert result["error_code"] == "missing_input"
+            assert result["next_action"] == "ask_user_to_clarify"
+
+    @pytest.mark.asyncio
+    async def test_foreign_isin_refused_without_db_call(self) -> None:
+        """US/GB ISINs should never reach the repo — they're refused
+        synchronously on pattern recognition."""
+        from unittest.mock import patch
+        from src.tools.company_tools import lookup_company
+
+        with patch("src.tools.company_tools.catalog_session_scope") as scope:
+            result = await lookup_company("US0378331005")
+            assert result.get("ok") is False
+            assert result["error_code"] == "foreign_isin"
+            # Confirm: never opened a DB session for foreign ISIN
+            scope.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bse_numeric_code_refused_without_db_call(self) -> None:
+        """6-digit BSE codes should be refused before any DB call."""
+        from unittest.mock import patch
+        from src.tools.company_tools import lookup_company
+
+        with patch("src.tools.company_tools.catalog_session_scope") as scope:
+            result = await lookup_company("500325")
+            assert result.get("ok") is False
+            assert result["error_code"] == "bse_code_unsupported"
+            scope.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_indian_isin_dispatches_to_get_by_isin(self) -> None:
+        """An IN-prefixed 12-char ISIN should call repo.get_by_isin."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from src.models.catalog import CompanyIndustry
+        from src.tools.company_tools import lookup_company
+
+        # Repo returns a real-shaped CompanyIndustry instance.
+        fake_co = CompanyIndustry(
+            code="RELIANCE",
+            company_name="Reliance Industries Limited",
+            industry="Refineries",
+            isin="INE002A01018",
+        )
+
+        # Mock repo: get_by_isin returns the fake row, get_by_ticker
+        # should NEVER be called for an ISIN input.
+        mock_repo = MagicMock()
+        mock_repo.get_by_isin = AsyncMock(return_value=fake_co)
+        mock_repo.get_by_ticker = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield MagicMock()  # session — unused after we mock the repo
+
+        with patch("src.tools.company_tools.catalog_session_scope", fake_session_scope), \
+             patch("src.tools.company_tools.CompanyRepository", return_value=mock_repo):
+            result = await lookup_company("INE002A01018")
+            assert result["found"] is True
+            assert result["ticker"] == "RELIANCE"
+            assert "disambiguation_note" in result
+            assert "Resolved ISIN INE002A01018" in result["disambiguation_note"]
+            mock_repo.get_by_isin.assert_awaited_once_with("INE002A01018")
+            mock_repo.get_by_ticker.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_regular_ticker_dispatches_to_get_by_ticker(self) -> None:
+        """A plain alpha ticker like "TCS" should call get_by_ticker, not ISIN."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from src.models.catalog import CompanyIndustry
+        from src.tools.company_tools import lookup_company
+
+        fake_co = CompanyIndustry(
+            code="TCS",
+            company_name="Tata Consultancy Services",
+            industry="Software & Services",
+            isin="INE467B01029",
+        )
+        mock_repo = MagicMock()
+        mock_repo.get_by_ticker = AsyncMock(return_value=fake_co)
+        mock_repo.get_by_isin = AsyncMock()
+        mock_repo.list = AsyncMock()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield MagicMock()
+
+        with patch("src.tools.company_tools.catalog_session_scope", fake_session_scope), \
+             patch("src.tools.company_tools.CompanyRepository", return_value=mock_repo):
+            result = await lookup_company("TCS")
+            assert result["found"] is True
+            assert result["ticker"] == "TCS"
+            mock_repo.get_by_ticker.assert_awaited_once_with("TCS")
+            mock_repo.get_by_isin.assert_not_called()
+            mock_repo.list.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiword_name_falls_through_to_fuzzy(self) -> None:
+        """Multi-word names like 'Tata Consultancy' should miss exact
+        ticker lookup AND skip the ISIN/BSE branches, then call
+        repo.list() for fuzzy resolution."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from src.repositories.company_repo import CompanyListResult
+        from src.tools.company_tools import lookup_company
+
+        mock_repo = MagicMock()
+        mock_repo.get_by_ticker = AsyncMock(return_value=None)
+        mock_repo.get_by_isin = AsyncMock()
+        mock_repo.list = AsyncMock(
+            return_value=CompanyListResult(items=[], total=0, suggestions=[])
+        )
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield MagicMock()
+
+        with patch("src.tools.company_tools.catalog_session_scope", fake_session_scope), \
+             patch("src.tools.company_tools.CompanyRepository", return_value=mock_repo):
+            result = await lookup_company("Tata Consultancy")
+            # Empty fuzzy result → "found: false, suggestions: []"
+            assert result["found"] is False
+            # The ticker shape stored on miss is the upper-cased original input
+            assert result["ticker"] == "TATA CONSULTANCY"
+            # Confirm dispatch path: NOT to get_by_isin
+            mock_repo.get_by_isin.assert_not_called()
+            mock_repo.list.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lookup_company_rejects_pathological_length(self) -> None:
+        """Inputs > 200 chars are refused BEFORE hitting the repo.
+        Protects rapidfuzz from a 10K-char fuzzy-match storm."""
+        from unittest.mock import patch
+        from src.tools.company_tools import lookup_company
+
+        with patch("src.tools.company_tools.catalog_session_scope") as scope:
+            result = await lookup_company("x" * 5000)
+            assert result.get("ok") is False
+            assert result["error_code"] == "input_too_long"
+            assert result["next_action"] == "ask_user_to_clarify"
+            scope.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_companies_rejects_long_query(self) -> None:
+        """search_companies guards `query` against the same length cap."""
+        from unittest.mock import patch
+        from src.tools.company_tools import search_companies
+
+        with patch("src.tools.company_tools.catalog_session_scope") as scope:
+            result = await search_companies(query="x" * 1000)
+            assert result.get("ok") is False
+            assert result["error_code"] == "input_too_long"
+            scope.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_companies_rejects_long_sector(self) -> None:
+        """search_companies guards `sector` against the same length cap."""
+        from unittest.mock import patch
+        from src.tools.company_tools import search_companies
+
+        with patch("src.tools.company_tools.catalog_session_scope") as scope:
+            result = await search_companies(query="TCS", sector="x" * 500)
+            assert result.get("ok") is False
+            assert result["error_code"] == "input_too_long"
+            scope.assert_not_called()
+
+
+# ── Pure unit tests — fuzzy sector resolution (no DB) ──────────────────────
+
+
+class TestFuzzySectorResolution:
+    """Verify ``_resolve_sector`` maps wonky sector hints to the catalog's
+    canonical names, and returns useful suggestions on a miss."""
+
+    @pytest.mark.asyncio
+    async def test_case_insensitive_exact_match(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+        from src.tools.company_tools import _resolve_sector
+
+        mock_repo = MagicMock()
+        mock_repo.distinct_sectors = AsyncMock(
+            return_value=["Banks", "Software & Services", "Pharmaceuticals"]
+        )
+        resolved, suggestions = await _resolve_sector(mock_repo, "banks")
+        assert resolved == "Banks"
+        assert suggestions == []  # exact match — no suggestions needed
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_resolves_partial_hint(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+        from src.tools.company_tools import _resolve_sector
+
+        mock_repo = MagicMock()
+        mock_repo.distinct_sectors = AsyncMock(
+            return_value=["Banks", "Software & Services", "Pharmaceuticals"]
+        )
+        # "software" partial → resolves to "Software & Services"
+        resolved, _ = await _resolve_sector(mock_repo, "software")
+        assert resolved == "Software & Services"
+
+    @pytest.mark.asyncio
+    async def test_no_match_returns_suggestions(self) -> None:
+        """When no fuzzy candidate clears the threshold, we still surface
+        the closest three as suggestions for the user."""
+        from unittest.mock import AsyncMock, MagicMock
+        from src.tools.company_tools import _resolve_sector
+
+        mock_repo = MagicMock()
+        mock_repo.distinct_sectors = AsyncMock(
+            return_value=["Banks", "Software & Services", "Pharmaceuticals"]
+        )
+        resolved, suggestions = await _resolve_sector(mock_repo, "asdfqwer")
+        assert resolved is None
+        assert len(suggestions) > 0  # always returns SOMETHING for the agent
+
+    @pytest.mark.asyncio
+    async def test_unknown_sector_returns_structured_error(self) -> None:
+        """search_companies surfaces _resolve_sector's miss as an
+        ``unknown_sector`` error with the closest sectors in `detail`."""
+        from contextlib import asynccontextmanager
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from src.tools.company_tools import search_companies
+
+        mock_repo = MagicMock()
+        mock_repo.distinct_sectors = AsyncMock(
+            return_value=["Banks", "Software & Services", "Pharmaceuticals"]
+        )
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield MagicMock()
+
+        with patch("src.tools.company_tools.catalog_session_scope", fake_session_scope), \
+             patch("src.tools.company_tools.CompanyRepository", return_value=mock_repo):
+            result = await search_companies(query="", sector="asdfqwer")
+            assert result.get("ok") is False
+            assert result["error_code"] == "unknown_sector"
+            assert "detail" in result  # the closest catalog sectors
+
+
+# ── Pure unit tests — sector dedup helpers (no DB) ─────────────────────────
+
+
+class TestSectorDedup:
+    """Verify the catalog's "Software & Services" vs "Software and Services"
+    near-duplicates collapse to one canonical entry."""
+
+    def test_normalize_collapses_amp_and_word_and(self) -> None:
+        from src.tools.company_tools import _normalize_sector
+        assert _normalize_sector("Software & Services") == "software services"
+        assert _normalize_sector("Software and Services") == "software services"
+        assert _normalize_sector("Oil & Gas") == "oil gas"
+        assert _normalize_sector("Iron / Steel") == "iron steel"
+
+    def test_normalize_handles_empty(self) -> None:
+        from src.tools.company_tools import _normalize_sector
+        assert _normalize_sector("") == ""
+        assert _normalize_sector("   ") == ""
+
+    def test_dedupe_keeps_longest_per_group(self) -> None:
+        from src.tools.company_tools import _dedupe_sectors
+        out = _dedupe_sectors([
+            "Software & Services",
+            "Software and Services",
+            "Banks",
+            "Oil & Gas",
+            "Oil and Gas",
+        ])
+        # 5 inputs → 3 groups
+        assert len(out) == 3
+        assert "Banks" in out
+        # The longer original is kept per group (alphabetical sort applies)
+        assert any("and" in s.lower() for s in out if "software" in s.lower())
+        assert any("and" in s.lower() for s in out if "oil" in s.lower())
+
+    def test_dedupe_alphabetical(self) -> None:
+        from src.tools.company_tools import _dedupe_sectors
+        out = _dedupe_sectors(["Pharmaceuticals", "Banks", "Software & Services"])
+        assert out == sorted(out)
+
+
 # ── Integration tests against a seeded catalog table ───────────────────────
 
 

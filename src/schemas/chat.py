@@ -132,6 +132,35 @@ class DataFreshnessEvent(BaseModel):
     as_of: str | None = None  # ISO date / "live" / null
 
 
+class ChartPoint(BaseModel):
+    """One labeled (x, y) data point on a chart series."""
+
+    x: str  # label / period — e.g. "Q4'25", "2024-04-30", "TCS"
+    y: float
+
+
+class ChartEvent(BaseModel):
+    """Structured chart data a tool surfaced — drives Workspace → Charts tab.
+
+    No tool emits these today; the schema lives here so when a chart-producing
+    tool ships (e.g. ``compute_trend`` over a NRE series, or a ``stock_technicals``
+    enrichment), the runner can emit ChartEvent and the frontend renders it
+    without further changes. Frontend mock-mode already validates the end-to-end
+    pipeline (see ``chat.mock.ts``).
+    """
+
+    type: Literal["chart"] = "chart"
+    call_id: str | None = None  # which tool emitted it; null if from final
+    chart_id: str  # stable id so the UI can dedup
+    title: str  # e.g. "Jio segment ARPU · trailing 5 quarters"
+    unit: str = ""  # display prefix/suffix — "₹" / "%" / "x" / ""
+    current_value: str  # latest value as a display string ("202", "47,628")
+    current_delta: str | None = None  # "+3.1% q/q" / "−0.42% YTD"
+    delta_kind: Literal["pos", "neg", "neutral"] | None = None
+    points: list[ChartPoint] = Field(default_factory=list)
+    kind: Literal["line", "area", "bar"] = "line"
+
+
 # ── Structured final-answer payload ───────────────────────────────────────
 
 
@@ -143,6 +172,33 @@ class Citation(BaseModel):
     source_kind: Literal["filing", "web", "bmc", "tool"] = "tool"
     as_of: str | None = None  # ISO date or null
     tool_call_id: str | None = None  # links to a ToolCallEvent.call_id
+
+
+class FinalKpi(BaseModel):
+    """A headline KPI surfaced in the workspace Report tab.
+
+    Renders as one card in the KPI grid (mockup pattern: Revenue ·
+    ₹2.74L cr · cite 1 · pg 4). No tool emits these today; the schema
+    lives here so when a tool ships that extracts headline numbers
+    from a filing (or the agent fills it from a structured answer
+    block), the Report tab renders without further frontend changes.
+    """
+
+    label: str  # e.g. "Revenue"
+    value: str  # e.g. "₹2.74L cr" or "47,628"
+    unit: str | None = None  # optional secondary unit chip ("cr", "%")
+    cite_label: str | None = None  # short "cite 1 · pg 4" reference
+
+
+class FinalSection(BaseModel):
+    """A named section in the final research note (Executive summary,
+    Anomaly flags, etc.). Body is markdown so citations / bold / lists
+    survive. ``kind`` lets the UI accent anomaly callouts in warn-yellow.
+    """
+
+    title: str
+    body: str  # markdown
+    kind: Literal["summary", "anomaly", "note"] = "summary"
 
 
 class FinalAnswer(BaseModel):
@@ -158,6 +214,8 @@ class FinalAnswer(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     confidence: Literal["high", "medium", "low"] = "medium"
     data_freshness: str | None = None  # earliest source date present in the answer
+    kpis: list[FinalKpi] = Field(default_factory=list)
+    sections: list[FinalSection] = Field(default_factory=list)
 
 
 class FinalEvent(BaseModel):

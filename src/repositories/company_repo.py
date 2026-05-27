@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
-from sqlalchemy import func, or_, select
+from sqlalchemy import Integer, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.catalog import CompanyIndustry
@@ -204,14 +204,33 @@ class CompanyRepository:
     async def _list_no_search(
         self, *, sector: str | None, limit: int, offset: int
     ) -> CompanyListResult:
-        """Pure list/filter — no text matching."""
+        """Pure list/filter — no text matching.
+
+        The upstream catalog has many rows where ``company_name`` is empty
+        — those are still real listings (the ticker IS the identifier on
+        Indian exchanges), so we keep them. We DO de-prioritise pure-numeric
+        BSE scrip codes (e.g. "526945") by sorting them to the end, since
+        they're rarely what someone browsing the universe actually wants.
+        Search paths bypass this ordering and accept exact code hits.
+        """
         filters = []
         if sector:
             filters.append(CompanyIndustry.industry == sector)
+        # ``code ~ '^[0-9]+$'`` → 1 for pure-numeric (rank these last). The
+        # CASE expression turns that into a 0/1 sort key. PostgreSQL-only
+        # syntax, which is fine since the catalog is Postgres.
+        numeric_code_last = func.cast(
+            CompanyIndustry.code.op("~")("^[0-9]+$"), Integer
+        )
         stmt = (
             select(CompanyIndustry)
             .where(*filters)
-            .order_by(CompanyIndustry.company_name.asc())
+            .order_by(
+                numeric_code_last.asc(),  # 0 (alpha tickers) first, 1 (BSE codes) last
+                CompanyIndustry.industry_rank.asc().nulls_last(),
+                CompanyIndustry.company_name.asc().nulls_last(),
+                CompanyIndustry.code.asc(),
+            )
             .limit(limit)
             .offset(offset)
         )

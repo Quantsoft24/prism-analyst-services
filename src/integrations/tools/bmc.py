@@ -24,6 +24,7 @@ and fall back to ``bmc_generate`` only when there's no cached canvas — saves
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 # DB-only and snappy. We pick 180s for the heavy ones, 30s for the rest.
 _HEAVY_TIMEOUT = 180.0
 _LIGHT_TIMEOUT = 30.0
+# One-shot retry on transient transport blips — matches stock_chat._post.
+_RETRY_DELAY_S = 0.25
 
 # Canonical block IDs (in the order the service emits them).
 BMC_BLOCK_IDS = (
@@ -58,29 +61,57 @@ def _base_url() -> str:
 
 async def _request(method: str, path: str, *, timeout: float, body: dict | None = None,
                    params: dict | None = None) -> dict:
-    """HTTP helper with transparent, graceful error reporting (Part-A)."""
+    """HTTP helper with transparent, graceful error reporting (Part-A).
+
+    Transient transport failures (timeout / network) get **one silent
+    retry** after 250 ms — same pattern as ``stock_chat._post``. On
+    retry success the response carries ``retry_count: 1`` for the
+    runner's ToolRetryEvent emission. 4xx + 5xx responses are NOT
+    retried (those are either bad input or upstream issues that won't
+    fix themselves in 250 ms).
+    """
     url = f"{_base_url()}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.request(method, url, json=body, params=params)
-    except httpx.TimeoutException as exc:
-        logger.warning("BMC service timed out at %s: %s", url, exc)
-        return make_error(
-            message="The BMC service timed out building the canvas. Try again in a moment.",
-            code="bmc_timeout",
-            next_action="ask_user_to_retry_later",
-            retriable=True,
-            detail=str(exc),
-        )
-    except httpx.RequestError as exc:
-        logger.warning("BMC service unreachable at %s: %s", url, exc)
-        return make_error(
-            message="The BMC service is unreachable.",
-            code="bmc_unreachable",
-            next_action="ask_user_to_retry_later",
-            retriable=True,
-            detail=f"{method} {path}: {exc}",
-        )
+    retry_count = 0
+    for attempt in (1, 2):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.request(method, url, json=body, params=params)
+            if attempt == 2:
+                retry_count = 1
+            break
+        except httpx.TimeoutException as exc:
+            if attempt == 1:
+                logger.warning(
+                    "BMC service timed out at %s (attempt %d) — retrying in %sms",
+                    url, attempt, int(_RETRY_DELAY_S * 1000),
+                )
+                await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+            logger.warning("BMC service timed out at %s after retry: %s", url, exc)
+            return make_error(
+                message="The BMC service timed out building the canvas. Try again in a moment.",
+                code="bmc_timeout",
+                next_action="ask_user_to_retry_later",
+                retriable=True,
+                detail=str(exc),
+            )
+        except httpx.RequestError as exc:
+            if attempt == 1:
+                logger.warning(
+                    "BMC service unreachable at %s (attempt %d) — retrying in %sms",
+                    url, attempt, int(_RETRY_DELAY_S * 1000),
+                )
+                await asyncio.sleep(_RETRY_DELAY_S)
+                continue
+            logger.warning("BMC service unreachable at %s after retry: %s", url, exc)
+            return make_error(
+                message="The BMC service is unreachable.",
+                code="bmc_unreachable",
+                next_action="ask_user_to_retry_later",
+                retriable=True,
+                detail=f"{method} {path}: {exc}",
+            )
+
     if resp.status_code == 404:
         return make_error(
             message="No business model canvas exists yet for this ticker. Use bmc_generate to build one.",
@@ -105,7 +136,10 @@ async def _request(method: str, path: str, *, timeout: float, body: dict | None 
             retriable=False,
             detail=resp.text,
         )
-    return resp.json()
+    data = resp.json()
+    if retry_count and isinstance(data, dict):
+        data["retry_count"] = retry_count
+    return data
 
 
 def _trim_bmc(data: dict) -> dict:
