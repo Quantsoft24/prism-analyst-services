@@ -52,7 +52,7 @@ class CompanyListResult:
 # Scores are 0-100 from rapidfuzz; the values below were calibrated against
 # the 4,773-row Indian catalog using typos like "Reliac/Releace/TCS Ltd".
 _HIT_THRESHOLD = 60          # ≥ this score → real result
-_SUGGEST_THRESHOLD = 40      # ≥ this but < HIT → "did you mean" surface
+_SUGGEST_THRESHOLD = 50      # ≥ this but < HIT → "did you mean" surface
 _STAGE1_CANDIDATE_CAP = 200  # how many SQL rows we'll re-rank
 _STAGE2_CANDIDATE_CAP = 500  # fallback when stage-1 SQL returns nothing
 
