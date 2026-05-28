@@ -43,6 +43,7 @@ from src.models.agent_run import AgentRun
 from src.schemas.chat import (
     AgentThoughtEvent,
     ChartEvent,
+    ChartPoint,
     DataFreshnessEvent,
     ErrorEvent,
     FinalAnswer,
@@ -147,6 +148,15 @@ class AgentRunner:
             agent_run_id=self._agent_run_id,
             session_id=self._session_id,
             agent_name=self._agent.name,
+        )
+
+        # Synthetic opening plan thought — gives the UI an immediate "Thinking…"
+        # card so the user sees agentic motion in the 1-3 seconds before the
+        # first tool result arrives. Phrasing is intentionally generic so we
+        # never lie about what tools the LLM will choose. See `_initial_plan_thought`.
+        yield AgentThoughtEvent(
+            text=_initial_plan_thought(user_message),
+            kind="plan",
         )
 
         try:
@@ -339,14 +349,32 @@ class AgentRunner:
                                 source=_freshness_source_label(tool_name),
                                 as_of=str(freshness),
                             )
+                    # Auto-chart from time-series rows when the tool emits
+                    # a recognizable shape (financials_query with period_end +
+                    # a numeric series across >=3 rows). The helper returns
+                    # None when conditions aren't met — never a fabricated chart.
+                    chart_evt = _try_emit_chart(tool_name, call_id, response)
+                    if chart_evt is not None:
+                        yield chart_evt
                     continue
 
+                # Text part — either a "thought" (Gemini thinking mode, if ever
+                # enabled) or the actual answer text. Thought parts MUST NOT
+                # accumulate into the final answer prose.
                 text = getattr(part, "text", None)
                 if text:
-                    # On the final response, all the text is in this event;
-                    # for streaming intermediate, also surfaces as tokens.
+                    if bool(getattr(part, "thought", False)):
+                        yield AgentThoughtEvent(text=text, kind="reflect")
+                        continue
                     final_text_parts.append(text)
-                    yield TokenEvent(text=text)
+                    # Re-chunk large text parts so the UI sees a smooth typing
+                    # cadence instead of a single 500+ char drop. ADK's Gemini
+                    # adapter typically yields the entire final answer in one
+                    # part. Small parts pass through with no delay so naturally-
+                    # streamed mid-turn text stays snappy. Cancellation
+                    # propagates through `asyncio.sleep` cleanly.
+                    async for chunk in _TokenChunker.stream(text):
+                        yield TokenEvent(text=chunk)
 
             # ── Detect end-of-turn ──
             check = getattr(event, "is_final_response", None)
@@ -361,22 +389,52 @@ class AgentRunner:
         raw_final = "".join(final_text_parts).strip()
         prose, structured = _split_structured_answer(raw_final)
 
-        # Safety net: Gemini sometimes terminates a turn after a tool call
-        # without emitting any final text — typically when the tool result
-        # was ambiguous (e.g. search_companies returned multiple matches).
-        # The system prompt forbids this (Rule 0) but the model can still
-        # do it. Rather than show the user an empty answer, synthesize a
-        # short fallback that names the tools that DID run so they know
-        # something happened and can refine the question.
+        # Safety net for the "empty prose" failure mode. Gemini sometimes
+        # terminates a turn after a tool call without writing the prose answer
+        # — either zero output, or (after the 2026-05-28 prompt change) ONLY
+        # the <answer_meta> block. The system prompt forbids this (Rule 0)
+        # but Flash is non-deterministic. Layered rescue (most-to-least useful):
+        #
+        #   1. structured.sections[0].body  → promote it to prose. Gemini
+        #      put the answer in the section body; just surface it.
+        #   2. structured.citations exist   → emit a short "data retrieved,
+        #      see Report tab" pointer. The right pane already has the data.
+        #   3. otherwise                    → existing generic fallback
+        #      that names the tools so users know something happened.
         if not prose:
-            prose = _synthesize_empty_answer_fallback(self._tool_trace)
-            structured = None  # invalidate any partial structured payload
-            logger.warning(
-                "Agent run %s terminated with empty answer; %d tools called. "
-                "Surfacing fallback message.",
-                self._agent_run_id,
-                len(self._tool_trace),
-            )
+            if structured is not None and structured.sections:
+                first_body = (structured.sections[0].body or "").strip()
+                if first_body:
+                    prose = first_body
+                    # Sync structured.text so the Report tab + chat thread
+                    # render the same content.
+                    structured = structured.model_copy(update={"text": prose})
+                    logger.warning(
+                        "Agent run %s emitted only meta block; promoted "
+                        "sections[0].body to prose.",
+                        self._agent_run_id,
+                    )
+            if not prose and structured is not None and structured.citations:
+                prose = (
+                    "I retrieved the data but didn't compose a written "
+                    "summary this turn — see the **Report** and **Sources** "
+                    "tabs on the right for the full breakdown."
+                )
+                structured = structured.model_copy(update={"text": prose})
+                logger.warning(
+                    "Agent run %s emitted only meta block with citations; "
+                    "surfacing pointer-to-Report-tab fallback.",
+                    self._agent_run_id,
+                )
+            if not prose:
+                prose = _synthesize_empty_answer_fallback(self._tool_trace)
+                structured = None  # nothing structured to preserve
+                logger.warning(
+                    "Agent run %s terminated with empty answer; %d tools "
+                    "called. Surfacing generic fallback message.",
+                    self._agent_run_id,
+                    len(self._tool_trace),
+                )
 
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
@@ -519,49 +577,152 @@ def _summarize_tool_response(response: dict[str, Any]) -> str:
     return "ok · " + ", ".join(keys)
 
 
-# Regex anchored to the end of the answer so a stray ``<answer_meta>`` inside
-# the prose (unlikely but possible) doesn't get mistaken for the contract block.
+# Regex anchored to the end of the response. Uses GREEDY ``.*`` for the JSON
+# capture (not ``\{.*?\}``) so it handles nested braces / arrays without
+# truncating mid-payload — critical when the LLM emits a citations array of
+# objects: a non-greedy ``\{.*?\}`` would stop at the FIRST inner ``}``,
+# capture invalid JSON, and the whole block would leak into the visible prose.
+# The ``\s*$`` anchor ensures we still only match a block at the very end of
+# the response, not a stray inline ``<answer_meta>`` tag.
 _ANSWER_META_RE = re.compile(
-    r"<answer_meta>\s*(?P<json>\{.*?\})\s*</answer_meta>\s*$",
+    r"<answer_meta>\s*(?P<json>.*)</answer_meta>\s*$",
     re.DOTALL,
 )
+
+# Defensive fallback: if the main regex fails to parse cleanly for any reason
+# (truncated block, unbalanced JSON, LLM put text after the closing tag),
+# we still strip any ``<answer_meta>...</answer_meta>`` pair from the tail so
+# users NEVER see the raw block as visible prose. Same end-anchor.
+_ANSWER_META_STRIP_RE = re.compile(
+    r"<answer_meta>.*?</answer_meta>\s*$",
+    re.DOTALL,
+)
+
+# Backstop: strip a trailing "Sources: ..." line if the LLM appended one
+# despite the prompt rule against it. The UI's right-pane "Sources" tab is
+# the canonical place for source attribution; a prose line is duplicate noise.
+# Matches the most common shapes Gemini Flash produces:
+#   "\nSources: financials_query"
+#   "\n**Sources:** [...]"
+#   "\n\n- Sources: foo, bar"
+_TRAILING_SOURCES_RE = re.compile(
+    r"\n+\s*[\*\-•]*\s*\**\s*Sources?\s*:\s*[^\n]+\s*$",
+    re.IGNORECASE,
+)
+
+# Valid Literal values lifted from src/schemas/chat.py — kept here so we can
+# coerce LLM output BEFORE Pydantic strict-validates and rejects the whole
+# structured payload. Used by ``_coerce_citation`` / ``_coerce_section``.
+_VALID_SOURCE_KIND = frozenset({"filing", "web", "bmc", "tool"})
+_VALID_CONFIDENCE = frozenset({"high", "medium", "low"})
+_VALID_SECTION_KIND = frozenset({"summary", "anomaly", "note"})
+
+
+def _coerce_citation(c: Any) -> dict | None:
+    """Soften LLM-emitted citation fields so Pydantic accepts them.
+
+    Gemini sometimes writes ``source_kind: "financials"`` (or anything else);
+    rather than reject the whole structured payload over a vocabulary mismatch,
+    we coerce unknown values to ``"tool"`` (the safe default the schema
+    already uses). Non-dict entries are dropped.
+    """
+    if not isinstance(c, dict):
+        return None
+    out = dict(c)
+    if out.get("source_kind") not in _VALID_SOURCE_KIND:
+        out["source_kind"] = "tool"
+    return out
+
+
+def _coerce_section(s: Any) -> dict | None:
+    """Same idea as ``_coerce_citation`` for ``FinalSection``: unknown
+    ``kind`` values get mapped to ``"summary"``. Missing title/body → drop."""
+    if not isinstance(s, dict):
+        return None
+    if not s.get("title") or not s.get("body"):
+        return None
+    out = dict(s)
+    if out.get("kind") not in _VALID_SECTION_KIND:
+        out["kind"] = "summary"
+    return out
+
+
+def _clean_prose_tail(prose: str) -> str:
+    """Strip artefacts the LLM commonly appends despite the prompt rules:
+    (1) a raw ``<answer_meta>...</answer_meta>`` block, (2) a trailing
+    ``Sources:`` line. Run AFTER the meta block has been extracted (or
+    after a parse-failure), so it's always a defensive last pass."""
+    if not prose:
+        return prose
+    cleaned = _ANSWER_META_STRIP_RE.sub("", prose).rstrip()
+    cleaned = _TRAILING_SOURCES_RE.sub("", cleaned).rstrip()
+    return cleaned
 
 
 def _split_structured_answer(raw: str) -> tuple[str, FinalAnswer | None]:
     """Extract an optional structured FinalAnswer block from the prose tail.
 
-    Contract: the agent MAY end its response with::
+    Contract: the agent SHOULD end its response with::
 
-        <answer_meta>{"citations":[...],"confidence":"high","data_freshness":"2026-Q4"}</answer_meta>
+        <answer_meta>{"citations":[...],"confidence":"high",
+          "data_freshness":"2025-03-31","kpis":[...],"sections":[...]}</answer_meta>
 
-    If present and parseable, returns ``(prose_without_block, FinalAnswer)``.
-    Otherwise returns ``(raw, None)`` — prose alone, the UI still renders.
-    Soft contract: never error on a malformed block, just degrade.
+    Returns ``(prose, FinalAnswer | None)``. Soft contract: NEVER errors on
+    a malformed block, NEVER leaks the raw meta block into the visible
+    prose, NEVER preserves a trailing "Sources:" line.
+
+    Layered fallback (most-to-least preferred):
+      1. Regex matches + JSON parses + FinalAnswer validates → full structured.
+      2. Regex matches + JSON parses + validation fails per-field → coerced
+         and partial FinalAnswer (citations w/ unknown source_kind → "tool",
+         unknown confidence → "medium", invalid sections dropped).
+      3. Regex matches + JSON fails → strip the block from prose, return prose.
+      4. Regex misses → strip any raw meta tags from prose defensively.
     """
     if not raw:
         return raw, None
     match = _ANSWER_META_RE.search(raw)
     if not match:
-        return raw, None
-    prose = raw[: match.start()].rstrip()
-    payload = match.group("json")
+        # No structured block — still defensively clean any artefacts so
+        # the user never sees raw meta tags or a duplicate Sources line.
+        return _clean_prose_tail(raw), None
+    prose = _clean_prose_tail(raw[: match.start()])
+    payload = match.group("json").strip()
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        logger.debug("answer_meta JSON parse failed; returning prose only")
-        return raw, None
-    # The contract: data may carry only citations/confidence/data_freshness —
-    # we synthesize a FinalAnswer with the prose as ``text``.
+        logger.debug("answer_meta JSON parse failed; returning cleaned prose")
+        return prose, None
+    if not isinstance(data, dict):
+        return prose, None
+
+    # Coerce LLM output to schema-valid shapes BEFORE Pydantic strict-validates.
+    confidence = data.get("confidence")
+    if confidence not in _VALID_CONFIDENCE:
+        confidence = "medium"
+    citations = [
+        c for c in (_coerce_citation(x) for x in (data.get("citations") or []))
+        if c is not None
+    ]
+    sections = [
+        s for s in (_coerce_section(x) for x in (data.get("sections") or []))
+        if s is not None
+    ]
+    kpis_raw = data.get("kpis") or []
+    kpis = [k for k in kpis_raw if isinstance(k, dict) and k.get("label") and k.get("value")]
+
     try:
         structured = FinalAnswer(
             text=prose,
-            citations=data.get("citations") or [],
-            confidence=data.get("confidence") or "medium",
+            citations=citations,
+            confidence=confidence,
             data_freshness=data.get("data_freshness"),
+            kpis=kpis,
+            sections=sections,
         )
-    except Exception:
-        logger.debug("answer_meta payload didn't validate; returning prose only")
-        return raw, None
+    except Exception as exc:
+        logger.debug("answer_meta validation failed after coercion: %s", exc)
+        return prose, None
     return prose, structured
 
 
@@ -622,6 +783,213 @@ def _freshness_source_label(tool_name: str) -> str:
     if tool_name == "web_search":
         return "web search"
     return tool_name
+
+
+class _TokenChunker:
+    """Chunk long text into word-boundary beats with short async sleeps.
+
+    Why this exists: ADK's Gemini adapter typically emits the full final
+    answer as ONE big text part. The frontend then sees a single TokenEvent
+    of 200-2000 chars and the prose "pops" into view all at once — a long
+    wait followed by a sudden drop. Re-chunking on the server gives the UI
+    the same smooth typing cadence the mock-mode scenarios produce
+    (``prism-analyst-platform/src/lib/api/chat.mock.ts``), without changing
+    the wire shape (still ``TokenEvent`` objects; just more of them).
+
+    Pass-through for short parts: when ADK is streaming naturally (small
+    chunks at 50-100ms intervals), adding our own delay would compound and
+    feel sluggish. ``_PASSTHROUGH`` is the boundary above which re-chunking
+    is worth the slight extra latency.
+
+    Cancellation: ``asyncio.sleep`` propagates ``CancelledError`` cleanly,
+    so a user clicking Stop interrupts mid-chunk just like before.
+    """
+
+    _PASSTHROUGH = 120   # parts this size or smaller emit as-is, no delay
+    _TARGET_LEN = 80     # split larger parts at roughly this width
+    _SLACK = 20          # accept a word boundary within ±SLACK of the target
+    _DELAY_S = 0.035     # 35 ms between chunks — perceptible motion, not slow
+
+    @classmethod
+    async def stream(cls, text: str) -> AsyncIterator[str]:
+        """Yield text in chunks suitable for ``TokenEvent.text``. Short
+        text passes through with zero delay; long text is split at word
+        boundaries with a 35 ms sleep between yields."""
+        if not text:
+            return
+        if len(text) <= cls._PASSTHROUGH:
+            yield text
+            return
+        remaining = text
+        first = True
+        while remaining:
+            chunk, remaining = cls._split_one(remaining)
+            if not first:
+                await asyncio.sleep(cls._DELAY_S)
+            first = False
+            yield chunk
+
+    @classmethod
+    def _split_one(cls, text: str) -> tuple[str, str]:
+        """Take ~``_TARGET_LEN`` chars at the nearest word boundary.
+        Returns ``(chunk, remainder)``. Never breaks inside a word when
+        a sensible boundary exists within ±``_SLACK``."""
+        if len(text) <= cls._TARGET_LEN:
+            return text, ""
+        # Look for a space within target ± SLACK
+        lo = max(1, cls._TARGET_LEN - cls._SLACK)
+        hi = min(len(text), cls._TARGET_LEN + cls._SLACK)
+        cut = text.rfind(" ", lo, hi)
+        if cut == -1:
+            # No space in window — fall back to a hard cut at TARGET_LEN
+            cut = cls._TARGET_LEN
+        else:
+            cut += 1  # include the space in the chunk
+        return text[:cut], text[cut:]
+
+
+def _initial_plan_thought(user_msg: str) -> str:
+    """Honest, safe opening thought emitted before any tool fires.
+
+    Phrasings never name a specific tool or commit to a path — the LLM
+    might pick differently. They're tuned to match the cadence of the
+    mock's plan beats while remaining accurate regardless of which tool
+    the agent actually chooses.
+    """
+    if not user_msg:
+        return "Let me work on this."
+    # Pad with spaces so leading-position keywords (e.g. "RSI for X" → " rsi ")
+    # match the same way they do in mid-sentence position. Cheap, robust.
+    m = " " + user_msg.lower() + " "
+    # Multi-company comparison
+    if any(k in m for k in (" vs ", " vs. ", " compare ", " versus ")):
+        return "Let me pull data on each company so I can compare them side by side."
+    # Filings narrative
+    if any(k in m for k in (
+        "filing", "annual report", "disclos", " agm ", "board meeting",
+        "md&a", "concall", "transcript",
+    )):
+        return "Let me check the latest filings for that."
+    # Live market data
+    if any(k in m for k in (
+        "price", " rsi ", "moving average", " macd ", "trading at", "52-week", "52 week",
+    )):
+        return "Let me pull the live market data."
+    # Numbers / financials
+    if any(k in m for k in (
+        "profit", "revenue", "ebitda", "margin", "ratio", "cagr",
+        " yoy ", "growth", "earnings", " pat ", " pbt ", "balance sheet",
+        "cash flow", "debt", "shareholding", "holding",
+    )):
+        return "Let me pull the financial data for that."
+    # Business model
+    if any(k in m for k in (" bmc ", "business model", "canvas")):
+        return "Let me load the business model canvas."
+    # Sector
+    if any(k in m for k in ("sector", "industry", " top ", " bottom ", "ranking", "peers")):
+        return "Let me check what's in that sector."
+    return "Let me work on this."
+
+
+# Columns that are metadata, not chartable values, on financials_query rows.
+# Used by ``_try_emit_chart`` to filter down to a single numeric series.
+_NON_CHART_COLUMNS = frozenset({
+    "period_end", "period_type", "company_id", "company_name", "ticker",
+    "exchange", "industry", "industry_group", "sector",
+    "sid", "line_code", "line_path", "statement_type", "taxonomy",
+    "view", "fiscal_period", "as_of", "source", "id",
+})
+
+
+def _try_emit_chart(
+    tool_name: str, call_id: str, response: Any,
+) -> ChartEvent | None:
+    """Auto-build a ChartEvent from a tool response that holds a time-series.
+
+    Conservative on purpose — fires ONLY when every signal lines up:
+      * tool is ``financials_query`` (the only tool that reliably returns
+        date-anchored rows today)
+      * response has ``rows`` (list, >=3 entries)
+      * every row has a string ``period_end`` field
+      * exactly one numeric column appears in every row and isn't a meta
+        column (period_end / company_id / sid / etc.)
+
+    Returns ``None`` when any check fails. Rather a dropped chart than a
+    wrong/ugly one. Multi-series and bar-style charts could be added later
+    without changing the call site.
+    """
+    if tool_name != "financials_query":
+        return None
+    if not isinstance(response, dict):
+        return None
+    rows = response.get("rows")
+    if not isinstance(rows, list) or len(rows) < 3:
+        return None
+    if not all(
+        isinstance(r, dict) and isinstance(r.get("period_end"), str)
+        for r in rows
+    ):
+        return None
+
+    # Find numeric columns present in EVERY row, excluding meta fields.
+    first_row = rows[0]
+    candidate_cols: list[str] = []
+    for col, val in first_row.items():
+        if col in _NON_CHART_COLUMNS:
+            continue
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            continue
+        if all(
+            isinstance(r.get(col), (int, float)) and not isinstance(r.get(col), bool)
+            for r in rows
+        ):
+            candidate_cols.append(col)
+
+    if not candidate_cols:
+        return None
+    # Multiple series → pick deterministically (alphabetical) for now.
+    # Future: detect "value" / "amount" preferred columns, or emit one chart per series.
+    column = sorted(candidate_cols)[0]
+
+    sorted_rows = sorted(rows, key=lambda r: r["period_end"])
+    points = [
+        ChartPoint(x=str(r["period_end"]), y=float(r[column]))
+        for r in sorted_rows
+    ]
+    first_y = points[0].y
+    last_y = points[-1].y
+    if first_y != 0:
+        delta_pct = (last_y - first_y) / abs(first_y) * 100
+    else:
+        delta_pct = 0.0
+    if delta_pct > 0.5:
+        delta_kind: Any = "pos"
+        delta_str = f"+{delta_pct:.1f}% over period"
+    elif delta_pct < -0.5:
+        delta_kind = "neg"
+        delta_str = f"{delta_pct:.1f}% over period"
+    else:
+        delta_kind = "neutral"
+        delta_str = "flat over period"
+
+    title = column.replace("_", " ").strip().title()
+    # Compact display formatting: don't strip zeros from values like "0.44".
+    if abs(last_y) >= 100:
+        current_value = f"{last_y:,.0f}"
+    else:
+        current_value = f"{last_y:,.2f}"
+
+    return ChartEvent(
+        call_id=call_id,
+        chart_id=f"financials_{column}",
+        title=title,
+        unit="",
+        current_value=current_value,
+        current_delta=delta_str,
+        delta_kind=delta_kind,
+        points=points,
+        kind="line",
+    )
 
 
 def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
