@@ -11,6 +11,13 @@ right one for any question:
 The legacy ``/tools/ask`` and ``/tools/search-narrative`` are intentionally NOT
 wired — the service's own docs say "do not use for new integrations".
 
+**v3 contract (2026-05):** ``stock_filings_read`` sends only 3 fields —
+``question``, ``company`` (optional hint), and ``synthesise``. Every catalog
+filter (category, period, dates, industry, text_match, max_filings) is derived
+by the service's own LLM planner, which has domain context the upstream agent
+lacks (the catalog's exact category enum, the screener industry taxonomy,
+date-phrase semantics). The upstream agent MUST NOT pre-fill those fields.
+
 Base URL: ``settings.STOCK_CHAT_URL`` (env ``STOCK_CHAT_URL``). No caller auth —
 the service is network-restricted to the PRISM backend.
 """
@@ -122,7 +129,7 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
             retriable=True,
             detail=resp.text,
         )
-    if resp.status_code == 400:
+    if resp.status_code in (400, 422):
         return make_error(
             message="The filings service rejected the request — the question may need more detail.",
             code="stock_chat_bad_request",
@@ -148,63 +155,71 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
 
 async def stock_filings_read(
     question: str,
-    company: str | None = None,
-    companies: list[str] | None = None,
-    category: str | None = None,
-    period: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    max_filings: int = 3,
+    company: str | list[str] | None = None,
+    synthesise: bool = True,
 ) -> dict:
     """Answer a NARRATIVE question about what an Indian listed company (or a whole
     sector) said, disclosed, announced, decided, or commented on in its NSE/BSE
     filings — strategy, risks, MD&A, sustainability, governance, board decisions,
-    dividends, regulatory disclosures. Searches a 649k-filing catalog, reads the
-    actual PDF(s), and returns a synthesised answer plus verbatim evidence
-    passages with ``[Company | p.N]`` citations.
+    dividends, regulatory disclosures, board members / directors. Searches a
+    650k-filing catalog, reads the actual PDF(s), and returns a synthesised
+    answer plus verbatim evidence passages with ``[Company | p.N]`` citations.
 
-    WHEN TO USE: the user asks what a company/sector *said* or *disclosed*
-    qualitatively, or when the filing may not be in PRISM's locally ingested set
-    (this covers the full public NSE/BSE catalog).
+    **SIMPLIFIED CONTRACT (v3):** This tool's internal LLM planner handles ALL
+    catalog filtering — category, period, dates, sector industry matching,
+    text keywords, and how many PDFs to open. Do NOT pre-fill those fields;
+    the planner has domain-specific context (the catalog's exact category enum,
+    screener industry taxonomy, and date-phrase semantics) that the upstream
+    agent lacks. Just pass the question and an optional company hint.
 
-    WHEN NOT TO USE: exact financial figures (precise revenue, margins, ratios,
-    segment numbers) — use PRISM's own filing retrieval + compute_* tools. For
-    *which filings exist* use ``stock_filings_lookup``; for live price/technicals
-    use ``stock_technicals``.
+    WHEN TO USE:
+      • The user asks what a company/sector *said* or *disclosed* qualitatively.
+      • The user asks about strategy, risks, MD&A, governance, sustainability.
+      • The user asks for board members, directors, board decisions.
+      • The user asks about dividends, corporate actions FROM filings.
+      • The user asks for sector-wide narrative ("What did the cement sector's
+        boards decide recently?") — the planner infers the sector from 16
+        supported sector keys (Auto, Bank, Pharma, IT, Steel, Cement, Chemical,
+        FMCG, Telecom, Insurance, RealEstate, Power, Textile, Hospital, Airline,
+        Media) and picks filings from distinct companies.
+      • Comparison questions ("Compare ICICI and HDFC Bank board outcomes").
+
+    WHEN NOT TO USE:
+      • Exact financial figures (precise revenue, margins, ratios, segment
+        numbers) → use ``financials_query`` instead.
+      • "Which filings exist?" (catalog metadata only) → ``stock_filings_lookup``.
+      • Live price/technicals → ``stock_technicals``.
 
     Always preserve the returned ``[Company | p.N]`` citation strings verbatim.
-    If ``needs_clarification`` is true, ask the user the ``clarification_question``.
+    If ``needs_clarification`` is true, show the ``clarification_question`` to
+    the user. If ``selected_filings[].is_scanned`` is true, note the gap.
 
     Args:
-        question: The user's natural-language question (required). Phrase sector
-            questions naturally ("the cement sector"); the service infers the sector.
-        company: Single company hint (name or ticker) — best-match resolved.
-        companies: Multiple companies — each best-match resolved.
-        category: One of "Annual Report", "Result", "Board Meeting", "AGM/EGM",
-            "Corp. Action", "Company Update", "Insider Trading / SAST".
-        period: Fiscal to-year, e.g. "2025" for FY2024-25.
-        date_from: ISO YYYY-MM-DD lower bound (board-meeting/update windows).
-        date_to: ISO YYYY-MM-DD upper bound.
-        max_filings: PDFs to open, 1-8. Keep >=3 for sector surveys.
+        question: The user's natural-language question (required). Pass it
+            verbatim — the service's 6-tier company resolver handles short
+            forms (TCS, RIL, L&T, M&M, HUL, SBI), 1-2 char typos
+            (Relianse, Bharat Petrolium), &/and variants, punctuation
+            (Dr. Reddy's), and BSE numeric scrip codes.
+        company: Optional company hint — a single name/ticker (``"TCS"``),
+            a list for comparisons (``["ICICI Bank", "HDFC Bank"]``), or
+            omitted (the planner extracts company names from the question).
+            Pass the user's input as-is; do NOT pre-resolve via
+            ``lookup_company`` — the service has its own resolver.
+        synthesise: ``True`` (default) → prose answer with inline
+            ``[Company | p.N]`` citations for direct user display.
+            ``False`` → evidence passages + bulk document excerpts only,
+            for when the orchestrator blends output from multiple tools.
 
     Returns:
-        dict with ``answer``, ``needs_clarification`` / ``clarification_question``,
-        ``resolved_companies``, ``selected_filings``, ``evidence``. ``{"error": ...}``
-        on a transport/service failure.
+        dict with ``answer``, ``plan``, ``needs_clarification`` /
+        ``clarification_question``, ``resolved_companies``,
+        ``selected_filings`` (enriched), ``evidence``,
+        ``candidates_considered``, ``data_freshness``.
+        ``{"error": ...}`` on a transport/service failure.
     """
-    payload: dict = {"question": question, "synthesise": True, "max_filings": max_filings}
+    payload: dict = {"question": question, "synthesise": synthesise}
     if company:
         payload["company"] = company
-    if companies:
-        payload["companies"] = companies
-    if category:
-        payload["category"] = category
-    if period:
-        payload["period"] = period
-    if date_from:
-        payload["date_from"] = date_from
-    if date_to:
-        payload["date_to"] = date_to
 
     data = await _post("/tools/read", payload, _READ_TIMEOUT)
     if data.get("ok") is False or "error" in data:
@@ -216,24 +231,32 @@ async def stock_filings_read(
         (f.get("announcement_dt") for f in selected if f.get("announcement_dt")),
         default=None,
     )
-    # Trim bulky fields (document_excerpts / token_usage / timings) to keep context lean.
+    # Trim bulky fields (document_excerpts / token_usage / timings) to keep
+    # context lean, but preserve enriched metadata the agent needs.
     return {
         "answer": data.get("answer"),
+        "plan": data.get("plan"),
         "needs_clarification": data.get("needs_clarification", False),
         "clarification_question": data.get("clarification_question"),
         "resolved_companies": data.get("resolved_companies"),
+        "candidates_considered": data.get("candidates_considered"),
         "selected_filings": [
             {
                 "company_name": f.get("company_name"),
                 "headline": f.get("headline"),
+                "category": f.get("category"),
                 "announcement_dt": f.get("announcement_dt"),
                 "read_ok": f.get("read_ok"),
                 "page_count": f.get("page_count"),
+                "is_scanned": f.get("is_scanned"),
+                "why_selected": f.get("why_selected"),
+                "sections_read": f.get("sections_read"),
             }
             for f in selected
         ],
         "evidence": data.get("evidence"),
         "data_freshness": latest_dt,
+        **({"retry_count": data["retry_count"]} if "retry_count" in data else {}),
     }
 
 

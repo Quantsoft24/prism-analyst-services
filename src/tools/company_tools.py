@@ -84,6 +84,7 @@ _MAX_INPUT_LENGTH = 200
 _SECTOR_FUZZY_THRESHOLD = 75.0
 
 
+
 # ── Shared formatters ──────────────────────────────────────────────────────
 
 
@@ -225,7 +226,23 @@ async def lookup_company(ticker: str) -> dict:
             next_action="ask_user_to_clarify",
         )
 
-    # 3) Treat the whole-string upper-case form as a candidate ticker.
+    # 3) DB-backed alias resolution — checks the company_aliases table
+    # (populated by scripts/setup_company_aliases.py). Covers ~10,000+
+    # algorithmically generated aliases (first-letter acronyms, suffix-
+    # stripped short names, &/and variants, BSE cross-refs, curated
+    # entries) with a 30-minute TTL cache for the 99% path.
+    async with catalog_session_scope() as session:
+        repo = CompanyRepository(session)
+        alias_match = await repo.resolve_alias(cleaned)
+        if alias_match is not None:
+            return _to_full_row(
+                alias_match.company,
+                disambiguation_note=(
+                    f'Resolved alias "{cleaned}" -> {alias_match.code}'
+                ),
+            )
+
+    # 4) Treat the whole-string upper-case form as a candidate ticker.
     # For multi-word inputs ("Tata Consultancy") this won't hit and we
     # fall into the fuzzy path below — that's the desired flow.
     ticker_form = upper
