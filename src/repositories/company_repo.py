@@ -21,14 +21,18 @@ replaced by a trigram-similarity scan that's both faster and broader.
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 
 from rapidfuzz import fuzz
-from sqlalchemy import Integer, func, or_, select
+from sqlalchemy import Integer, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models.catalog import CompanyIndustry
+from src.models.catalog import CompanyAlias, CompanyIndustry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -46,6 +50,84 @@ class CompanyListResult:
     items: list[CompanyIndustry]
     total: int
     suggestions: list[CompanyIndustry] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class AliasMatch:
+    """Result of a successful alias resolution.
+
+    ``company``  — the resolved CompanyIndustry row.
+    ``alias``    — the alias string that matched.
+    ``code``     — the canonical ticker code.
+    ``method``   — how it was resolved: 'exact' | 'trgm' | 'cache'.
+    """
+
+    company: CompanyIndustry
+    alias: str
+    code: str
+    method: str
+
+
+# ── Alias TTL cache ───────────────────────────────────────────────────────────
+# The alias table is quasi-static (changes only when the generation script
+# runs). Caching exact alias_norm → code lookups avoids a DB roundtrip on
+# every single user query. 30-minute TTL keeps memory bounded and ensures
+# new aliases propagate within half an hour.
+#
+# Only exact matches are cached. pg_trgm similarity queries are too
+# dynamic (query-dependent) and too rare (only fire when exact misses)
+# to benefit from caching.
+
+_ALIAS_CACHE_TTL = 1800  # 30 minutes
+_ALIAS_CACHE_MAX = 1000  # max entries
+
+
+class _AliasCache:
+    """Lightweight TTL cache for exact alias → code lookups.
+
+    Thread-safety: asyncio is single-threaded within an event loop, so
+    no locking needed. For multi-worker deployments each worker gets its
+    own cache instance — that's fine given the small memory footprint
+    (~100 KB for 1,000 entries).
+    """
+
+    def __init__(self, ttl: float = _ALIAS_CACHE_TTL, maxsize: int = _ALIAS_CACHE_MAX) -> None:
+        self._ttl = ttl
+        self._maxsize = maxsize
+        self._store: dict[str, tuple[str | None, float]] = {}  # alias_norm -> (code | None, expiry)
+
+    def get(self, alias_norm: str) -> str | None | object:
+        """Return cached code, ``None`` (cached negative), or ``_MISS`` (not in cache)."""
+        entry = self._store.get(alias_norm)
+        if entry is None:
+            return _MISS
+        code, expiry = entry
+        if time.monotonic() > expiry:
+            del self._store[alias_norm]
+            return _MISS
+        return code
+
+    def put(self, alias_norm: str, code: str | None) -> None:
+        """Cache a result (code or None for negative cache)."""
+        # Evict oldest entries if at capacity. Simple: clear half the cache.
+        # This is rare (1,000 entries) and fast.
+        if len(self._store) >= self._maxsize:
+            entries = sorted(self._store.items(), key=lambda kv: kv[1][1])
+            for key, _ in entries[: len(entries) // 2]:
+                del self._store[key]
+        self._store[alias_norm] = (code, time.monotonic() + self._ttl)
+
+    def clear(self) -> None:
+        """Flush the cache (called after alias regeneration)."""
+        self._store.clear()
+
+
+# Sentinel for cache miss (distinct from None, which means "negative cache").
+_MISS = object()
+
+# Module-level singleton — shared across all CompanyRepository instances
+# within a single worker process.
+_alias_cache = _AliasCache()
 
 
 # ── Fuzzy-match tuning constants ──────────────────────────────────────────
@@ -83,6 +165,9 @@ def _normalize_query(q: str) -> str:
     transliterate, because the catalog itself doesn't have them.
     """
     s = q.strip().lower()
+    # Normalise "&" to "and" BEFORE stripping punctuation — gives "L&T"
+    # a meaningful shape ("l and t") instead of "l t" for rapidfuzz.
+    s = s.replace("&", " and ")
     # Strip everything that isn't a letter, digit, or single space.
     s = re.sub(r"[^a-z0-9\s]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -128,14 +213,106 @@ def _rank_candidates(
 
 
 class CompanyRepository:
-    """Async read-only repository over ``company_industry``. Construct with a
-    session bound to the catalog engine (``catalog_session_scope`` /
-    ``get_catalog_session``)."""
+    """Async read-only repository over ``company_industry`` + ``company_aliases``.
+    Construct with a session bound to the catalog engine (``catalog_session_scope``
+    / ``get_catalog_session``)."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    # ── Reads ─────────────────────────────────────────────────────────────
+    # ── Alias resolution ─────────────────────────────────────────────────────────
+
+    async def resolve_alias(self, query: str) -> AliasMatch | None:
+        """Resolve a user query against the ``company_aliases`` table.
+
+        Resolution order (first hit wins):
+          1. **TTL cache** — exact alias_norm lookup in the in-memory cache.
+             Avoids a DB roundtrip for the ~500 most common abbreviations.
+          2. **Exact B-tree match** on ``alias_norm`` — O(1) indexed lookup.
+             Covers "RIL", "Infy", "L&T" etc.
+          3. **pg_trgm similarity** on ``alias_norm`` (threshold 0.6) —
+             catches typos in the alias itself ("Relianse" → "reliance").
+
+        Returns ``AliasMatch`` on success, ``None`` on no match.
+        Thread-safe within a single asyncio event loop.
+        """
+        norm = _normalize_query(query)
+        if not norm:
+            return None
+
+        # 1) Check the in-memory cache first.
+        cached = _alias_cache.get(norm)
+        if cached is not _MISS:
+            if cached is None:
+                return None  # negative cache
+            # Cache hit — we have the code, fetch the company row.
+            company = await self.get_by_ticker(cached)
+            if company is not None:
+                return AliasMatch(
+                    company=company, alias=norm, code=cached, method="cache"
+                )
+
+        # 2) Exact match on alias_norm (B-tree index).
+        try:
+            stmt = (
+                select(CompanyAlias)
+                .where(CompanyAlias.alias_norm == norm)
+                .order_by(CompanyAlias.confidence.desc())
+                .limit(1)
+            )
+            alias_row = (await self._session.execute(stmt)).scalar_one_or_none()
+        except Exception:
+            # Table might not exist yet (pre-migration). Degrade gracefully.
+            logger.debug("company_aliases table not available — skipping alias lookup")
+            return None
+
+        if alias_row is not None:
+            _alias_cache.put(norm, alias_row.code)
+            company = await self.get_by_ticker(alias_row.code)
+            if company is not None:
+                return AliasMatch(
+                    company=company,
+                    alias=alias_row.alias,
+                    code=alias_row.code,
+                    method="exact",
+                )
+
+        # 3) pg_trgm similarity (catches typos in the alias itself).
+        try:
+            stmt = (
+                select(CompanyAlias)
+                .where(
+                    text("similarity(alias_norm, :q) > 0.6")
+                    .bindparams(q=norm)
+                )
+                .order_by(
+                    text("similarity(alias_norm, :q) DESC")
+                    .bindparams(q=norm)
+                )
+                .limit(1)
+            )
+            alias_row = (await self._session.execute(stmt)).scalar_one_or_none()
+        except Exception:
+            # pg_trgm might not be available or table missing.
+            logger.debug("pg_trgm alias search failed — skipping")
+            alias_row = None
+
+        if alias_row is not None:
+            _alias_cache.put(norm, alias_row.code)
+            company = await self.get_by_ticker(alias_row.code)
+            if company is not None:
+                return AliasMatch(
+                    company=company,
+                    alias=alias_row.alias,
+                    code=alias_row.code,
+                    method="trgm",
+                )
+
+        # No match — cache negative result to avoid repeated DB hits.
+        _alias_cache.put(norm, None)
+        return None
+
+    # ── Reads ───────────────────────────────────────────────────────────────────────
 
     async def get_by_ticker(self, ticker: str, exchange: str = "NSE") -> CompanyIndustry | None:
         """Resolve by NSE symbol / scrip code (``code`` column). ``exchange``

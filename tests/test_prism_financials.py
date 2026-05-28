@@ -201,6 +201,17 @@ def test_http_500_is_retriable(monkeypatch) -> None:
     assert result["retriable"] is True
 
 
+def test_http_404_signals_misconfigured_url(monkeypatch) -> None:
+    # 404 from this service is almost always a misconfigured PRISM_FINANCIALS_URL
+    # (e.g. unset → wrapper hits PRISM's own :8000). We surface it specifically
+    # so the agent stops instead of pretending an alternate tool could answer.
+    result, _ = _invoke(monkeypatch, [_FakeResp(404, text="Not Found")])
+    assert result["error_code"] == "prism_financials_http_404"
+    assert result["next_action"] == "ask_user_to_retry_later"
+    assert result["retriable"] is False
+    assert "PRISM_FINANCIALS_URL" in result["detail"]
+
+
 # ── Transport failures + one-shot retry ─────────────────────────────────────
 
 

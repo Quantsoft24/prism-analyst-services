@@ -104,7 +104,12 @@ class Settings(BaseSettings):
     # currently open (no caller auth); PRISM_FINANCIALS_API_KEY stays empty
     # until the service adds X-API-Key auth — the wrapper sends the header only
     # when it's set, so no secret ever lands in git.
-    PRISM_FINANCIALS_URL: str = "http://localhost:8000"
+    #
+    # NOTE: the upstream runs on :8000 — the same port PRISM itself binds to.
+    # The default below is :8013 (a placeholder), NOT :8000, so a missing env
+    # var fails loudly with "connection refused" instead of silently routing
+    # /ask back into PRISM's own FastAPI server (which would 404).
+    PRISM_FINANCIALS_URL: str = "http://localhost:8013"
     PRISM_FINANCIALS_API_KEY: str = ""
 
     # RAG / pdf-parsing / chunking settings retired with the read-on-demand

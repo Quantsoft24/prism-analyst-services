@@ -21,10 +21,15 @@
   source: python
   enabled: true
   description: >
-    Indian NSE/BSE filings service (649k catalog). Exposes three tools:
-    filings narrative Q&A (reads PDFs, cited evidence), catalog lookup (which
-    filings exist), and live technicals (price/RSI/MACD). Narrative + market
-    data; exact financials still go through PRISM's own retrieval + NRE.
+    Indian NSE/BSE filings service (650k catalog). Exposes three tools:
+    filings narrative Q&A (reads PDFs, cited evidence with [Company | p.N]
+    citations — covers strategy, risks, MD&A, sustainability, governance,
+    board decisions, dividends, board members / directors, sector roundups
+    across 16 curated sectors), catalog lookup (which filings exist), and
+    live technicals (price/RSI/MACD). The narrative tool has its own LLM
+    planner that handles all catalog filtering — the agent sends only the
+    question and an optional company hint. Exact financials go to
+    prism-financials.
   tags: [filings, research, market-data]
   config:
     entrypoint: "src.integrations.tools.stock_chat:STOCK_CHAT_TOOLS"
