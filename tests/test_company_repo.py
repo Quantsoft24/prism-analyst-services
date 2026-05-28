@@ -213,6 +213,7 @@ class TestLookupCompanyPatternRouting:
         mock_repo = MagicMock()
         mock_repo.get_by_ticker = AsyncMock(return_value=fake_co)
         mock_repo.get_by_isin = AsyncMock()
+        mock_repo.resolve_alias = AsyncMock(return_value=None)
         mock_repo.list = AsyncMock()
 
         @asynccontextmanager
@@ -242,6 +243,7 @@ class TestLookupCompanyPatternRouting:
         mock_repo = MagicMock()
         mock_repo.get_by_ticker = AsyncMock(return_value=None)
         mock_repo.get_by_isin = AsyncMock()
+        mock_repo.resolve_alias = AsyncMock(return_value=None)
         mock_repo.list = AsyncMock(
             return_value=CompanyListResult(items=[], total=0, suggestions=[])
         )

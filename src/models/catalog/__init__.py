@@ -5,6 +5,7 @@ PRISM's primary Alembic chain never touches them. Treat as read-only — the
 stock-chat / bmc services own these tables.
 """
 
+from src.models.catalog.company_alias import CompanyAlias
 from src.models.catalog.company_industry import CompanyIndustry
 
-__all__ = ["CompanyIndustry"]
+__all__ = ["CompanyAlias", "CompanyIndustry"]
