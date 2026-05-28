@@ -3,6 +3,11 @@
 > **AI-powered equity research backend.** FastAPI + PostgreSQL + Google ADK.
 > Indian markets, agent-first, read-on-demand grounding (no in-house RAG).
 
+> **Coding agent? Start here:** [`AGENTS.md`](AGENTS.md) and
+> [`../PRISM_HANDOFF.md`](../PRISM_HANDOFF.md). The workspace supports
+> multi-agent collaboration (Claude Code, Antigravity, Cursor, Aider) — those
+> files are the shared single source of truth across agent sessions.
+
 ## Architecture
 
 ```
@@ -20,23 +25,26 @@
                                │                 │       │
               ┌────────────────┘                 │       └──────────────┐
               ▼                                  ▼                      ▼
-   ┌───────────────────┐          ┌─────────────────────┐    ┌──────────────────┐
-   │ Neon Postgres     │          │  stock_chat Postgres │    │ External services │
-   │ (PRISM-owned)     │          │  (READ-ONLY catalog) │    │  bmc       :8012  │
-   │ agent_runs,       │          │  company_industry    │    │  stock-chat:8011  │
-   │ firms, users,     │          │  filings_index       │    │ (teammate-owned;  │
-   │ firm_integrations │          │  document_texts      │    │  same GCP VM)     │
-   └───────────────────┘          └─────────────────────┘    └──────────────────┘
+   ┌───────────────────┐          ┌─────────────────────┐    ┌──────────────────────┐
+   │ Neon Postgres     │          │  stock_chat Postgres │    │ External services    │
+   │ (PRISM-owned)     │          │  (READ-ONLY catalog) │    │  bmc            :8012│
+   │ agent_runs,       │          │  company_industry    │    │  stock-chat     :8011│
+   │ firms, users,     │          │  company_aliases     │    │  prism-financials:8000│
+   │ firm_integrations │          │  filings_index       │    │ (teammate-owned;     │
+   │                   │          │  document_texts      │    │  same GCP VM)        │
+   └───────────────────┘          └─────────────────────┘    └──────────────────────┘
 ```
 
 **Where PRISM owns data:** `agent_runs` (audit), `firm_integrations` (per-firm
 tool toggles), `firms` / `users` / `firm_memberships` (auth/tenancy).
-**Where PRISM reads-only:** `company_industry` (4,773 companies), via a
-secondary read-only engine.
-**External services (HTTP):** the `bmc` service (9-block canvas) and
-`stock-chat` (filings narrative Q&A, catalog lookup, technicals). PRISM's
-`/api/v1/bmc/*` thin-proxies to `bmc`; the chat agent reaches both via the
-integration registry.
+**Where PRISM reads-only:** `company_industry` (4,773 companies) +
+`company_aliases` (~10k algorithmic abbreviations / short-forms / typo
+variants), via a secondary read-only engine.
+**External services (HTTP):** `bmc` (9-block canvas), `stock-chat` (filings
+narrative Q&A, catalog lookup, technicals), and `prism-financials` (text-to-SQL
+over CMIE Prowess for exact figures / ratios / rankings). PRISM's
+`/api/v1/bmc/*` thin-proxies to `bmc`; the chat agent reaches all three via
+the integration registry.
 
 ## Tech stack
 
@@ -67,9 +75,12 @@ src/
 ├── models/                ORM — primary DB
 │   ├── base.py, firm.py, user.py, agent_run.py, integration.py
 │   └── catalog/           Read-only models on the catalog engine
-│       └── company_industry.py
+│       ├── company_industry.py
+│       └── company_alias.py    Algorithmic alias → ticker mappings
 ├── repositories/          Data access
-│   ├── company_repo.py    Queries company_industry on catalog engine
+│   ├── company_repo.py    Queries company_industry + company_aliases on
+│   │                      catalog engine (3-tier alias resolution: TTL
+│   │                      cache → exact alias_norm → pg_trgm similarity)
 │   └── integration_repo.py
 ├── schemas/               Pydantic request/response shapes
 ├── routers/
@@ -84,15 +95,21 @@ src/
 │   └── web_search.py      Google Search subagent (AgentTool pattern)
 ├── tools/                 Built-in agent tools
 │   ├── company_tools.py   lookup_company / search_companies / list_sectors
-│   └── nre_tools.py       Deterministic numerical reasoning (compute_*)
+│   └── nre_tools.py       Deterministic numerical reasoning (compute_*) —
+│                          on disk only; NOT attached to the agent today
+│                          (prism-financials covers the ratio cases via SQL).
 ├── integrations/          Universal integration framework
 │   ├── registry.py        Loads config/integrations.yml + builds adapters
 │   ├── adapters.py        python / openapi / mcp / agent source types
 │   ├── firm_state.py      Per-firm enable/disable resolver
 │   └── tools/             Typed wrappers for external services
-│       ├── stock_chat.py  3 tools (read / lookup-filings / technicals)
-│       └── bmc.py         6 tools (get / generate / library / version /
-│                          block_chat / diff)
+│       ├── stock_chat.py  3 tools — read (v3: question/company/synthesise
+│       │                  only; planner derives every other filter) /
+│       │                  lookup-filings / technicals
+│       ├── bmc.py         6 tools (get / generate / library / version /
+│       │                  block_chat / diff)
+│       └── prism_financials.py   1 tool — financials_query (exact
+│                          numbers / ratios / rankings via text-to-SQL)
 ├── services/
 │   ├── agent_runner.py    ADK Runner + agent_runs audit row
 │   ├── model_router.py    LiteLLM Router singleton (tier → deployment)
@@ -103,6 +120,10 @@ config/
 └── ingestion_sources.yml  (RAG retired; file may be unused)
 alembic/versions/          Migrations — see "Database" below
 docs/INTEGRATION_INTAKE.md Per-tool intake template (one form per integration)
+scripts/
+└── setup_company_aliases.py  Idempotent: creates company_aliases table on the
+                          catalog DB and seeds ~10k algorithmic aliases.
+                          Re-run after each catalog refresh.
 .github/workflows/
 ├── ci.yml                 ruff + alembic + pytest (against pgvector/pg17)
 └── deploy.yml             SSH-to-EC2 → docker compose + alembic upgrade head
@@ -167,9 +188,11 @@ For company catalog + external integrations:
 
 | Var | Purpose |
 |---|---|
-| `CATALOG_DATABASE_URL` (or `POSTGRES_URL`) | Read-only secondary engine → catalog Postgres (`company_industry`). If unset, `/api/v1/companies` returns 503 cleanly. |
+| `CATALOG_DATABASE_URL` (or `POSTGRES_URL`) | Read-only secondary engine → catalog Postgres (`company_industry`, `company_aliases`). If unset, `/api/v1/companies` returns 503 cleanly. |
 | `BMC_URL` | External BMC service base URL (e.g. `http://35.234.221.166:8012`). Proxied by `/api/v1/bmc/*`. |
 | `STOCK_CHAT_URL` | External filings service base URL. Used by the integration registry. |
+| `PRISM_FINANCIALS_URL` | External text-to-SQL financials service base URL (prod `http://35.234.221.166:8000`). **MUST be set explicitly** — the default `http://localhost:8013` is a deliberate placeholder; without this var, `financials_query` cannot reach the upstream. The teammate service runs on the same port number (8000) that PRISM itself binds to, so an unset env var would otherwise silently loop into PRISM and 404. |
+| `PRISM_FINANCIALS_API_KEY` | Optional `X-API-Key` header for the financials service. Empty today (open endpoint); set when the upstream adds auth. |
 
 Optional / firm scope:
 
