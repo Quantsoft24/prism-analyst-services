@@ -142,6 +142,18 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
             retriable=False,
             detail=resp.text,
         )
+    if resp.status_code == 404:
+        # 404 from this service almost always means the base URL is wrong (most
+        # often the env var is unset and the wrapper hit PRISM's own :8000).
+        # There's no useful "alternate tool" — surface the misconfig so it gets
+        # fixed instead of asking the LLM to retry against a different path.
+        return make_error(
+            message="The financials service is unavailable (404 — the URL looks misconfigured).",
+            code="prism_financials_http_404",
+            next_action="ask_user_to_retry_later",
+            retriable=False,
+            detail=f"GET {url} returned 404. Check PRISM_FINANCIALS_URL env var.",
+        )
     if resp.status_code != 200:
         return make_error(
             message=f"The financials service returned HTTP {resp.status_code}.",
