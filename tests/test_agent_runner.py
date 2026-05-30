@@ -23,10 +23,13 @@ from src.schemas.chat import ChartEvent, FinalAnswer
 from src.services.agent_runner import (
     _freshness_source_label,
     _initial_plan_thought,
+    _is_stall_response,
     _split_structured_answer,
     _summarize_tool_response,
     _TokenChunker,
+    _trim_response_for_rescue,
     _try_emit_chart,
+    _validate_structured_freshness,
 )
 
 # ── make_error / is_error / is_retriable ───────────────────────────────────
@@ -139,6 +142,76 @@ class TestSummarizeToolResponse:
         assert (
             _summarize_tool_response({"result": 12.5, "unit": "%"}) == "= 12.5%"
         )
+
+    # ── financials_query shape — explicit branches (added 2026-05-29) ──
+
+    def test_financials_query_rows_summary(self) -> None:
+        resp = {
+            "rows": [{"a": 1}, {"a": 2}, {"a": 3}],
+            "sql": "SELECT ...",
+            "needs_clarification": False,
+            "clarification": None,
+        }
+        assert _summarize_tool_response(resp) == "3 rows"
+
+    def test_financials_query_single_row_singular(self) -> None:
+        resp = {
+            "rows": [{"a": 1}],
+            "sql": "SELECT 1",
+            "needs_clarification": False,
+            "clarification": None,
+        }
+        assert _summarize_tool_response(resp) == "1 row"
+
+    def test_financials_query_auto_disambig_chip(self) -> None:
+        resp = {
+            "rows": [{"a": 1}],
+            "sql": "SELECT 1",
+            "needs_clarification": False,
+            "clarification": None,
+            "auto_disambiguated_to": "Tata Consultancy Services Ltd.",
+        }
+        summary = _summarize_tool_response(resp)
+        assert "1 row" in summary
+        assert "auto-resolved" in summary
+        assert "Tata Consultancy" in summary
+
+    def test_financials_query_needs_clarification_counts_candidates(self) -> None:
+        resp = {
+            "rows": [],
+            "sql": None,
+            "needs_clarification": True,
+            "clarification": (
+                "Which one did you mean?\n"
+                "  1. Reliance Industries Ltd.\n"
+                "  2. Reliance Power Ltd.\n"
+                "  3. Reliance Infrastructure Ltd.\n"
+                "  4. Reliance Communications Ltd.\n"
+            ),
+        }
+        summary = _summarize_tool_response(resp)
+        assert "needs clarification" in summary
+        assert "4 candidates" in summary
+
+    def test_financials_query_not_in_database_refusal(self) -> None:
+        resp = {
+            "rows": [{"note": "NOT IN DATABASE: stock-price time series is not loaded."}],
+            "sql": None,
+            "needs_clarification": False,
+            "clarification": None,
+        }
+        assert _summarize_tool_response(resp) == "no data · NOT IN DATABASE"
+
+    def test_financials_query_empty_no_clarification(self) -> None:
+        # Edge case: tool returned no rows and no clarification — odd but
+        # possible. Should be clearly labelled, not bare "ok · keys".
+        resp = {
+            "rows": [],
+            "sql": "SELECT ...",
+            "needs_clarification": False,
+            "clarification": None,
+        }
+        assert _summarize_tool_response(resp) == "no data"
 
 
 # ── _freshness_source_label ────────────────────────────────────────────────
@@ -615,3 +688,393 @@ class TestTryEmitChart:
             {"period_end": "2025-03-31", "is_listed": False},
         ]
         assert _try_emit_chart("financials_query", "c1", {"rows": rows}) is None
+
+
+# ── _validate_structured_freshness (anti-hallucination guard) ────────────────
+
+
+class TestValidateStructuredFreshness:
+    """Defence-in-depth against Gemini fabricating a `data_freshness` date
+    from training data when no tool actually returned one this turn."""
+
+    @staticmethod
+    def _payload(freshness: str | None) -> FinalAnswer:
+        return FinalAnswer(
+            text="prose",
+            citations=[],
+            confidence="high",
+            data_freshness=freshness,
+        )
+
+    def test_none_structured_returns_none(self) -> None:
+        assert _validate_structured_freshness(None, {"2025-03-31"}) is None
+
+    def test_unset_freshness_preserved(self) -> None:
+        before = self._payload(None)
+        after = _validate_structured_freshness(before, {"2025-03-31"})
+        assert after is before
+        assert after.data_freshness is None
+
+    def test_matching_freshness_preserved(self) -> None:
+        before = self._payload("2025-03-31")
+        after = _validate_structured_freshness(before, {"2025-03-31", "live"})
+        # Same instance + same value — no unnecessary copy on the happy path.
+        assert after is before
+        assert after.data_freshness == "2025-03-31"
+
+    def test_fabricated_freshness_dropped_to_none(self) -> None:
+        # Gemini wrote "2025-05-15" but no tool emitted that — drop it.
+        before = self._payload("2025-05-15")
+        after = _validate_structured_freshness(before, {"2025-03-31"})
+        assert after is not None
+        assert after.data_freshness is None
+        # The rest of the payload must be preserved verbatim.
+        assert after.confidence == "high"
+        assert after.text == "prose"
+
+    def test_fabricated_when_no_tool_emitted_freshness(self) -> None:
+        # Common case: only `list_covered_sectors` ran; observed is empty.
+        before = self._payload("2025-05-15")
+        after = _validate_structured_freshness(before, set())
+        assert after is not None
+        assert after.data_freshness is None
+
+    def test_live_label_preserved_when_tool_emitted_it(self) -> None:
+        # `stock_technicals` emits the literal string "live" — must pass.
+        before = self._payload("live")
+        after = _validate_structured_freshness(before, {"live"})
+        assert after.data_freshness == "live"
+
+
+# ── _trim_response_for_rescue (audit log + rescue prompt sizing) ─────────────
+
+
+class TestTrimResponseForRescue:
+    """Tool responses can be huge (200 rows, multi-page PDF text). We trim
+    them so the audit row + rescue-call context stay bounded."""
+
+    def test_non_dict_passes_through(self) -> None:
+        assert _trim_response_for_rescue("hello") == "hello"
+        assert _trim_response_for_rescue(42) == 42
+        assert _trim_response_for_rescue(None) is None
+
+    def test_short_dict_unchanged(self) -> None:
+        resp = {"rows": [{"x": 1}, {"x": 2}], "sql": "SELECT 1"}
+        out = _trim_response_for_rescue(resp)
+        assert out == resp
+
+    def test_long_list_truncated_with_marker(self) -> None:
+        rows = [{"i": i} for i in range(50)]
+        out = _trim_response_for_rescue({"rows": rows}, max_rows=20)
+        # 20 real rows + 1 marker entry
+        assert len(out["rows"]) == 21
+        assert out["rows"][:20] == rows[:20]
+        assert "+30 more" in str(out["rows"][20])
+
+    def test_long_string_cropped(self) -> None:
+        big = "x" * 5000
+        out = _trim_response_for_rescue({"answer": big}, max_str=2000)
+        assert len(out["answer"]) == 2003  # 2000 + "..."
+        assert out["answer"].endswith("...")
+
+    def test_keys_preserved(self) -> None:
+        resp = {"a": 1, "b": [1, 2, 3], "c": "short"}
+        out = _trim_response_for_rescue(resp)
+        assert set(out.keys()) == {"a", "b", "c"}
+
+
+# ── _rescue_empty_synthesis (Pro single-shot when prose is empty) ────────────
+
+
+class TestRescueEmptySynthesis:
+    """The rescue path fires when the orchestrator skips prose synthesis.
+    These tests cover the deterministic guards (no key, no trace, empty
+    response) — the actual Pro call is mocked at the litellm boundary."""
+
+    @staticmethod
+    async def _run(monkeypatch, trace, **kwargs):
+        # Default-stub the gemini key so the API-key guard doesn't fire
+        # unless the test wants it to. ``gemini_api_keys`` is a computed
+        # property (reads GEMINI_API_KEY / GEMINI_API_KEY_1..4); set the
+        # underlying field directly instead of trying to assign the prop.
+        if "api_keys" in kwargs:
+            keys = kwargs.pop("api_keys")
+        else:
+            keys = ["test-key"]
+        from src.services import agent_runner as ar
+        monkeypatch.setattr(ar.settings, "GEMINI_API_KEY", keys[0] if keys else "")
+        for i, k in enumerate(["GEMINI_API_KEY_1", "GEMINI_API_KEY_2",
+                               "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]):
+            monkeypatch.setattr(ar.settings, k, keys[i + 1] if len(keys) > i + 1 else "")
+        return await ar._rescue_empty_synthesis("the question", trace)
+
+    def test_empty_trace_returns_none(self, monkeypatch) -> None:
+        # No tools ran → nothing to compose from → skip rescue.
+        result = asyncio.run(self._run(monkeypatch, []))
+        assert result is None
+
+    def test_no_api_key_returns_none(self, monkeypatch) -> None:
+        # Can't call Pro without a key — caller falls back to deterministic.
+        result = asyncio.run(self._run(
+            monkeypatch,
+            [{"tool": "financials_query", "args": {}, "response": {"rows": []}}],
+            api_keys=[],
+        ))
+        assert result is None
+
+    def test_trace_without_response_returns_none(self, monkeypatch) -> None:
+        # Tool was called but we never recorded the response (shouldn't
+        # happen in real flow, but defend against it).
+        result = asyncio.run(self._run(
+            monkeypatch,
+            [{"tool": "financials_query", "args": {"q": "x"}}],
+        ))
+        assert result is None
+
+    def test_successful_rescue_returns_pro_text(self, monkeypatch) -> None:
+        # Mock litellm.acompletion to return a canned answer.
+        captured: dict = {}
+
+        async def fake_acompletion(**kwargs):
+            captured.update(kwargs)
+            return _make_litellm_response(
+                "Reliance reported PAT of ₹80,787 cr in FY25 [Reliance | 2025-03-31]."
+            )
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        trace = [{
+            "tool": "financials_query",
+            "args": {"question": "Reliance profit FY25"},
+            "response": {"rows": [{"pat": 80787}]},
+        }]
+        result = asyncio.run(self._run(monkeypatch, trace))
+
+        assert result is not None
+        assert "Reliance" in result
+        assert "80,787" in result
+        # Sanity: Pro model selected, low temp, short prompt.
+        assert captured["model"] == "gemini/gemini-2.5-pro"
+        assert captured["temperature"] == 0.2
+        # The original user question must reach the model.
+        joined = " ".join(m["content"] for m in captured["messages"])
+        assert "the question" in joined
+
+    def test_rescue_strips_accidental_meta_block(self, monkeypatch) -> None:
+        # Pro might still try to emit a meta tail; we strip it so the
+        # prose we splice in is clean.
+        async def fake_acompletion(**kwargs):
+            return _make_litellm_response(
+                "Reliance PAT was ₹80,787 cr.\n<answer_meta>{\"x\":1}</answer_meta>"
+            )
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        result = asyncio.run(self._run(
+            monkeypatch,
+            [{"tool": "financials_query", "args": {}, "response": {"rows": [{}]}}],
+        ))
+        assert result is not None
+        assert "<answer_meta>" not in result
+        assert result.startswith("Reliance PAT")
+
+    def test_rescue_litellm_exception_returns_none(self, monkeypatch) -> None:
+        # Network error / quota / anything — caller falls back cleanly.
+        async def fake_acompletion(**kwargs):
+            raise RuntimeError("upstream down")
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        result = asyncio.run(self._run(
+            monkeypatch,
+            [{"tool": "financials_query", "args": {}, "response": {"rows": [{}]}}],
+        ))
+        assert result is None
+
+    def test_rescue_empty_pro_response_returns_none(self, monkeypatch) -> None:
+        # If Pro itself emits empty text, we don't pretend — fall back.
+        async def fake_acompletion(**kwargs):
+            return _make_litellm_response("")
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        result = asyncio.run(self._run(
+            monkeypatch,
+            [{"tool": "financials_query", "args": {}, "response": {"rows": [{}]}}],
+        ))
+        assert result is None
+
+    def test_rescue_only_uses_last_3_tools(self, monkeypatch) -> None:
+        # Bound the prompt size by keeping at most 3 recent tool entries.
+        captured_messages: list = []
+
+        async def fake_acompletion(**kwargs):
+            captured_messages.extend(kwargs["messages"])
+            return _make_litellm_response("ok")
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        trace = [
+            {"tool": f"tool_{i}", "args": {}, "response": {"r": i}}
+            for i in range(5)
+        ]
+        asyncio.run(self._run(monkeypatch, trace))
+
+        user_msg = next(m["content"] for m in captured_messages if m["role"] == "user")
+        # Only the last 3 tools' names should appear in the user message.
+        assert "tool_2" in user_msg
+        assert "tool_3" in user_msg
+        assert "tool_4" in user_msg
+        assert "tool_0" not in user_msg
+        assert "tool_1" not in user_msg
+
+
+# ── _is_stall_response (catches "I will re-run" type final answers) ─────────
+
+
+class TestIsStallResponse:
+    """Stall detection: prose that promises future tool calls but doesn't
+    actually fire them. The detector must catch real stalls while leaving
+    legitimate analyst answers alone — even ones that happen to mention
+    a partial retry."""
+
+    # ── Empty / no-stall-phrase cases (should NOT trigger) ──────────────
+
+    def test_empty_string_is_not_stall(self) -> None:
+        assert _is_stall_response("") is False
+
+    def test_normal_answer_is_not_stall(self) -> None:
+        prose = (
+            "Reliance Industries reported PAT of ₹80,787 crore in FY25, "
+            "up 12% YoY. Margins held steady at ~9.7%."
+        )
+        assert _is_stall_response(prose) is False
+
+    def test_refusal_is_not_stall(self) -> None:
+        # Refusals don't mention re-running — they're terminal.
+        prose = "PRISM is a research analyst for Indian listed companies — I can't help with that."
+        assert _is_stall_response(prose) is False
+
+    def test_clarification_question_is_not_stall(self) -> None:
+        prose = "Did you mean Reliance Industries (RELIANCE) or Reliance Power (RPOWER)?"
+        assert _is_stall_response(prose) is False
+
+    # ── Pure stall cases (SHOULD trigger) ────────────────────────────────
+
+    def test_will_rerun_is_stall(self) -> None:
+        # The exact failure pattern from production.
+        prose = (
+            "I am still retrieving the data for the comparison. The "
+            "initial query did not return all the necessary information. "
+            "I will re-run the query to gather the 5-year revenue CAGR "
+            "and the net profit margin for FY25 for TCS, Infosys, Wipro, "
+            "and HCLTech."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_let_me_try_again_is_stall(self) -> None:
+        prose = "The tool returned an unexpected shape. Let me try again with a clearer query."
+        assert _is_stall_response(prose) is True
+
+    def test_still_investigating_is_stall(self) -> None:
+        prose = "Still investigating the financial details — one moment."
+        assert _is_stall_response(prose) is True
+
+    def test_let_me_gather_more_is_stall(self) -> None:
+        prose = "I have partial data. Let me gather more from the filings."
+        assert _is_stall_response(prose) is True
+
+    # ── False-positive guard (substantive content overrides stall phrases) ─
+
+    def test_stall_phrase_with_real_numbers_is_not_stall(self) -> None:
+        # A real answer that ALSO mentions a retry → stays as-is.
+        prose = (
+            "I had to re-run the query once. TCS reported ₹2.46L crore "
+            "in revenue for FY25 with a 24.6% EBIT margin."
+        )
+        assert _is_stall_response(prose) is False
+
+    def test_stall_phrase_with_rupee_is_not_stall(self) -> None:
+        prose = "Initial query did not return all rows, but the partial result shows ₹80,787 cr PAT."
+        assert _is_stall_response(prose) is False
+
+    def test_stall_phrase_with_fy_label_is_not_stall(self) -> None:
+        prose = "Let me try again with FY24 included; FY25 already showed 12% growth."
+        assert _is_stall_response(prose) is False
+
+    def test_stall_phrase_with_percent_is_not_stall(self) -> None:
+        prose = "I'll re-run for FY26, but FY25 net margin was 24.6%."
+        assert _is_stall_response(prose) is False
+
+    def test_stall_phrase_with_crore_unit_is_not_stall(self) -> None:
+        prose = "Let me gather more data; TCS revenue was 2.46 lakh crore in FY25."
+        assert _is_stall_response(prose) is False
+
+    # ── "Give up" family (added 2026-05-29 from production wire log) ──
+
+    def test_i_do_not_have_access_is_stall(self) -> None:
+        # The exact failure pattern from the wire log:
+        prose = (
+            "I do not have access to comparative 5-year CAGR metrics or "
+            "FY25 full-year financials for all requested companies."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_i_am_unable_to_provide_is_stall(self) -> None:
+        prose = (
+            "I am unable to provide a complete side-by-side growth and "
+            "margin analysis at this time."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_currently_not_available_is_stall(self) -> None:
+        prose = (
+            "Comparative metrics for the requested peer set are currently "
+            "not available through the available financial query tools."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_could_not_be_fulfilled_is_stall(self) -> None:
+        prose = (
+            "The current request for comparative metrics could not be "
+            "fulfilled as the automated query did not return a complete "
+            "dataset."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_my_current_database_does_not_is_stall(self) -> None:
+        prose = (
+            "While some historical data is available, my current database "
+            "does not support a comprehensive multi-company cross-comparison."
+        )
+        assert _is_stall_response(prose) is True
+
+    def test_give_up_phrase_with_real_numbers_is_not_stall(self) -> None:
+        # If the model gave a partial-but-substantive answer, leave it alone.
+        prose = (
+            "TCS posted a net profit margin of 18.76% in FY24. I do not "
+            "have access to FY25 figures for the full peer set."
+        )
+        assert _is_stall_response(prose) is False
+
+
+def _make_litellm_response(content: str):
+    """Tiny shim to construct the shape litellm.acompletion returns."""
+    class _Msg:
+        def __init__(self, c: str) -> None:
+            self.content = c
+
+    class _Choice:
+        def __init__(self, c: str) -> None:
+            self.message = _Msg(c)
+
+    class _Resp:
+        def __init__(self, c: str) -> None:
+            self.choices = [_Choice(c)]
+
+    return _Resp(content)

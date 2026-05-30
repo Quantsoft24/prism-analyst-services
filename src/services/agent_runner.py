@@ -242,6 +242,28 @@ class AgentRunner:
         pending_calls: dict[str, tuple[str, float]] = {}  # call_id -> (tool_name, start_ts)
         final_text_parts: list[str] = []
         final_seen = False
+        # All `data_freshness` values surfaced by tools THIS turn. Used as
+        # the allow-list when validating the agent's structured
+        # ``data_freshness`` claim — see ``_validate_structured_freshness``.
+        # Gemini occasionally fabricates freshness dates from training data;
+        # this is the defence-in-depth that drops them silently before they
+        # ever reach the UI's "as of …" chip.
+        observed_freshness: set[str] = set()
+        # Identical-call circuit breaker. Wire-log analysis showed Gemini
+        # Flash occasionally fires the SAME (tool, args) call 3+ times in a
+        # row when the tool keeps returning data the model finds inadequate.
+        # ADK's iteration cap doesn't catch this — those are legitimately
+        # different iterations as far as ADK is concerned. We bail at 3
+        # consecutive identical signatures to prevent the 6-tool-card wall.
+        _last_call_sig: str | None = None
+        _identical_run: int = 0
+        _IDENTICAL_RUN_LIMIT = 3
+        _circuit_broken = False
+        # Token de-duplication. Some ADK / Gemini configurations re-emit the
+        # same text part across consecutive events (observed in production
+        # as 3x repeated chunks during streaming). We dedupe at the runner
+        # so the UI never sees the typing animation flicker on duplicates.
+        _last_text_emitted: str | None = None
 
         # IMPORTANT: do not ``break`` out of the runner loop on final_response.
         # ADK uses OpenTelemetry contextvars internally; closing the inner
@@ -280,6 +302,40 @@ class AgentRunner:
                     call_id = getattr(fn_call, "id", None) or f"call_{uuid.uuid4().hex[:8]}"
                     tool_name = getattr(fn_call, "name", "unknown")
                     args = dict(getattr(fn_call, "args", {}) or {})
+                    # Circuit-breaker for repeated-same-call loops. Compute a
+                    # stable signature on tool + sorted args. Same signature
+                    # 3 times in a row → break: emit an error, stop iterating.
+                    try:
+                        sig = f"{tool_name}::{json.dumps(args, sort_keys=True, default=str)}"
+                    except (TypeError, ValueError):
+                        sig = f"{tool_name}::<unserialisable>"
+                    if sig == _last_call_sig:
+                        _identical_run += 1
+                    else:
+                        _identical_run = 1
+                        _last_call_sig = sig
+                    if _identical_run >= _IDENTICAL_RUN_LIMIT:
+                        logger.warning(
+                            "Agent run %s hit identical-call circuit breaker: "
+                            "tool=%r fired %d times in a row with the same args. "
+                            "Stopping the loop.",
+                            self._agent_run_id, tool_name, _identical_run,
+                        )
+                        yield ErrorEvent(
+                            code="identical_call_loop",
+                            message=(
+                                f"The agent called `{tool_name}` with the same "
+                                f"arguments {_identical_run} times in a row without "
+                                "making progress. Stopping to avoid wasting your "
+                                "tokens. Try rephrasing the question with more "
+                                "specifics (a single ticker, an explicit fiscal "
+                                "period, or a different metric)."
+                            ),
+                            retriable=True,
+                            agent_run_id=self._agent_run_id,
+                        )
+                        _circuit_broken = True
+                        break  # exit the parts loop
                     pending_calls[call_id] = (tool_name, time.perf_counter())
                     self._tool_trace.append({"tool": tool_name, "args": args, "call_id": call_id})
                     yield ToolCallEvent(tool=tool_name, args=args, call_id=call_id)
@@ -330,6 +386,15 @@ class AgentRunner:
                             )
 
                     summary = _summarize_tool_response(response)
+                    # Attach a trimmed copy of the response to the matching
+                    # tool_trace entry. The rescue path
+                    # (_rescue_empty_synthesis) needs the actual returned
+                    # data — not just the name/args — to compose a prose
+                    # answer when the orchestrator skips synthesis.
+                    for entry in self._tool_trace:
+                        if entry.get("call_id") == call_id:
+                            entry["response"] = _trim_response_for_rescue(response)
+                            break
                     yield ToolResultEvent(
                         call_id=call_id,
                         tool=tool_name,
@@ -344,10 +409,12 @@ class AgentRunner:
                     if isinstance(response, dict):
                         freshness = response.get("data_freshness")
                         if freshness:
+                            as_of_str = str(freshness)
+                            observed_freshness.add(as_of_str)
                             yield DataFreshnessEvent(
                                 call_id=call_id,
                                 source=_freshness_source_label(tool_name),
-                                as_of=str(freshness),
+                                as_of=as_of_str,
                             )
                     # Auto-chart from time-series rows when the tool emits
                     # a recognizable shape (financials_query with period_end +
@@ -366,6 +433,19 @@ class AgentRunner:
                     if bool(getattr(part, "thought", False)):
                         yield AgentThoughtEvent(text=text, kind="reflect")
                         continue
+                    # Token dedup: production wire logs showed ADK / Gemini
+                    # occasionally re-emit byte-identical text parts across
+                    # consecutive events (observed as 3x duplicate streaming
+                    # chunks). Drop exact duplicates — the final answer is
+                    # built from the SAME source so it stays clean.
+                    if text == _last_text_emitted:
+                        logger.debug(
+                            "Agent run %s: skipping duplicate text part "
+                            "(%d chars).",
+                            self._agent_run_id, len(text),
+                        )
+                        continue
+                    _last_text_emitted = text
                     final_text_parts.append(text)
                     # Re-chunk large text parts so the UI sees a smooth typing
                     # cadence instead of a single 500+ char drop. ADK's Gemini
@@ -375,6 +455,13 @@ class AgentRunner:
                     # propagates through `asyncio.sleep` cleanly.
                     async for chunk in _TokenChunker.stream(text):
                         yield TokenEvent(text=chunk)
+
+            # Circuit-breaker fired inside the parts loop — stop iterating
+            # ADK events entirely. Without this break we'd keep streaming
+            # downstream events from the same broken turn.
+            if _circuit_broken:
+                final_seen = True
+                break
 
             # ── Detect end-of-turn ──
             check = getattr(event, "is_final_response", None)
@@ -388,6 +475,32 @@ class AgentRunner:
         # Compute cost + write final audit row.
         raw_final = "".join(final_text_parts).strip()
         prose, structured = _split_structured_answer(raw_final)
+
+        # Defence-in-depth: silently drop a fabricated `data_freshness`
+        # from the structured payload. Gemini sometimes writes a date
+        # from training data into the meta block even when no tool
+        # returned one this turn. Without this guard the UI shows a
+        # misleading "as of <date>" chip that doesn't trace back to any
+        # real source. See the prompt's <answer_meta> rules — this is
+        # the runtime check that backs the rule.
+        structured = _validate_structured_freshness(structured, observed_freshness)
+
+        # Stall detection: the model wrote prose like "I will re-run the
+        # query..." but the turn already ended without firing another
+        # tool. ADK accepted the narration as the final answer; the user
+        # sees a useless stall message. We treat this the same as empty
+        # prose — blank `prose` so the rescue path below fires. The
+        # detector is conservative (substantive-content guard) to avoid
+        # false-positives on real answers that mention a retry. See
+        # `_is_stall_response` for the exact logic.
+        if prose and _is_stall_response(prose):
+            logger.warning(
+                "Agent run %s emitted stall prose (%d chars, no "
+                "substantive content); routing to synthesis rescue.",
+                self._agent_run_id,
+                len(prose),
+            )
+            prose = ""  # zero out so the empty-prose rescue path runs
 
         # Safety net for the "empty prose" failure mode. Gemini sometimes
         # terminates a turn after a tool call without writing the prose answer
@@ -427,14 +540,42 @@ class AgentRunner:
                     self._agent_run_id,
                 )
             if not prose:
-                prose = _synthesize_empty_answer_fallback(self._tool_trace)
-                structured = None  # nothing structured to preserve
-                logger.warning(
-                    "Agent run %s terminated with empty answer; %d tools "
-                    "called. Surfacing generic fallback message.",
-                    self._agent_run_id,
-                    len(self._tool_trace),
+                # Industry-grade rescue: when the orchestrator (Flash)
+                # ran tools but skipped synthesis, ask a higher-tier
+                # model (Pro) to compose the answer in a single targeted
+                # call. The retry is single-shot (no tools, no agent
+                # loop) so it can't hit the same multi-turn failure
+                # mode. ~1-2s latency on failure turns only; zero impact
+                # on the happy path. Matches the Claude / Cursor / Devin
+                # pattern for synthesis rescue.
+                rescued = await _rescue_empty_synthesis(
+                    user_message=user_message,
+                    tool_trace=self._tool_trace,
                 )
+                if rescued:
+                    prose = rescued
+                    # Sync the prose into structured.text so the Report
+                    # tab + chat thread render the same content.
+                    if structured is not None:
+                        structured = structured.model_copy(update={"text": prose})
+                    logger.warning(
+                        "Agent run %s rescued synthesis via single-shot "
+                        "Pro retry after orchestrator skipped prose.",
+                        self._agent_run_id,
+                    )
+                else:
+                    # Last-resort deterministic message. The rescue path
+                    # already covers every realistic failure (network,
+                    # empty Pro response, exception); this is here to
+                    # guarantee the user always sees SOMETHING.
+                    prose = _synthesize_empty_answer_fallback(self._tool_trace)
+                    structured = None
+                    logger.warning(
+                        "Agent run %s: rescue returned empty too; "
+                        "surfacing generic fallback. %d tools called.",
+                        self._agent_run_id,
+                        len(self._tool_trace),
+                    )
 
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
@@ -540,11 +681,57 @@ def _summarize_tool_response(response: dict[str, Any]) -> str:
     """Squash a tool response dict into a short human-readable summary line.
 
     Never inspects the error path — the runner branches on ``is_error()``
-    before calling this. Designed for the UI tool-call card: 80 chars max,
+    before calling this. Designed for the UI tool-call card: ~80 chars,
     no trailing punctuation, no markdown.
     """
     if not isinstance(response, dict):
         return str(response)[:120]
+
+    # ── financials_query shapes — check FIRST so they don't fall through to
+    # the generic "ok · keys" path. The financials envelope always carries
+    # rows + sql + needs_clarification + clarification, so the bare-key
+    # fallback below would render an unreadable "ok · rows, sql, needs_…"
+    # for every call. Explicit branches:
+    if (
+        "rows" in response and "sql" in response
+        and "needs_clarification" in response
+    ):
+        rows = response.get("rows") or []
+        clarif = response.get("needs_clarification")
+        # NOT IN DATABASE refusal — the upstream returns a one-row stub.
+        if (
+            isinstance(rows, list) and len(rows) == 1
+            and isinstance(rows[0], dict)
+            and isinstance(rows[0].get("note"), str)
+            and rows[0]["note"].startswith("NOT IN DATABASE")
+        ):
+            return "no data · NOT IN DATABASE"
+        # Clarification gate fired (and the wrapper's auto-disambig couldn't
+        # resolve, so the user has to pick).
+        if clarif:
+            # Count candidates in the clarification text — gives the UI a
+            # quick sense of how much ambiguity there is.
+            text = response.get("clarification") or ""
+            n_candidates = sum(
+                1 for line in text.splitlines()
+                if line.strip().startswith(("1.", "2.", "3.", "4.", "5.",
+                                            "1)", "2)", "3)", "4)", "5)"))
+            )
+            n_label = f"{n_candidates} candidates" if n_candidates else "ambiguous"
+            return f"needs clarification · {n_label}"
+        # Happy path — non-empty rows.
+        if rows:
+            n = len(rows)
+            chip = ""
+            picked = response.get("auto_disambiguated_to")
+            if picked:
+                # Trim to keep the chip readable in the tool card.
+                picked_short = (picked[:24] + "…") if len(picked) > 25 else picked
+                chip = f" · auto-resolved: {picked_short}"
+            return f"{n} row{'s' if n != 1 else ''}{chip}"
+        # Empty rows, no clarification, no NOT IN DATABASE — odd but possible.
+        return "no data"
+
     # Company list / filings list / generic items array
     if "items" in response and isinstance(response["items"], list):
         n = len(response["items"])
@@ -724,6 +911,245 @@ def _split_structured_answer(raw: str) -> tuple[str, FinalAnswer | None]:
         logger.debug("answer_meta validation failed after coercion: %s", exc)
         return prose, None
     return prose, structured
+
+
+# Stall phrases — fragments that signal the model wrote prose PROMISING
+# another tool call instead of answering. Matched case-insensitively as
+# substrings. Curated to be unambiguous: each phrase only legitimately
+# appears in mid-process narration, not in a real analyst answer.
+_STALL_PHRASES: tuple[str, ...] = (
+    # "I will re-run" family — model promises a tool call it never fires
+    "i will re-run", "i'll re-run", "let me re-run",
+    "i will re-query", "let me re-query",
+    "i am still retrieving", "i'm still retrieving", "still retrieving",
+    "still investigating", "still gathering",
+    "i will try again", "let me try again", "i'll try again",
+    "initial query did not return all",
+    "initial query didn't return all",
+    "did not return all the necessary",
+    "didn't return all the necessary",
+    "let me gather more", "i will gather more",
+    "i'll check again", "let me check again",
+    "i need to re-query", "i need to retry",
+    # "Give up" family — model writes a long refusal despite having data
+    # (added 2026-05-29 after the wire log showed this failure shape on
+    # "Compare TCS, Infosys, Wipro, HCLTech…": tool returned data, model
+    # composed a "I do not have access to comparative metrics" refusal).
+    "i do not have access to",
+    "i don't have access to",
+    "i am unable to provide",
+    "i'm unable to provide",
+    "currently not available",
+    "could not be fulfilled",
+    "my current database does not",
+    "the available data does not support",
+    "the available financial query tools",
+    "is not available through the available",
+)
+
+# Regex patterns that indicate substantive financial content in prose.
+# Used as the false-positive guard for _is_stall_response — if prose
+# carries actual VALUES (numbers with thousands-separators, percentages,
+# currency symbols, unit words like "crore"), we trust it even if it
+# also mentions a retry ("we tried twice; here's TCS at ₹2.46L cr...").
+#
+# Critical: FY labels (FY25, FY24) alone are NOT substantive. A stall
+# like "I will fetch revenue for FY25" mentions FY25 but delivers no
+# value — so FY-only matches must not exempt prose from being a stall.
+_SUBSTANTIVE_NUMBER_RE = re.compile(
+    r"\d{1,3}(?:[,.]\d{3})+|\d+\.?\d*\s*%",  # 80,787  or  24.6%
+    re.IGNORECASE,
+)
+_SUBSTANTIVE_UNITS = (
+    "₹", "$ ", "crore", "lakh", "billion", "million", " bps", "ebitda",
+)
+
+
+def _is_stall_response(prose: str) -> bool:
+    """True when the model wrote text that promises a future tool call
+    but never fires one — the "I will re-run the query" failure mode.
+
+    Two conditions must hold:
+      1. At least one ``_STALL_PHRASES`` fragment is present.
+      2. The prose has NO substantive VALUE content — no ₹/$/% symbol,
+         no big formatted number (80,787), no unit word (crore / lakh).
+         FY labels alone (FY25) are NOT enough; they often appear inside
+         stall phrases ("I will fetch ... for FY25").
+    Both → it's pure stalling. Either alone → leave the prose intact.
+
+    This is the runner-side guard that pairs with the prompt-level
+    "NO STALLING" rule in `agents/company_intel.py`. Gemini Flash
+    occasionally writes a stalling final answer despite the rule; the
+    runner detects it and triggers the same Pro-rescue path that
+    handles empty prose.
+    """
+    if not prose:
+        return False
+    lower = prose.lower()
+    if not any(phrase in lower for phrase in _STALL_PHRASES):
+        return False
+    if any(unit in lower for unit in _SUBSTANTIVE_UNITS):
+        return False
+    if _SUBSTANTIVE_NUMBER_RE.search(prose):
+        return False
+    return True
+
+
+def _trim_response_for_rescue(response: Any, max_rows: int = 20, max_str: int = 2000) -> Any:
+    """Trim a tool response to a size suitable for (a) the audit log and
+    (b) the synthesis-rescue context window.
+
+    Tool responses can be large — financials_query can return 200 rows,
+    stock_filings_read returns multi-page PDF excerpts. Storing those raw
+    on every tool_trace entry blows up the audit row and the rescue
+    prompt. We keep the shape but bound the size:
+      * lists longer than ``max_rows`` → first ``max_rows`` + a marker
+      * strings longer than ``max_str`` → cropped + ellipsis
+      * non-dict responses pass through unchanged
+    """
+    if not isinstance(response, dict):
+        return response
+    out: dict = {}
+    for k, v in response.items():
+        if isinstance(v, list) and len(v) > max_rows:
+            out[k] = list(v[:max_rows]) + [f"... (+{len(v) - max_rows} more)"]
+        elif isinstance(v, str) and len(v) > max_str:
+            out[k] = v[:max_str] + "..."
+        else:
+            out[k] = v
+    return out
+
+
+# System prompt for the synthesis-rescue single-shot call. Deliberately
+# narrow: write the answer, cite inline, no tool calls, no meta block.
+_RESCUE_SYSTEM_PROMPT = """You are a senior research analyst's writing assistant. \
+The research agent ran tools successfully but failed to compose a written \
+answer for the user. Your job is to write that answer using ONLY the tool \
+data provided below — do not invent numbers, dates, or companies. Use the \
+inline citation format [Source | period] sparingly. Write 2-4 sentences of \
+prose; include 2-4 supporting bullets if the data warrants them. Do NOT \
+call any tools, do NOT write a <answer_meta> block, do NOT apologise for \
+the agent's earlier silence. Prose only."""
+
+
+async def _rescue_empty_synthesis(
+    user_message: str,
+    tool_trace: list[dict[str, Any]],
+) -> str | None:
+    """Single-shot Pro call that composes prose when the orchestrator skips it.
+
+    Returns the rescued prose, or ``None`` on any failure (no API key,
+    network/timeout, empty response, exception). Caller falls back to the
+    deterministic message on ``None``.
+
+    Why a separate call instead of just looping back through the agent:
+      * Single-shot has NO tools attached → can't hit the same "model
+        decides to call another tool and skips synthesis" failure mode.
+      * Pro (not Flash) is far more reliable about following an explicit
+        "write the answer" directive — Flash is exactly what failed.
+      * No agent loop overhead; ~1-2s vs 5-10s for a full agent re-run.
+
+    Triggered only on the empty-prose path so steady-state cost is zero.
+    On failures (~5-10% of turns in early measurement) it adds one Pro
+    call (~$0.001) and ~1-2s of latency, in exchange for a real answer
+    instead of the generic "I ran N tool(s)…" message.
+    """
+    if not tool_trace:
+        return None
+
+    # Pick the first non-empty Gemini key — we share the same pool as the
+    # main router. If no key is set we can't rescue; caller falls back.
+    api_key = next((k for k in settings.gemini_api_keys if k), None)
+    if not api_key:
+        logger.warning("Rescue skipped: no GEMINI_API_KEY available.")
+        return None
+
+    # Build a compact summary of the tools and their (already-trimmed)
+    # responses. Last 3 tools max to keep the prompt lean.
+    parts: list[str] = []
+    for entry in tool_trace[-3:]:
+        tool = entry.get("tool", "?")
+        args = entry.get("args", {})
+        response = entry.get("response")
+        if response is None:
+            continue
+        try:
+            response_str = json.dumps(response, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            response_str = repr(response)
+        # Defensive: even after _trim_response_for_rescue, cap one final time.
+        if len(response_str) > 2500:
+            response_str = response_str[:2500] + "..."
+        parts.append(f"{tool}(args={args}) →\n{response_str}")
+
+    if not parts:
+        return None
+
+    user_prompt = (
+        f"ORIGINAL USER QUESTION:\n{user_message}\n\n"
+        "TOOL CALLS AND RESPONSES (most recent last):\n\n"
+        + "\n\n---\n\n".join(parts)
+        + "\n\nNow write the analyst's answer using the data above."
+    )
+
+    try:
+        # Lazy import — keeps module load fast on the happy path.
+        import litellm
+
+        resp = await litellm.acompletion(
+            model="gemini/gemini-2.5-pro",
+            api_key=api_key,
+            messages=[
+                {"role": "system", "content": _RESCUE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=600,
+            temperature=0.2,  # low temp — composing from given data, not creating
+            timeout=20,
+        )
+        text_obj = resp.choices[0].message.content if resp.choices else None
+        text = (text_obj or "").strip()
+        # Strip any accidental <answer_meta> tail Pro might still emit.
+        meta_at = text.find("<answer_meta>")
+        if meta_at >= 0:
+            text = text[:meta_at].rstrip()
+        return text or None
+    except Exception as exc:  # noqa: BLE001 — any failure → fall back
+        logger.warning("Synthesis rescue failed (%s): %s", type(exc).__name__, exc)
+        return None
+
+
+def _validate_structured_freshness(
+    structured: FinalAnswer | None, observed: set[str],
+) -> FinalAnswer | None:
+    """Drop ``data_freshness`` from a structured payload when it doesn't
+    trace back to a date the runner actually saw a tool emit this turn.
+
+    Why this exists: Gemini sometimes writes a plausible-looking date
+    (typically last quarter or "today") into ``<answer_meta>.data_freshness``
+    even when the question didn't invoke any date-returning tool. The
+    UI faithfully renders that as an "as of <date>" chip, which misleads
+    analysts into believing data exists where none does. The prompt tells
+    the model not to do this; this validator is the runtime guarantee.
+
+    Validation is conservative: we only drop on a *positive mismatch* —
+    the model wrote a string, and that exact string isn't in the observed
+    set. ``observed`` is the set of `data_freshness` values surfaced by
+    tools this turn (financials_query rows' `period_end`, stock_filings_*'s
+    latest `announcement_dt`, technicals' literal "live"). Empty/None
+    `data_freshness` is left alone (the model correctly omitted it).
+    """
+    if structured is None or not structured.data_freshness:
+        return structured
+    if structured.data_freshness in observed:
+        return structured
+    logger.warning(
+        "Dropping fabricated data_freshness %r from structured payload "
+        "(no tool emitted that date; observed=%s)",
+        structured.data_freshness,
+        sorted(observed),
+    )
+    return structured.model_copy(update={"data_freshness": None})
 
 
 def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:

@@ -71,7 +71,7 @@ def test_shipped_registry_is_valid():
     """config/integrations.yml must always parse — guards a malformed PR edit."""
     specs = load_specs("config/integrations.yml")
     names = {s.name for s in specs}
-    assert {"stock-chat", "bmc", "prism-financials"}.issubset(names)
+    assert {"stock-chat", "bmc", "prism-financials", "prism-news"}.issubset(names)
     for s in specs:
         assert isinstance(s, IntegrationSpec)
 
@@ -132,6 +132,24 @@ def test_registry_builds_prism_financials_tool():
     assert health[0]["tool_count"] == 1
     tool_names = {getattr(t, "name", None) for t in reg.tools()}
     assert tool_names == {"financials_query"}
+
+
+def test_registry_builds_prism_news_tools():
+    """The prism-news integration exposes 4 typed tools (news_sentiment,
+    news_trending, news_search, news_compare)."""
+    spec = IntegrationSpec(
+        name="prism-news", source="python",
+        config={"entrypoint": "src.integrations.tools.prism_news:PRISM_NEWS_TOOLS"},
+    )
+    reg = IntegrationRegistry([spec])
+    asyncio.run(reg.build())
+
+    health = reg.health()
+    assert health[0]["status"] == "ok"
+    assert health[0]["tool_count"] == 4
+    tool_names = {getattr(t, "name", None) for t in reg.tools()}
+    expected = {"news_sentiment", "news_trending", "news_search", "news_compare"}
+    assert expected == tool_names
 
 
 def test_registry_disabled_spec_skipped():
