@@ -140,18 +140,36 @@ def test_answer_mode_override_is_forwarded(monkeypatch) -> None:
 
 
 def test_clarification_passthrough_is_not_error(monkeypatch) -> None:
-    resp = _FakeResp(200, {
+    # When the upstream returns ``needs_clarification: true``, the wrapper
+    # now auto-disambiguates by re-calling with the top candidate. This
+    # test exercises the case where BOTH calls return clarification (e.g.
+    # the question has multi-entity ambiguity that one retry can't
+    # resolve). The wrapper should preserve the ORIGINAL clarification
+    # so the agent has the most informative context to forward to the user.
+    first = _FakeResp(200, {
         "rows": [],
         "sql": None,
         "needs_clarification": True,
         "clarification": "Which Reliance did you mean?\n  1. Industries\n  2. Power",
         "error": None,
     })
-    result, _ = _invoke(monkeypatch, [resp])
+    second = _FakeResp(200, {
+        "rows": [],
+        "sql": None,
+        "needs_clarification": True,
+        "clarification": "And which Wipro?\n  1. Wipro Limited\n  2. Wipro Enterprises",
+        "error": None,
+    })
+    result, calls = _invoke(monkeypatch, [first, second])
 
     assert is_error(result) is False  # error stays null → not a failure
     assert result["needs_clarification"] is True
+    # Original clarification preserved (retry couldn't resolve → keep first).
     assert "Which Reliance" in result["clarification"]
+    # Exactly 2 calls — wrapper does not loop further.
+    assert len(calls) == 2
+    # No auto_disambiguated_to chip because the retry didn't succeed.
+    assert "auto_disambiguated_to" not in result
 
 
 # ── Shape 3: NOT IN DATABASE refusal (deliberate, not an error) ─────────────
@@ -261,3 +279,181 @@ def test_no_auth_header_when_key_unset(monkeypatch) -> None:
         monkeypatch, [_FakeResp(200, {"rows": [], "error": None})], api_key="",
     )
     assert calls[0]["headers"] == {}
+
+
+# ── _extract_top_candidate (clarification parser) ────────────────────────────
+
+
+class TestExtractTopCandidate:
+    """Parser must reliably pull the #1-ranked candidate from the upstream's
+    clarification text. Failure modes degrade safely to ``None`` so the
+    wrapper skips the auto-retry rather than picking garbage."""
+
+    def test_canonical_format_returns_top_name(self) -> None:
+        text = (
+            "Your question mentions a company that could mean several things. Which one did you mean?\n\n"
+            "  1. Tata Consultancy Services Ltd. (NSE: TCS, prowess_id=11536)\n"
+            "  2. TCS Education Society (no NSE listing, prowess_id=98765)\n"
+            "  3. Tata Consultancy Cyber Security Ltd. (BSE: 543210)\n"
+        )
+        assert pf._extract_top_candidate(text) == "Tata Consultancy Services Ltd."
+
+    def test_paren_variant_picks_correct_name(self) -> None:
+        text = "  1) Reliance Industries Ltd. (NSE: RELIANCE, prowess_id=500325)\n  2) Reliance Power Ltd. (...)\n"
+        assert pf._extract_top_candidate(text) == "Reliance Industries Ltd."
+
+    def test_bare_format_without_parenthetical_still_parsed(self) -> None:
+        text = "  1. Wipro Limited\n  2. Wipro Enterprises Ltd\n"
+        assert pf._extract_top_candidate(text) == "Wipro Limited"
+
+    def test_empty_string_returns_none(self) -> None:
+        assert pf._extract_top_candidate("") is None
+
+    def test_no_numbered_list_returns_none(self) -> None:
+        text = "There are multiple possible matches but I'm not listing them."
+        assert pf._extract_top_candidate(text) is None
+
+    def test_non_string_input_returns_none(self) -> None:
+        # Defensive — clarification field could in theory be null/missing.
+        assert pf._extract_top_candidate(None) is None  # type: ignore[arg-type]
+        assert pf._extract_top_candidate(123) is None  # type: ignore[arg-type]
+
+    def test_very_short_match_rejected(self) -> None:
+        # Defensive: a malformed clarification like "1. ok" shouldn't pick.
+        text = "  1. ok (some details)\n"
+        assert pf._extract_top_candidate(text) is None
+
+
+# ── Auto-disambiguation (the integration of wrapper + retry) ─────────────────
+
+
+class TestAutoDisambiguation:
+    """The wrapper's primary defence against the financials_query ambiguity
+    gate. When the first call returns ``needs_clarification: true`` and the
+    parser can extract a top candidate, the wrapper silently re-calls with
+    the candidate prepended. The retry's response replaces the first if it
+    resolved successfully; otherwise the original clarification surfaces."""
+
+    def test_clarification_triggers_silent_retry_with_top_candidate(self, monkeypatch) -> None:
+        # First call → clarification about TCS. Second call → real rows.
+        first = _FakeResp(200, {
+            "rows": [],
+            "sql": None,
+            "needs_clarification": True,
+            "clarification": "  1. Tata Consultancy Services Ltd. (NSE: TCS)\n  2. TCS Education\n",
+            "error": None,
+        })
+        second = _FakeResp(200, {
+            "rows": [{"company_name": "Tata Consultancy Services Ltd.",
+                      "period_end": "2025-03-31", "revenue": 246060.0}],
+            "sql": "SELECT ...",
+            "needs_clarification": False,
+            "error": None,
+        })
+        result, calls = _invoke(monkeypatch, [first, second], question="TCS revenue FY25")
+
+        # Two upstream calls; the second has the top candidate prepended.
+        assert len(calls) == 2
+        assert "Tata Consultancy Services Ltd." in calls[1]["json"]["question"]
+        # The wrapper returns the SECOND response — rows are present.
+        assert result["needs_clarification"] is False
+        assert len(result["rows"]) == 1
+        # Auto-disambig field tells the agent what we picked.
+        assert result["auto_disambiguated_to"] == "Tata Consultancy Services Ltd."
+
+    def test_unparseable_clarification_does_not_retry(self, monkeypatch) -> None:
+        # Parser returns None → wrapper skips the retry and surfaces the
+        # original clarification cleanly (the agent then forwards it).
+        resp = _FakeResp(200, {
+            "rows": [],
+            "sql": None,
+            "needs_clarification": True,
+            "clarification": "I have multiple matches but didn't list them.",
+            "error": None,
+        })
+        result, calls = _invoke(monkeypatch, [resp])
+
+        # Only ONE upstream call — no retry attempted.
+        assert len(calls) == 1
+        assert result["needs_clarification"] is True
+        assert "auto_disambiguated_to" not in result
+
+    def test_retry_still_ambiguous_returns_original_clarification(self, monkeypatch) -> None:
+        # Multi-entity ambiguity: retry picks TCS but tool now needs to
+        # clarify Wipro. Cap at 1 retry → wrapper surfaces the retry's
+        # clarification (or the original — either path tells the agent
+        # to forward to the user). We assert the wrapper didn't fire a
+        # THIRD call.
+        first = _FakeResp(200, {
+            "rows": [],
+            "sql": None,
+            "needs_clarification": True,
+            "clarification": "  1. Tata Consultancy Services Ltd. (NSE: TCS)\n",
+            "error": None,
+        })
+        second = _FakeResp(200, {
+            "rows": [],
+            "sql": None,
+            "needs_clarification": True,
+            "clarification": "  1. Wipro Limited (NSE: WIPRO)\n",
+            "error": None,
+        })
+        result, calls = _invoke(monkeypatch, [first, second])
+
+        # Exactly TWO upstream calls — no third. The wrapper doesn't loop.
+        assert len(calls) == 2
+        # Result preserves the first (original) clarification so the agent
+        # has the most informative context to forward.
+        assert result["needs_clarification"] is True
+        assert "auto_disambiguated_to" not in result
+
+    def test_retry_returning_rows_replaces_first_response(self, monkeypatch) -> None:
+        # Even if the retry returns `needs_clarification: false` AND rows,
+        # we use it. Confirmed by checking the rows are from the second call.
+        first = _FakeResp(200, {
+            "rows": [],
+            "needs_clarification": True,
+            "clarification": "  1. Infosys Ltd. (NSE: INFY)\n",
+            "error": None,
+        })
+        second = _FakeResp(200, {
+            "rows": [{"company_name": "Infosys Ltd.", "period_end": "2025-03-31",
+                      "net_profit_margin_pct": 16.48}],
+            "needs_clarification": False,
+            "error": None,
+        })
+        result, _ = _invoke(monkeypatch, [first, second])
+
+        assert result["rows"][0]["net_profit_margin_pct"] == 16.48
+        assert result["auto_disambiguated_to"] == "Infosys Ltd."
+
+    def test_retry_failure_falls_back_to_original(self, monkeypatch) -> None:
+        # If the retry HTTP call errors (5xx), wrapper keeps the original
+        # clarification — doesn't propagate the retry error.
+        first = _FakeResp(200, {
+            "rows": [],
+            "needs_clarification": True,
+            "clarification": "  1. Tata Consultancy Services Ltd. (NSE: TCS)\n",
+            "error": None,
+        })
+        second = _FakeResp(503, text="upstream down on retry")
+        result, calls = _invoke(monkeypatch, [first, second])
+
+        # Two attempts; original clarification surfaces.
+        assert len(calls) == 2
+        assert result.get("needs_clarification") is True
+        assert "auto_disambiguated_to" not in result
+
+    def test_happy_path_no_retry(self, monkeypatch) -> None:
+        # Sanity: when the first call returns rows directly, NO retry fires.
+        # Steady-state behavior is unchanged for the common case.
+        resp = _FakeResp(200, {
+            "rows": [{"company_name": "TCS", "period_end": "2025-03-31", "pat": 50000}],
+            "needs_clarification": False,
+            "error": None,
+        })
+        result, calls = _invoke(monkeypatch, [resp])
+
+        assert len(calls) == 1  # no retry
+        assert "auto_disambiguated_to" not in result
+        assert result["rows"][0]["pat"] == 50000

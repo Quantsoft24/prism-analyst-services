@@ -51,6 +51,10 @@ def _adk_template_hits(template: str) -> list[tuple[int, str, str]]:
         ("FINANCE_DOMAIN_RULES", FINANCE_DOMAIN_RULES),
         ("COMPANY_INTEL_INSTRUCTION", COMPANY_INTEL_INSTRUCTION),
     ],
+    # Explicit IDs — pytest's default ID-from-value embeds the full prompt
+    # string into the test name. On Windows that hits the 32767-char env
+    # var limit during test collection. Stable short IDs avoid it.
+    ids=["finance_rules", "company_intel"],
 )
 def test_prompt_has_no_adk_template_hazards(name: str, template: str) -> None:
     """Fail if the prompt contains a ``{identifier}`` literal that ADK would

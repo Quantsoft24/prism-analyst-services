@@ -112,6 +112,26 @@ class Settings(BaseSettings):
     PRISM_FINANCIALS_URL: str = "http://localhost:8013"
     PRISM_FINANCIALS_API_KEY: str = ""
 
+    # ── Prism News (external financial-news + sentiment service) ──
+    # Teammate-built FastAPI service (showtimeapp/NewsRSS) over 82 Indian RSS
+    # feeds with OpenAI sentiment + a 4,149-company alias master. Prod runs on
+    # :8001. Exposes REST (/news, /news/summary, /news/trending, /news/compare,
+    # /news/sources, /news/companies, /news/sectors, /health, /stats) AND an MCP
+    # endpoint (/mcp). We wire it as a ``python`` typed agent wrapper (NOT
+    # ``openapi``) — same convention as stock-chat / bmc / prism-financials —
+    # so the LLM sees only the 3-4 agent-useful tools, gets trimmed responses,
+    # and inherits our structured error contract. The frontend /news page talks
+    # through PRISM's own /api/v1/news/* proxy router (one CORS/auth surface),
+    # mirroring the BMC pattern. Endpoint is open today (no caller auth);
+    # PRISM_NEWS_API_KEY stays empty until a gateway is added — the wrapper
+    # sends the header only when set, so no secret lands in git.
+    #
+    # Default :8014 is a deliberate placeholder (NOT :8001) so a missing env
+    # var fails loudly with "connection refused" rather than silently hitting
+    # the wrong local service. Set PRISM_NEWS_URL to the real GCP host in .env.
+    PRISM_NEWS_URL: str = "http://localhost:8014"
+    PRISM_NEWS_API_KEY: str = ""
+
     # RAG / pdf-parsing / chunking settings retired with the read-on-demand
     # cutover (2026-05-24) — PRISM no longer maintains its own embedding/chunk
     # index. Filings narrative Q&A comes via stock-chat's read-on-demand tools.

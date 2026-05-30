@@ -30,6 +30,7 @@ from src.routers import (
     chat_router,
     companies_router,
     integrations_router,
+    news_router,
     router_health_router,
 )
 from src.services.model_router import dispose_router, init_router
@@ -163,6 +164,7 @@ async def root() -> dict[str, str]:
 app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
+app.include_router(news_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).
 # We mount unconditionally so the route table is consistent.
