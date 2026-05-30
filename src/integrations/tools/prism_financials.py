@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 import httpx
 
@@ -177,6 +178,48 @@ def _latest_period_end(rows: list[dict]) -> str | None:
     )
 
 
+# Regex for the clarification format the upstream emits:
+#
+#   "Which one did you mean?
+#     1. Reliance Industries Ltd. (NSE: RELIANCE, prowess_id=500325)
+#     2. Reliance Power Ltd. (NSE: RPOWER, prowess_id=532792)
+#     ..."
+#
+# We pull the company name from line "1." — the top-ranked candidate by the
+# service's own similarity gate. Two patterns: with-parenthetical (the
+# canonical shape) and bare (defensive fallback if the format ever shifts).
+_CANDIDATE_LINE_RE = re.compile(r"^\s*1[.)]\s+(.+?)\s*\(", re.MULTILINE)
+_CANDIDATE_BARE_RE = re.compile(r"^\s*1[.)]\s+(.+?)\s*$", re.MULTILINE)
+
+
+def _extract_top_candidate(clarification: str) -> str | None:
+    """Return the top-ranked candidate company name from a financials_query
+    clarification block, or ``None`` if the format doesn't match.
+
+    The service ranks candidates by similarity to the user's input, so the
+    item at position #1 is the highest-confidence match. Auto-picking it is
+    the same as a human typing "1" — which is the intended human flow per
+    SKILL.md section 2.
+
+    Returns None when the format is unrecognised; the wrapper then skips
+    the auto-disambig retry and surfaces the clarification verbatim (safe
+    degradation — no wrong answer, just a clarification round-trip).
+    """
+    if not clarification or not isinstance(clarification, str):
+        return None
+    match = _CANDIDATE_LINE_RE.search(clarification)
+    if match is None:
+        match = _CANDIDATE_BARE_RE.search(clarification)
+    if match is None:
+        return None
+    name = match.group(1).strip()
+    # Filter out obvious non-name lines (the regex could grab a header
+    # like "1) Pick one of these:" — defensively reject very-short strings).
+    if len(name) < 3:
+        return None
+    return name
+
+
 async def financials_query(
     question: str,
     answer_mode: str = "off",
@@ -257,6 +300,40 @@ async def financials_query(
             detail=str(data.get("error")),
         )
 
+    # Auto-disambiguation (SKILL.md §2 says the human flow is: pick the top
+    # candidate and re-call). In an autonomous agent turn the orchestrator
+    # can't pause for user input, so the wrapper does it. We retry ONCE on
+    # `needs_clarification: true`, prepending the top-ranked candidate name
+    # to the original question. The retry's response is tagged with
+    # `auto_disambiguated_to` so the agent can NOTE the assumption in prose
+    # ("Interpreting TCS as Tata Consultancy Services Ltd.") and the UI can
+    # render a small chip on the tool card.
+    #
+    # Capped at one retry — if the retry STILL needs clarification (the
+    # remaining ambiguity is on a different entity in a multi-company query),
+    # we surface that clarification cleanly. No looping.
+    auto_disambiguated_to: str | None = None
+    if data.get("needs_clarification"):
+        top = _extract_top_candidate(data.get("clarification") or "")
+        if top:
+            retry_question = f"{top}. {question}"
+            logger.info(
+                "prism-financials auto-disambig: picking top candidate %r and re-calling",
+                top,
+            )
+            retry_payload = {**payload, "question": retry_question}
+            retry_data = await _post("/ask", retry_payload, _TIMEOUT)
+            # If the retry itself errored, fall back to the original
+            # clarification (better to surface that than an error).
+            if not (retry_data.get("ok") is False or retry_data.get("error")):
+                # Take the retry as the canonical response IF it actually
+                # resolved (no clarification) OR if it gave us rows.
+                still_ambiguous = retry_data.get("needs_clarification") is True
+                got_rows = bool(retry_data.get("rows"))
+                if got_rows or not still_ambiguous:
+                    data = retry_data
+                    auto_disambiguated_to = top
+
     # Shapes 1-3 are all SUCCESS envelopes (error is null). Trim operational
     # fields (debug, echoed answer) and keep the canonical rows + sql.
     rows = data.get("rows") or []
@@ -269,6 +346,8 @@ async def financials_query(
         "duration_ms": data.get("duration_ms"),
         "data_freshness": _latest_period_end(rows),
     }
+    if auto_disambiguated_to:
+        out["auto_disambiguated_to"] = auto_disambiguated_to
     if "retry_count" in data:
         out["retry_count"] = data["retry_count"]
     return out

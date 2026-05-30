@@ -19,9 +19,10 @@ env/
 *.swo
 
 # ── Environment ──
+# ALL env files stay off git (incl. .env.example) — shared privately within
+# the team, never committed. Team policy: no `!.env.example` exception.
 .env
-.env.local
-.env.production
+.env.*
 
 # ── SSL certs ──
 *.pem
