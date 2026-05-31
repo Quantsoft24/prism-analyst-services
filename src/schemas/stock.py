@@ -89,3 +89,31 @@ class BalanceSheetResponse(BaseModel):
     available_bases: list[FinancialBasis]
     years: list[str]
     sections: list[FinancialNode]
+
+
+# ── Annual financials (Income Statement) ────────────────────────────────────
+
+
+class IncomeRow(BaseModel):
+    """One line in the sequential income statement. ``values`` maps fiscal-year
+    → amount in ₹ crore. ``emphasis`` flags computed subtotals (Operating
+    Profit / PBT / PAT); ``sign`` is a display operator for input rows
+    (``minus`` deducts, ``plus`` adds); ``info`` is the formula tooltip."""
+
+    key: str
+    label: str
+    emphasis: bool = False
+    sign: Literal["plus", "minus"] | None = None
+    info: str | None = None
+    values: dict[str, float | None]
+
+
+class IncomeStatementResponse(BaseModel):
+    """A security's income statement over the last ~10 fiscal years (sequential
+    rows: Revenue → … → PAT). Same basis/years contract as the balance sheet."""
+
+    security_id: int
+    basis: FinancialBasis
+    available_bases: list[FinancialBasis]
+    years: list[str]
+    rows: list[IncomeRow]

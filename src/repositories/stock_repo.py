@@ -22,6 +22,8 @@ from src.schemas.stock import (
     BalanceSheetResponse,
     FinancialBasis,
     FinancialNode,
+    IncomeRow,
+    IncomeStatementResponse,
     SecurityRead,
     StockRange,
 )
@@ -38,9 +40,22 @@ _SECURITIES_TTL_SECONDS = 6 * 3600
 # Balance-sheet line-item hierarchy (baked from asset_and_liabilities_parent.csv).
 _BS_HIERARCHY_PATH = Path(__file__).resolve().parents[2] / "config" / "balance_sheet_hierarchy.json"
 _BS_FINANCIAL_TYPES = ["asset", "capital and liabilities"]
-_BS_YEARS = 10
+_FIN_YEARS = 10
 # Cached nested template: list of root nodes {key, label, level, children:[...]}.
 _BS_TREE_TEMPLATE: list[dict] | None = None
+
+# Income-statement sequential structure (editable config — see the file).
+_IS_CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "income_statement_structure.json"
+_IS_FINANCIAL_TYPES = ["profit_and_loss"]
+_IS_CONFIG: list[dict] | None = None
+
+
+def _income_statement_config() -> list[dict]:
+    """Load + cache the ordered income-statement row config."""
+    global _IS_CONFIG
+    if _IS_CONFIG is None:
+        _IS_CONFIG = json.loads(_IS_CONFIG_PATH.read_text(encoding="utf-8"))
+    return _IS_CONFIG
 
 
 def _balance_sheet_template() -> list[dict]:
@@ -157,31 +172,24 @@ class StockRepository:
         stmt = base.order_by(PriceRow.trade_date.asc())
         return list((await self.session.scalars(stmt)).all())
 
-    async def get_balance_sheet(
-        self, security_id: int, basis: FinancialBasis = "consolidated"
-    ) -> BalanceSheetResponse:
-        """Build the balance-sheet tree (last ~10 fiscal years) for a security.
+    async def _financials_window(
+        self, security_id: int, basis: FinancialBasis, financial_types: list[str]
+    ) -> tuple[list[FinancialBasis], FinancialBasis, list[str], dict[str, dict[str, float | None]]]:
+        """Shared loader for annual statements: resolve the basis (with fallback),
+        the 10 most recent fiscal years, and ``{variable: {year: value}}``.
 
-        Resolves the standalone/consolidated basis (falling back to whichever is
-        available), takes the 10 most recent fiscal years, attaches values onto
-        the cached hierarchy, and prunes branches that are entirely empty for
-        this security (e.g. bank-only lines for a non-bank). Values are ₹ crore.
-        """
-        # Which bases actually have balance-sheet data for this security.
+        Returns ``(available_bases, resolved_basis, years, values_by_var)``;
+        ``years``/``values`` are empty when the security has no data."""
         avail_rows = await self.session.execute(
             text(
                 "SELECT DISTINCT data_type FROM annual_data "
                 "WHERE security_id = :sid AND financial_type IN :fts"
             ).bindparams(bindparam("fts", expanding=True)),
-            {"sid": security_id, "fts": _BS_FINANCIAL_TYPES},
+            {"sid": security_id, "fts": financial_types},
         )
         available: list[FinancialBasis] = sorted(r[0] for r in avail_rows)
-
         if not available:
-            return BalanceSheetResponse(
-                security_id=security_id, basis=basis,
-                available_bases=[], years=[], sections=[],
-            )
+            return [], basis, [], {}
 
         resolved: FinancialBasis = basis if basis in available else available[0]
 
@@ -192,14 +200,11 @@ class StockRepository:
                 "WHERE security_id = :sid AND data_type = :basis AND financial_type IN :fts "
                 "ORDER BY date DESC LIMIT :lim"
             ).bindparams(bindparam("fts", expanding=True)),
-            {"sid": security_id, "basis": resolved, "fts": _BS_FINANCIAL_TYPES, "lim": _BS_YEARS},
+            {"sid": security_id, "basis": resolved, "fts": financial_types, "lim": _FIN_YEARS},
         )
         years = sorted(r[0] for r in year_rows)
         if not years:
-            return BalanceSheetResponse(
-                security_id=security_id, basis=resolved,
-                available_bases=available, years=[], sections=[],
-            )
+            return available, resolved, [], {}
 
         # Pull the values for those years in one shot.
         val_rows = await self.session.execute(
@@ -208,11 +213,36 @@ class StockRepository:
                 "WHERE security_id = :sid AND data_type = :basis "
                 "AND financial_type IN :fts AND date IN :years"
             ).bindparams(bindparam("fts", expanding=True), bindparam("years", expanding=True)),
-            {"sid": security_id, "basis": resolved, "fts": _BS_FINANCIAL_TYPES, "years": years},
+            {"sid": security_id, "basis": resolved, "fts": financial_types, "years": years},
         )
         values_by_var: dict[str, dict[str, float | None]] = {}
         for variable, d, value in val_rows:
             values_by_var.setdefault(variable, {})[d] = value
+        return available, resolved, years, values_by_var
+
+    async def get_balance_sheet(
+        self, security_id: int, basis: FinancialBasis = "consolidated"
+    ) -> BalanceSheetResponse:
+        """Build the balance-sheet tree (last ~10 fiscal years) for a security.
+
+        Resolves the standalone/consolidated basis (falling back to whichever is
+        available), takes the 10 most recent fiscal years, attaches values onto
+        the cached hierarchy, and prunes branches that are entirely empty for
+        this security (e.g. bank-only lines for a non-bank). Values are ₹ crore.
+        """
+        available, resolved, years, values_by_var = await self._financials_window(
+            security_id, basis, _BS_FINANCIAL_TYPES
+        )
+        if not available:
+            return BalanceSheetResponse(
+                security_id=security_id, basis=basis,
+                available_bases=[], years=[], sections=[],
+            )
+        if not years:
+            return BalanceSheetResponse(
+                security_id=security_id, basis=resolved,
+                available_bases=available, years=[], sections=[],
+            )
 
         sections = [
             node
@@ -222,6 +252,59 @@ class StockRepository:
         return BalanceSheetResponse(
             security_id=security_id, basis=resolved,
             available_bases=available, years=years, sections=sections,
+        )
+
+    async def get_income_statement(
+        self, security_id: int, basis: FinancialBasis = "consolidated"
+    ) -> IncomeStatementResponse:
+        """Build the sequential income statement (Revenue → … → PAT) for a
+        security over the last ~10 fiscal years. Input rows read a single
+        ``annual_data`` variable; computed rows (Operating Profit / PBT / PAT)
+        apply their formula over earlier rows. Values are ₹ crore.
+        """
+        available, resolved, years, values_by_var = await self._financials_window(
+            security_id, basis, _IS_FINANCIAL_TYPES
+        )
+        if not available:
+            return IncomeStatementResponse(
+                security_id=security_id, basis=basis,
+                available_bases=[], years=[], rows=[],
+            )
+        if not years:
+            return IncomeStatementResponse(
+                security_id=security_id, basis=resolved,
+                available_bases=available, years=[], rows=[],
+            )
+
+        computed: dict[str, dict[str, float | None]] = {}
+        rows: list[IncomeRow] = []
+        for spec in _income_statement_config():
+            if spec["type"] == "input":
+                var_vals = values_by_var.get(spec["variable"], {})
+                vals: dict[str, float | None] = {y: var_vals.get(y) for y in years}
+            else:  # computed — sum signed operands over already-built rows
+                vals = {}
+                for y in years:
+                    total = 0.0
+                    seen = False
+                    for op, ref in spec["formula"]:
+                        v = computed.get(ref, {}).get(y)
+                        if v is not None:
+                            seen = True
+                            total += v if op == "+" else -v
+                    vals[y] = total if seen else None
+            computed[spec["key"]] = vals
+            rows.append(
+                IncomeRow(
+                    key=spec["key"], label=spec["label"],
+                    emphasis=spec.get("emphasis", False),
+                    sign=spec.get("sign"), info=spec.get("info"),
+                    values=vals,
+                )
+            )
+        return IncomeStatementResponse(
+            security_id=security_id, basis=resolved,
+            available_bases=available, years=years, rows=rows,
         )
 
 
