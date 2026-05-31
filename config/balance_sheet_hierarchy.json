@@ -1,0 +1,332 @@
+[
+  {
+    "key": "total_assets",
+    "label": "Total assets",
+    "parent": "asset",
+    "root": "asset"
+  },
+  {
+    "key": "non_current_assets",
+    "label": "Non-current assets",
+    "parent": "Total assets",
+    "root": "asset"
+  },
+  {
+    "key": "net_fixed_assets",
+    "label": "Net fixed assets",
+    "parent": "Non-current assets",
+    "root": "asset"
+  },
+  {
+    "key": "gross_fixed_assets",
+    "label": "Gross fixed assets",
+    "parent": "Net fixed assets",
+    "root": "asset"
+  },
+  {
+    "key": "gross_fixed_ast_cumm_dep",
+    "label": "Cumulative depreciation on gross fixed assets",
+    "parent": "Net fixed assets",
+    "root": "asset"
+  },
+  {
+    "key": "net_intangible_ast",
+    "label": "Net intangible assets",
+    "parent": "Net fixed assets",
+    "root": "asset"
+  },
+  {
+    "key": "net_ppe",
+    "label": "Net property, plant and equipment",
+    "parent": "Net fixed assets",
+    "root": "asset"
+  },
+  {
+    "key": "non_curr_investments",
+    "label": "Long term investments",
+    "parent": "Non-current assets",
+    "root": "asset"
+  },
+  {
+    "key": "lt_invest_equity_shares",
+    "label": "Long term investment in equity shares",
+    "parent": "Long term investments",
+    "root": "asset"
+  },
+  {
+    "key": "lt_invest_pref_shares",
+    "label": "Long term investment in preference shares",
+    "parent": "Long term investments",
+    "root": "asset"
+  },
+  {
+    "key": "lt_invest_all_debt_instru",
+    "label": "Long term investment in debt instruments",
+    "parent": "Long term investments",
+    "root": "asset"
+  },
+  {
+    "key": "lt_invest_mfs",
+    "label": "Long term investment in mutual funds",
+    "parent": "Long term investments",
+    "root": "asset"
+  },
+  {
+    "key": "total_lt_loans_adv",
+    "label": "Total long term loans & advances",
+    "parent": "Non-current assets",
+    "root": "asset"
+  },
+  {
+    "key": "current_assets_incl_st_invest_loans",
+    "label": "Current assets (incl. short term investments, loans & advances)",
+    "parent": "Total assets",
+    "root": "asset"
+  },
+  {
+    "key": "short_term_investments",
+    "label": "Short term investments",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "st_inventories",
+    "label": "Short term inventories",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "st_trade_bills_receivables",
+    "label": "Short term trade receivables & bills receivable",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "st_cash_bank_oth_bal",
+    "label": "Cash & Bank balance (short term)",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "total_st_loans_adv",
+    "label": "Total short term loans & advances",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "total_liabilities",
+    "label": "Capital & Liabilities",
+    "parent": "capital and liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "tot_cap_reserv",
+    "label": "Capital & Reserves",
+    "parent": "Capital & Liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "total_capital",
+    "label": "Total capital",
+    "parent": "Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "paidup_equity_cap",
+    "label": "Paid up equity capital (net of forfeited equity capital)",
+    "parent": "Total capital",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "paidup_forfeited_equity_cap",
+    "label": "Forfeited equity capital",
+    "parent": "Total capital",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "paidup_pref_cap",
+    "label": "Paid up preference capital (net of forfeited preference capital)",
+    "parent": "Total capital",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "resv",
+    "label": "Reserves and funds",
+    "parent": "Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "liabilities_excl_cap",
+    "label": "Total liabilities excluding Capital & Reserves",
+    "parent": "Capital & Liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "deposits_commercial_banks",
+    "label": "Deposits (accepted by commercial banks)",
+    "parent": "Total liabilities excluding Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "demand_deposits",
+    "label": "Demand deposits",
+    "parent": "Deposits (accepted by commercial banks)",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "saving_deposits",
+    "label": "Saving deposits",
+    "parent": "Deposits (accepted by commercial banks)",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "lt_deposits",
+    "label": "Term deposits",
+    "parent": "Deposits (accepted by commercial banks)",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "non_current_liabilities",
+    "label": "Non-current liabilities",
+    "parent": "Total liabilities excluding Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "long_term_borrowings",
+    "label": "Long term borrowings excl current portion",
+    "parent": "Non-current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "deferred_tax_liab",
+    "label": "Deferred tax liability",
+    "parent": "Non-current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_long_term_liabilities",
+    "label": "Other long term liabilities",
+    "parent": "Non-current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "long_term_provisions",
+    "label": "Long term provisions",
+    "parent": "Non-current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "curr_liab_n_prov",
+    "label": "Current liabilities & provisions",
+    "parent": "Total liabilities excluding Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "current_liabilities",
+    "label": "Current liabilities",
+    "parent": "Current liabilities & provisions",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "short_term_borrowings",
+    "label": "Short-term borrowings",
+    "parent": "Current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "short_term_trade_paybl_acceptances",
+    "label": "Short term trade payables and acceptances",
+    "parent": "Current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "st_deposits_advances",
+    "label": "Deposits & advances from customers and employees (short term)",
+    "parent": "Current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "st_provisions",
+    "label": "Provisions outstanding (short term)",
+    "parent": "Current liabilities & provisions",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Total assets",
+    "label": "other_Total assets",
+    "parent": "Total assets",
+    "root": "asset"
+  },
+  {
+    "key": "other_Non-current assets",
+    "label": "other_Non-current assets",
+    "parent": "Non-current assets",
+    "root": "asset"
+  },
+  {
+    "key": "other_Net fixed assets",
+    "label": "other_Net fixed assets",
+    "parent": "Net fixed assets",
+    "root": "asset"
+  },
+  {
+    "key": "other_Long term investments",
+    "label": "other_Long term investments",
+    "parent": "Long term investments",
+    "root": "asset"
+  },
+  {
+    "key": "other_Current assets (incl. short term investments, loans & advances)",
+    "label": "other_Current assets (incl. short term investments, loans & advances)",
+    "parent": "Current assets (incl. short term investments, loans & advances)",
+    "root": "asset"
+  },
+  {
+    "key": "other_Capital & Liabilities",
+    "label": "other_Capital & Liabilities",
+    "parent": "Capital & Liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Capital & Reserves",
+    "label": "other_Capital & Reserves",
+    "parent": "Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Total capital",
+    "label": "other_Total capital",
+    "parent": "Total capital",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Total liabilities excluding Capital & Reserves",
+    "label": "other_Total liabilities excluding Capital & Reserves",
+    "parent": "Total liabilities excluding Capital & Reserves",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Deposits (accepted by commercial banks)",
+    "label": "other_Deposits (accepted by commercial banks)",
+    "parent": "Deposits (accepted by commercial banks)",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Non-current liabilities",
+    "label": "other_Non-current liabilities",
+    "parent": "Non-current liabilities",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Current liabilities & provisions",
+    "label": "other_Current liabilities & provisions",
+    "parent": "Current liabilities & provisions",
+    "root": "capital and liabilities"
+  },
+  {
+    "key": "other_Current liabilities",
+    "label": "other_Current liabilities",
+    "parent": "Current liabilities",
+    "root": "capital and liabilities"
+  }
+]

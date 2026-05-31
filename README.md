@@ -19,32 +19,41 @@
                           │  PRISM Backend (FastAPI, :8000)      │
                           │  ─ chat agent (Google ADK)           │
                           │  ─ company catalog endpoints          │
+                          │  ─ stock dashboard endpoints          │
                           │  ─ BMC proxy                          │
                           │  ─ integration registry               │
-                          └────┬─────────────────┬───────┬────────┘
-                               │                 │       │
-              ┌────────────────┘                 │       └──────────────┐
-              ▼                                  ▼                      ▼
-   ┌───────────────────┐          ┌─────────────────────┐    ┌──────────────────────┐
-   │ Neon Postgres     │          │  stock_chat Postgres │    │ External services    │
-   │ (PRISM-owned)     │          │  (READ-ONLY catalog) │    │  bmc            :8012│
-   │ agent_runs,       │          │  company_industry    │    │  stock-chat     :8011│
-   │ firms, users,     │          │  company_aliases     │    │  prism-financials:8000│
-   │ firm_integrations │          │  filings_index       │    │ (teammate-owned;     │
-   │                   │          │  document_texts      │    │  same GCP VM)        │
-   └───────────────────┘          └─────────────────────┘    └──────────────────────┘
+                          └──┬───────────┬───────────┬─────┬──────┘
+                             │           │           │     │
+            ┌────────────────┘     ┌─────┘           │     └──────────────┐
+            ▼                      ▼                 ▼                    ▼
+ ┌───────────────────┐ ┌─────────────────────┐ ┌──────────────┐ ┌──────────────────────┐
+ │ Neon Postgres     │ │  stock_chat Postgres │ │ investment   │ │ External services    │
+ │ (PRISM-owned)     │ │  (READ-ONLY catalog) │ │ RDS Postgres │ │  bmc            :8012│
+ │ agent_runs,       │ │  company_industry    │ │ (READ-ONLY)  │ │  stock-chat     :8011│
+ │ firms, users,     │ │  company_aliases     │ │ master_      │ │  prism-financials:8000│
+ │ firm_integrations │ │  filings_index       │ │  securities  │ │  prism-news     :8001│
+ │                   │ │  document_texts      │ │ prices_…     │ │ (teammate-owned;     │
+ │                   │ │                      │ │ annual_data  │ │  GCP VMs)            │
+ └───────────────────┘ └─────────────────────┘ └──────────────┘ └──────────────────────┘
 ```
 
 **Where PRISM owns data:** `agent_runs` (audit), `firm_integrations` (per-firm
 tool toggles), `firms` / `users` / `firm_memberships` (auth/tenancy).
-**Where PRISM reads-only:** `company_industry` (4,773 companies) +
-`company_aliases` (~10k algorithmic abbreviations / short-forms / typo
-variants), via a secondary read-only engine.
+**Where PRISM reads-only (two secondary engines):**
+- *Catalog DB* (stock_chat Postgres) — `company_industry` (4,773 companies) +
+  `company_aliases` (~10k algorithmic abbreviations / short-forms / typo
+  variants).
+- *Investment DB* (AWS RDS) — backs the **Stock Dashboard**:
+  `master_securities` (8,230 NSE/BSE securities), `prices_and_securities`
+  (21.5M daily OHLC/volume/value/market-cap bars), and `annual_data` (annual
+  financials — balance sheet today). Values in ₹ crore. SSL required.
 **External services (HTTP):** `bmc` (9-block canvas), `stock-chat` (filings
-narrative Q&A, catalog lookup, technicals), and `prism-financials` (text-to-SQL
-over CMIE Prowess for exact figures / ratios / rankings). PRISM's
-`/api/v1/bmc/*` thin-proxies to `bmc`; the chat agent reaches all three via
-the integration registry.
+narrative Q&A, catalog lookup, technicals), `prism-financials` (text-to-SQL
+over CMIE Prowess for exact figures / ratios / rankings), and `prism-news`
+(financial news + sentiment). PRISM's `/api/v1/bmc/*` and `/api/v1/news/*`
+thin-proxy to those services; the chat agent reaches them via the integration
+registry. The Stock Dashboard endpoints (`/api/v1/stocks/*`) are **direct DB
+reads** of the investment DB (not a proxy).
 
 ## Tech stack
 
@@ -54,6 +63,7 @@ the integration registry.
 | ORM / migrations | SQLAlchemy 2.x (async) + Alembic |
 | Primary DB | PostgreSQL (Neon dev/staging; AWS RDS / shared Postgres in prod) |
 | Catalog DB (read-only) | PostgreSQL — shared with stock-chat service (`company_industry`, `filings_index`, `document_texts`) |
+| Investment DB (read-only) | PostgreSQL (AWS RDS) — Stock Dashboard data (`master_securities`, `prices_and_securities`, `annual_data`) |
 | Agent runtime | Google ADK 1.33+ (LlmAgent, FunctionTool, AgentTool, OpenAPIToolset, MCPToolset) |
 | LLM routing | LiteLLM Router — multi-key + multi-model fallback (free + paid tiers) |
 | Tests | pytest + httpx async + real Postgres in CI |
@@ -71,21 +81,33 @@ src/
 ├── core/
 │   ├── database.py        Primary engine (PRISM-owned data)
 │   ├── catalog_database.py Secondary read-only engine (catalog DB)
+│   ├── investment_database.py Secondary read-only engine (investment RDS —
+│   │                      Stock Dashboard); own InvestmentBase, graceful if unset
 │   └── auth.py            Dev-mode firm dependency (Clerk in Phase 1 W3)
 ├── models/                ORM — primary DB
 │   ├── base.py, firm.py, user.py, agent_run.py, integration.py
-│   └── catalog/           Read-only models on the catalog engine
-│       ├── company_industry.py
-│       └── company_alias.py    Algorithmic alias → ticker mappings
+│   ├── catalog/           Read-only models on the catalog engine
+│   │   ├── company_industry.py
+│   │   └── company_alias.py    Algorithmic alias → ticker mappings
+│   └── investment/        Read-only models on the investment engine
+│       ├── master_security.py  master_securities (security master)
+│       └── price_row.py        prices_and_securities (daily bars)
+│                          (annual_data is queried via raw SQL in stock_repo)
 ├── repositories/          Data access
 │   ├── company_repo.py    Queries company_industry + company_aliases on
 │   │                      catalog engine (3-tier alias resolution: TTL
 │   │                      cache → exact alias_norm → pg_trgm similarity)
+│   ├── stock_repo.py      Securities search index (cached) + price series
+│   │                      (range→window) + balance-sheet tree (from the
+│   │                      committed hierarchy config; prunes empty branches)
 │   └── integration_repo.py
-├── schemas/               Pydantic request/response shapes
+├── schemas/               Pydantic request/response shapes (incl. stock.py)
 ├── routers/
 │   ├── companies.py       /api/v1/companies — catalog-backed (4,773 rows)
+│   ├── stocks.py          /api/v1/stocks/* — investment-DB reads (securities,
+│   │                      prices, balance-sheet)
 │   ├── bmc.py             /api/v1/bmc/* — THIN PROXY to BMC_URL
+│   ├── news.py            /api/v1/news/* — THIN PROXY to PRISM_NEWS_URL
 │   ├── chat.py            /api/v1/chat/run — agent SSE stream
 │   ├── integrations.py    /api/v1/integrations — list + per-firm toggle
 │   └── router_health.py   /api/v1/router/health — ModelRouter debug
@@ -117,6 +139,9 @@ src/
 │   └── nre/               Deterministic finance math
 config/
 ├── integrations.yml       Declarative integration registry
+├── balance_sheet_hierarchy.json  Balance-sheet line-item tree (variable→parent;
+│                          baked from a source CSV; source of truth for the
+│                          Annual Financials tree)
 └── ingestion_sources.yml  (RAG retired; file may be unused)
 alembic/versions/          Migrations — see "Database" below
 docs/INTEGRATION_INTAKE.md Per-tool intake template (one form per integration)
@@ -189,7 +214,9 @@ For company catalog + external integrations:
 | Var | Purpose |
 |---|---|
 | `CATALOG_DATABASE_URL` (or `POSTGRES_URL`) | Read-only secondary engine → catalog Postgres (`company_industry`, `company_aliases`). If unset, `/api/v1/companies` returns 503 cleanly. |
+| `INVESTMENT_DB_*` | Read-only secondary engine → investment RDS for the Stock Dashboard. Provide the `INVESTMENT_DB_HOST/PORT/NAME/USER/PASSWORD` parts (not a URL — the password has URL-unsafe chars) + `INVESTMENT_DB_SSL_MODE=require`. If unset, `/api/v1/stocks/*` returns 503 cleanly. The RDS security group must allow the backend host's IP. |
 | `BMC_URL` | External BMC service base URL (e.g. `http://35.234.221.166:8012`). Proxied by `/api/v1/bmc/*`. |
+| `PRISM_NEWS_URL` | External news+sentiment service base URL (prod `http://35.234.221.166:8001`). Proxied by `/api/v1/news/*`. |
 | `STOCK_CHAT_URL` | External filings service base URL. Used by the integration registry. |
 | `PRISM_FINANCIALS_URL` | External text-to-SQL financials service base URL (prod `http://35.234.221.166:8000`). **MUST be set explicitly** — the default `http://localhost:8013` is a deliberate placeholder; without this var, `financials_query` cannot reach the upstream. The teammate service runs on the same port number (8000) that PRISM itself binds to, so an unset env var would otherwise silently loop into PRISM and 404. |
 | `PRISM_FINANCIALS_API_KEY` | Optional `X-API-Key` header for the financials service. Empty today (open endpoint); set when the upstream adds auth. |
@@ -210,6 +237,11 @@ See `.env.example` for the full annotated list.
 | `GET` | `/health` | Load-balancer probe |
 | `GET` | `/api/v1/companies` | Paginated catalog list (4,773 companies) |
 | `GET` | `/api/v1/companies/{id_or_ticker}` | Detail (ticker / NSE scrip code / ISIN) |
+| `GET` | `/api/v1/stocks/securities` | Full NSE/BSE security search index (8,230; cached) |
+| `GET` | `/api/v1/stocks/{security_id}` | Security master detail (dashboard header) |
+| `GET` | `/api/v1/stocks/{security_id}/prices?range=` | Daily OHLC/volume/value/mcap series (5D…MAX) |
+| `GET` | `/api/v1/stocks/{security_id}/balance-sheet?basis=` | 10-year balance-sheet tree (standalone/consolidated) |
+| `GET` | `/api/v1/news/*` | News feed / sentiment / trending / compare (proxied to `PRISM_NEWS_URL`) |
 | `POST` | `/api/v1/chat/run` | Run the company-intel agent — SSE stream |
 | `GET` | `/api/v1/bmc/{ticker}` | Latest BMC (proxied to `BMC_URL`) |
 | `POST` | `/api/v1/bmc/{ticker}/run` | Generate new BMC version (proxied) |

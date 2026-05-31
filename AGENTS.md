@@ -22,7 +22,7 @@ graphify update .                           # refresh after edits (AST only)
 The graph lives at `graphify-out/`. `Read` and `Grep` are fallbacks when the
 graph excerpt is genuinely insufficient — not first-line tools.
 
-## The 14 agent tools
+## The 18 agent tools
 
 | Source | Tool | What it does |
 |---|---|---|
@@ -35,6 +35,10 @@ graph excerpt is genuinely insufficient — not first-line tools.
 | `stock_chat.py` | `stock_technicals` | Live price + RSI/MACD/MA. |
 | `bmc.py` × 6 | `bmc_get` / `_generate` / `_library` / `_get_version` / `_block_chat` / `_diff` | 9-block Business Model Canvas. |
 | `prism_financials.py` | `financials_query` | Exact numbers / ratios / rankings / time-series via text-to-SQL over CMIE Prowess. |
+| `prism_news.py` × 4 | `news_sentiment` / `news_trending` / `news_search` / `news_compare` | Live Indian-market news + per-company sentiment verdict. |
+
+(The **Stock Dashboard** investment-DB data is a UI feature with NO agent tool —
+direct DB reads via `stock_repo.py` + `/api/v1/stocks/*`.)
 
 The 5 NRE math tools (`compute_*`) stay on disk at `src/services/nre/` but are
 NOT attached to the agent — `financials_query` covers the ratio/CAGR/margin
@@ -57,9 +61,10 @@ runner emits `ToolResultEvent(ok=False, error=…)` when `ok` is `False` OR
 `error` is truthy. **`{"error": None}` is NOT an error** (the
 `prism-financials` success envelope always carries this key).
 
-## HTTP-wrapper pattern (the three teammate services)
+## HTTP-wrapper pattern (the four teammate services)
 
-`stock_chat._post`, `bmc._request`, `prism_financials._post` all follow:
+`stock_chat._post`, `bmc._request`, `prism_financials._post`, `prism_news._get`
+all follow:
 
 - One-shot 250 ms retry on `httpx.TimeoutException` / `httpx.RequestError`.
 - 4xx / 5xx are NEVER retried.
@@ -77,7 +82,7 @@ Use **backticks** for code/identifiers and **angle brackets** for placeholders.
 The one allowed exception is `<answer_meta>{{…}}` (the prompt is an f-string).
 Regression guard: `tests/test_agent_prompts.py::_adk_template_hits`.
 
-## Two databases — when to use which
+## Three databases — when to use which
 
 - **Primary (Neon, `DATABASE_URL`)**: writes — `agent_runs`, `firms`, `users`,
   `firm_memberships`, `firm_integrations`. Alembic-controlled.
@@ -85,6 +90,15 @@ Regression guard: `tests/test_agent_prompts.py::_adk_template_hits`.
   `CATALOG_DATABASE_URL`)**: reads only — `company_industry`, **`company_aliases`**,
   `filings_index`, `document_texts`, `bmc_*`, `chunks`. Use
   `catalog_session_scope()` from `src.core.catalog_database`.
+- **Investment (AWS RDS, `INVESTMENT_DB_*`)**: reads only — `master_securities`,
+  `prices_and_securities`, `annual_data`. Backs the **Stock Dashboard**
+  (`/api/v1/stocks/*`), which is a UI feature with **no agent tool** (direct DB
+  reads via `stock_repo.py`). Own `InvestmentBase`; use
+  `investment_session_scope()` / `get_investment_session` from
+  `src.core.investment_database`. Inited gracefully in `main.py` lifespan
+  (skipped if unconfigured → routes 503). Each engine is **separate** — never
+  cross-join across them. NB: a dual-listed company has two `security_id`s (one
+  per exchange); values in `prices_/annual_` are ₹ crore.
 
 ## Adding a tool — the integration framework
 
