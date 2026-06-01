@@ -24,6 +24,11 @@ from src.core.catalog_database import (
     is_catalog_configured,
 )
 from src.core.database import dispose_engine, init_engine
+from src.core.investment_database import (
+    dispose_investment_engine,
+    init_investment_engine,
+    is_investment_configured,
+)
 from src.integrations import dispose_registry, init_registry
 from src.routers import (
     bmc_router,
@@ -32,6 +37,7 @@ from src.routers import (
     integrations_router,
     news_router,
     router_health_router,
+    stocks_router,
 )
 from src.services.model_router import dispose_router, init_router
 
@@ -87,6 +93,16 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Catalog DB engine failed to initialize: %s", exc)
 
+    # Read-only engine for the investment DB (AWS RDS) — powers the Stock
+    # Dashboard (/api/v1/stocks/*). Skipped silently if not configured; a
+    # failure here logs + continues (the stocks routes 503 if accessed).
+    if is_investment_configured():
+        try:
+            init_investment_engine()
+            logger.info("Investment DB engine initialized (read-only).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Investment DB engine failed to initialize: %s", exc)
+
     # Build the ModelRouter if enabled — collects all GEMINI_API_KEY* values
     # from settings and hands them to the singleton. Disabling lets us run
     # without LLM access (e.g., CI runs of non-LLM endpoints).
@@ -114,6 +130,7 @@ async def lifespan(app: FastAPI):
     finally:
         dispose_registry()
         dispose_router()
+        await dispose_investment_engine()
         await dispose_catalog_engine()
         await dispose_engine()
 
@@ -165,6 +182,7 @@ app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
 app.include_router(news_router, prefix=settings.API_PREFIX)
+app.include_router(stocks_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).
 # We mount unconditionally so the route table is consistent.

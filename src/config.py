@@ -156,6 +156,22 @@ class Settings(BaseSettings):
     CATALOG_DATABASE_URL: str = ""
     POSTGRES_URL: str = ""  # back-compat: read teammate's .env if set
 
+    # ── Investment DB (READ-ONLY secondary engine — new AWS RDS ``investment``
+    # Postgres backing the Stock Dashboard). Two tables only: ``master_securities``
+    # (8,230 NSE/BSE securities) + ``prices_and_securities`` (21.5M daily OHLC /
+    # volume / value / market-cap rows). Owned externally — NEVER write through
+    # this engine. Provide either a full ``INVESTMENT_DATABASE_URL`` OR the
+    # ``INVESTMENT_DB_*`` parts (preferred when the password has URL-unsafe chars
+    # like ``$`` — we URL-encode via SQLAlchemy's URL.create). If unset, the
+    # Stock Dashboard endpoints 503 and the rest of the app is unaffected.
+    INVESTMENT_DATABASE_URL: str = ""
+    INVESTMENT_DB_HOST: str = ""
+    INVESTMENT_DB_PORT: int = 5432
+    INVESTMENT_DB_NAME: str = "investment"
+    INVESTMENT_DB_USER: str = "postgres"
+    INVESTMENT_DB_PASSWORD: str = ""
+    INVESTMENT_DB_SSL_MODE: str = "require"  # RDS requires TLS
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     def _build_url(self, driver: str, strip_sslmode: bool) -> str:
@@ -228,6 +244,59 @@ class Settings(BaseSettings):
                 url = "postgresql+asyncpg://" + url[len(prefix):]
                 break
         return _strip_sslmode(url)
+
+    @property
+    def async_investment_database_url(self) -> str:
+        """Async URL for the read-only investment DB (RDS ``investment``).
+
+        Prefers ``INVESTMENT_DATABASE_URL``; otherwise builds from the
+        ``INVESTMENT_DB_*`` parts via SQLAlchemy's ``URL.create`` (which
+        percent-encodes the password — important because the RDS password
+        contains ``$``). Returns "" if neither is configured (Stock Dashboard
+        endpoints then degrade gracefully). Normalizes the driver to asyncpg
+        and strips ``sslmode`` (SSL goes through ``investment_connect_args``)."""
+        if self.INVESTMENT_DATABASE_URL:
+            url = self.INVESTMENT_DATABASE_URL
+            for prefix in ("postgresql://", "postgres://"):
+                if url.startswith(prefix):
+                    url = "postgresql+asyncpg://" + url[len(prefix):]
+                    break
+            return _strip_sslmode(url)
+        if not self.INVESTMENT_DB_HOST:
+            return ""
+        from sqlalchemy.engine import URL
+
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.INVESTMENT_DB_USER,
+            password=self.INVESTMENT_DB_PASSWORD,
+            host=self.INVESTMENT_DB_HOST,
+            port=self.INVESTMENT_DB_PORT,
+            database=self.INVESTMENT_DB_NAME,
+        ).render_as_string(hide_password=False)
+
+    @property
+    def investment_connect_args(self) -> dict:
+        """Asyncpg connect args for the investment DB — TLS handling.
+
+        ``require``/``prefer``/``allow`` → encrypt but DON'T verify the cert
+        chain (libpq ``sslmode=require`` semantics) via an unverified SSL
+        context, so we don't need to ship the Amazon RDS CA bundle to connect.
+        ``verify-ca``/``verify-full`` → strict verification (``ssl=True``);
+        point ``INVESTMENT_DB_SSL_MODE`` there once the RDS global-bundle.pem is
+        installed in the trust store. ``disable`` → plaintext."""
+        mode = self.INVESTMENT_DB_SSL_MODE
+        if mode == "disable":
+            return {"ssl": False}
+        if mode in ("verify-ca", "verify-full"):
+            return {"ssl": True}
+        # require / prefer / allow — encrypt without chain verification
+        import ssl
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return {"ssl": ctx}
 
     @property
     def db_connect_args(self) -> dict:
