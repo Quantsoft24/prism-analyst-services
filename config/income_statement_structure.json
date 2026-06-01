@@ -1,0 +1,86 @@
+[
+  {
+    "key": "revenue",
+    "label": "Revenue",
+    "type": "input",
+    "variable": "Revenue",
+    "sign": null,
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "expenses",
+    "label": "Expenses",
+    "type": "input",
+    "variable": "Expense",
+    "sign": "minus",
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "operating_profit",
+    "label": "Operating Profit",
+    "type": "computed",
+    "variable": null,
+    "sign": null,
+    "formula": [["+", "revenue"], ["-", "expenses"]],
+    "emphasis": true,
+    "info": "Operating Profit = Revenue − Expenses. Profit from core operations, before other income, interest, depreciation and tax."
+  },
+  {
+    "key": "other_income",
+    "label": "Other Income",
+    "type": "input",
+    "variable": "other_income",
+    "sign": "plus",
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "interest",
+    "label": "Interest",
+    "type": "input",
+    "variable": "Interest",
+    "sign": "minus",
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "depreciation",
+    "label": "Depreciation & Amortisation",
+    "type": "input",
+    "variable": "Depreciation / Amortisation (net of transfer from revaluation reserves)",
+    "sign": "minus",
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "pbt",
+    "label": "Profit Before Tax (PBT)",
+    "type": "computed",
+    "variable": null,
+    "sign": null,
+    "formula": [["+", "operating_profit"], ["+", "other_income"], ["-", "interest"], ["-", "depreciation"]],
+    "emphasis": true,
+    "info": "PBT = Operating Profit + Other Income − Interest − Depreciation. Total profit before income tax."
+  },
+  {
+    "key": "tax",
+    "label": "Tax",
+    "type": "input",
+    "variable": "Provision for direct tax",
+    "sign": "minus",
+    "emphasis": false,
+    "info": null
+  },
+  {
+    "key": "pat",
+    "label": "Profit After Tax (PAT)",
+    "type": "computed",
+    "variable": null,
+    "sign": null,
+    "formula": [["+", "pbt"], ["-", "tax"]],
+    "emphasis": true,
+    "info": "PAT = PBT − Tax. The company's net profit — the bottom line."
+  }
+]
