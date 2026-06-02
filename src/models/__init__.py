@@ -11,6 +11,11 @@ from src.models.base import Base
 from src.models.catalog import CompanyIndustry  # noqa: F401
 from src.models.firm import Firm
 from src.models.integration import FirmIntegration
+from src.models.portfolio import (
+    PortfolioBacktest,
+    PortfolioCustomFactor,
+    PortfolioStrategy,
+)
 from src.models.user import FirmMembership, User
 
 __all__ = [
@@ -20,5 +25,8 @@ __all__ = [
     "FirmMembership",
     "AgentRun",
     "FirmIntegration",
+    "PortfolioBacktest",
+    "PortfolioCustomFactor",
+    "PortfolioStrategy",
     "CompanyIndustry",
 ]
