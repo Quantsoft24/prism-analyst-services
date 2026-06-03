@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -72,6 +73,15 @@ class JobRepository:
             .limit(limit)
         )
         return list((await self.session.execute(stmt)).scalars().all())
+
+    async def delete(self, firm_id: str, job_id: uuid.UUID) -> bool:
+        """Delete a firm's backtest job. Returns False if it didn't exist."""
+        res = await self.session.execute(
+            sa_delete(PortfolioBacktest).where(
+                PortfolioBacktest.id == job_id, PortfolioBacktest.firm_id == firm_id
+            )
+        )
+        return (res.rowcount or 0) > 0
 
     # ── Worker-side (own session; commits internally) ────────────────────────
 

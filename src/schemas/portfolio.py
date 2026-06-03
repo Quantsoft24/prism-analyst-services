@@ -33,6 +33,16 @@ class FactorMetaRead(BaseModel):
     decimals: int
 
 
+class IndexSeriesResponse(BaseModel):
+    """A benchmark index's cumulative NAV (growth of ₹1) over a window — used to
+    overlay/switch the benchmark on the backtest NAV chart without a re-run."""
+
+    index_id: int
+    index_name: str | None = None
+    dates: list[str]
+    nav: list[float]
+
+
 # ── Custom factors ───────────────────────────────────────────────────────────
 class CustomFactorSpec(BaseModel):
     """A user-composed factor, referenced by ``id`` in filters/weighting/display.

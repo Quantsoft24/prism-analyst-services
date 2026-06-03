@@ -361,3 +361,83 @@ class PortfolioRepository:
                 (r.trade_date, float(r.close) if r.close is not None else None)
             )
         return out
+
+    # ── Bulk preload (one query each) for the batched backtest ───────────────
+
+    async def index_snapshots(self, index_id: int) -> list[tuple[date, list[int]]]:
+        """All dated membership snapshots for an index, ascending —
+        ``[(date, [security_id, …]), …]``. The batched backtest resolves
+        point-in-time membership for each rebalance from this in memory."""
+        rows = await self.session.execute(
+            text(
+                "SELECT date, array_agg(security_id) AS sids FROM index_constituent "
+                "WHERE index_id = :iid GROUP BY date ORDER BY date ASC"
+            ),
+            {"iid": index_id},
+        )
+        return [(r.date, list(r.sids)) for r in rows]
+
+    async def bulk_prices(
+        self, security_ids: list[int], start: date, end: date
+    ) -> dict[int, list[tuple[date, float | None, float | None, float | None]]]:
+        """One-shot price panel for the whole backtest span —
+        ``{security_id: [(trade_date, close, market_cap, trade_value), …]}``
+        ascending. Drives returns + point-in-time market cap + momentum / vol /
+        ADV without per-rebalance round-trips."""
+        if not security_ids:
+            return {}
+        rows = await self.session.execute(
+            text(
+                "SELECT security_id, trade_date, close, market_cap, trade_value "
+                "FROM prices_and_securities "
+                "WHERE security_id IN :sids AND trade_date BETWEEN :start AND :end "
+                "ORDER BY security_id, trade_date ASC"
+            ).bindparams(bindparam("sids", expanding=True)),
+            {"sids": security_ids, "start": start, "end": end},
+        )
+        out: dict[int, list[tuple[date, float | None, float | None, float | None]]] = {}
+        for r in rows:
+            out.setdefault(r.security_id, []).append(
+                (
+                    r.trade_date,
+                    float(r.close) if r.close is not None else None,
+                    float(r.market_cap) if r.market_cap is not None else None,
+                    float(r.trade_value) if r.trade_value is not None else None,
+                )
+            )
+        return out
+
+    async def bulk_annual(
+        self, security_ids: list[int], variables: list[str], max_period: str
+    ) -> dict[int, dict[str, dict[str, list[tuple[str, float]]]]]:
+        """One-shot annual panel — every value for these securities/variables (both
+        bases) up to ``max_period`` ('YYYY-MM'), ascending by period. The lag is
+        applied **per rebalance in memory** (so one query serves the whole run).
+        Returns ``{security_id: {basis: {variable: [(period, value), …]}}}``."""
+        if not security_ids or not variables:
+            return {}
+        rows = await self.session.execute(
+            text(
+                """
+                SELECT security_id, data_type, variable, date, value
+                FROM annual_data
+                WHERE security_id IN :sids
+                  AND data_type IN :bases
+                  AND variable IN :vars
+                  AND value IS NOT NULL
+                  AND date <= :max_period
+                ORDER BY security_id, data_type, variable, date ASC
+                """
+            ).bindparams(
+                bindparam("sids", expanding=True),
+                bindparam("bases", expanding=True),
+                bindparam("vars", expanding=True),
+            ),
+            {"sids": security_ids, "bases": list(BASES), "vars": variables, "max_period": max_period},
+        )
+        out: dict[int, dict[str, dict[str, list[tuple[str, float]]]]] = {}
+        for r in rows:
+            out.setdefault(r.security_id, {}).setdefault(r.data_type, {}).setdefault(
+                r.variable, []
+            ).append((r.date, float(r.value)))
+        return out

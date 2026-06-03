@@ -15,10 +15,11 @@ routes 503 — the rest of the app is unaffected.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.auth import get_current_firm_id
@@ -48,6 +49,7 @@ from src.schemas.portfolio import (
     FactorMetaRead,
     FactorPreviewRequest,
     FactorPreviewResponse,
+    IndexSeriesResponse,
     ScreenRequest,
     ScreenResponse,
     StrategyCreate,
@@ -144,6 +146,40 @@ async def list_backtests(
 ) -> list[BacktestJobRead]:
     jobs = await JobRepository(session).list_for_firm(firm_id)
     return [_job_read(j, include_result=False) for j in jobs]
+
+
+@router.delete("/backtest/{job_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Delete a backtest")
+async def delete_backtest(
+    job_id: UUID,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> None:
+    if not await JobRepository(session).delete(firm_id, job_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Backtest not found.")
+
+
+@router.get("/index-series", response_model=IndexSeriesResponse, summary="Benchmark index NAV series")
+async def index_series(
+    session: Annotated[AsyncSession, Depends(get_investment_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    index_id: Annotated[int, Query(description="indices_list.index_id")],
+    start: Annotated[date, Query()],
+    end: Annotated[date, Query()],
+) -> IndexSeriesResponse:
+    """Cumulative NAV (growth of ₹1) for an index — lets the NAV chart switch the
+    benchmark to any universe without re-running the backtest."""
+    repo = PortfolioRepository(session)
+    series = await repo.benchmark_series(index_id, start, end)
+    dates: list[str] = []
+    nav: list[float] = []
+    cum = 1.0
+    for i, (d, r) in enumerate(series):
+        if i > 0:
+            cum *= 1.0 + (r or 0.0)
+        dates.append(d.isoformat())
+        nav.append(cum)
+    name = next((u.index_name for u in await repo.list_universes() if u.index_id == index_id), None)
+    return IndexSeriesResponse(index_id=index_id, index_name=name, dates=dates, nav=nav)
 
 
 # ── Factor Builder: live preview ─────────────────────────────────────────────

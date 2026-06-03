@@ -68,16 +68,40 @@ whitelisted tables on the investment RDS (verified live, read-only).
   metrics/rebalances incl. holdings) rather than a separate holdings table — a
   simplification; revisit if per-holding querying is needed.
 
-## Known limitations / deferred
-- **Attribution tab** ships **sector exposure** (portfolio sector weights at the
-  latest rebalance). Full benchmark-relative **factor attribution + sector drift
-  vs the benchmark** is deferred (needs benchmark constituent weights per date).
-- **Performance:** the per-rebalance screen loop is sequential over the RDS;
-  fine on the prod worker (near the DB), but **batching factor computation across
-  rebalances** is the headline optimization for the largest runs.
-- **Custom factor "backtest this factor"** uses the live preview + inline custom
-  factors in backtests; expressions are restricted to base factor ids + arithmetic
-  (safe `ast` evaluator, no `eval`).
+## Performance + attribution (implemented 2026-06-04)
+- **Batched backtest engine** (`backtest_data.py`): the run preloads membership,
+  prices (close/mcap/trade_value), and the annual panel in **a handful of bulk
+  queries**, then rebuilds the point-in-time factor matrix per rebalance entirely
+  **in memory** (`factor_matrix_inmem`, same math as `factors.compute`). Measured
+  ~**13× faster** (a 3-rebalance Nifty-50 run went 250s → ~19s) with identical
+  numbers; a 26-rebalance Nifty-200 run completes in ~53s.
+- **Benchmark-relative attribution** (`_attribution`): **sector active weights**
+  (portfolio − cap-weighted-universe benchmark), **factor tilts** (portfolio
+  weighted-avg z-score vs the universe), and **top/bottom return contributors**
+  (Σ weight × period-return). Surfaced in the Attribution tab. The benchmark for
+  sector weights is the chosen index's constituents cap-weighted (per-constituent
+  official index weights aren't in the schema — documented approximation).
+- **Custom factor "backtest this factor"** uses inline custom factors in
+  screens/backtests; expressions are base factor ids + arithmetic only (safe
+  `ast` evaluator, no `eval`).
+
+## Backtest-detail depth (implemented 2026-06-04, round 2)
+- **Switchable benchmark without a re-run.** `GET /portfolio/index-series`
+  returns any index's cumulative NAV (growth of ₹1) over a window; the NAV chart
+  re-bases it onto the result's date axis and recomputes benchmark metrics
+  client-side, so comparing the same book against Nifty 50 / 200 / 500 is instant
+  (no new job). The default benchmark stays the run's own `benchmark_index_id`.
+- **Always-on style exposure.** Attribution now reports `style_tilts` — the
+  portfolio's weighted-avg z-score (vs the universe) on one representative factor
+  per classic style: **Value** (earnings yield), **Quality** (ROE), **Growth**
+  (3Y revenue CAGR), **Momentum** (12M return), **Size** (market cap), **Low
+  Volatility** (−1×vol), signed so "+" always means *more of that style*. The
+  style factors are added to the **preload** set (variables only) and computed
+  once at the last rebalance, so the per-rebalance screen — and therefore the NAV
+  — is unchanged (identical numbers; the ~13× batched speed stands). Sector
+  exposure surfaces **absolute portfolio + benchmark weights** alongside active.
+- **Delete a backtest.** `DELETE /portfolio/backtest/{id}` (firm-scoped) backs
+  the Backtests-list trash action.
 
 ## Secrets
 - DB credentials come from env only (`.env`, gitignored; `.env.example` documents

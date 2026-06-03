@@ -93,5 +93,32 @@ def result_to_dict(res: BacktestResult) -> dict:
             }
             for r in res.rebalances
         ],
+        "attribution": (
+            {
+                "as_of": res.attribution.as_of.isoformat(),
+                "sector_active": [
+                    {"sector": s.sector, "portfolio": s.portfolio, "benchmark": s.benchmark, "active": s.active}
+                    for s in res.attribution.sector_active
+                ],
+                "factor_tilts": [
+                    {"factor_id": t.factor_id, "exposure": t.exposure}
+                    for t in res.attribution.factor_tilts
+                ],
+                "style_tilts": [
+                    {"factor_id": t.factor_id, "exposure": t.exposure}
+                    for t in res.attribution.style_tilts
+                ],
+                "top_contributors": [
+                    {"security_id": c.security_id, "symbol": c.symbol, "contribution": c.contribution}
+                    for c in res.attribution.top_contributors
+                ],
+                "bottom_contributors": [
+                    {"security_id": c.security_id, "symbol": c.symbol, "contribution": c.contribution}
+                    for c in res.attribution.bottom_contributors
+                ],
+            }
+            if res.attribution
+            else None
+        ),
         "notes": res.notes,
     }
