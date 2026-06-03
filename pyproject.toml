@@ -32,6 +32,10 @@ dependencies = [
     # repositories/company_repo.py as the Python-side fallback until pg_trgm
     # is enabled on the shared catalog DB (see docs/CATALOG_DB_INDEXES.md).
     "rapidfuzz>=3.10",
+    # numpy powers the vectorized backtest engine (src/portfolio/backtest.py) —
+    # price-matrix returns + NAV/drawdown math for the Systematic Portfolio
+    # Builder. Re-added 2026-05-31 (was dropped with the RAG stack below).
+    "numpy>=2.1.0",
     # RAG stack retired with the read-on-demand cutover (2026-05-24):
     #   fsspec / numpy / pdfplumber / tiktoken — removed.
     # BMC export and BMC-specific renderers also retired — the external bmc
