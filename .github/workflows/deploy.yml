@@ -72,6 +72,14 @@ jobs:
               exit 1
             fi
 
+            echo "🛠  Starting / refreshing the backtest worker..."
+            # Reuses the freshly built `prism-backend:latest` image (different
+            # entrypoint), so no extra build. Started AFTER migrations so the
+            # pb_* tables exist before it claims any job. Without this, submitted
+            # backtests stay `queued` forever.
+            docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml up -d worker
+            echo "✅ Worker up — $(docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml ps worker --format '{{.Status}}' 2>/dev/null | tail -1)"
+
             echo "🧹 Cleaning old images..."
             docker image prune -f
 
