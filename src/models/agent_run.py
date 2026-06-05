@@ -13,8 +13,9 @@ Tenant-scoped via ``firm_id``. Append-only (no deletes) — soft delete only.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKey, Numeric, String, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -60,6 +61,11 @@ class AgentRun(UUIDPKMixin, TimestampMixin, Base):
         Numeric(10, 6), default=0, server_default="0", nullable=False
     )
     latency_ms: Mapped[int | None] = mapped_column()
+
+    # Soft-delete: set when a user hides this conversation. The audit row is
+    # PRESERVED (cost/tokens/trace intact); it's just excluded from the user's
+    # conversation history. Never hard-deleted — append-only for compliance.
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     def __repr__(self) -> str:
         return f"<AgentRun id={self.id} agent={self.agent_name!r} status={self.status!r}>"
