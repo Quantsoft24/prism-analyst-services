@@ -282,3 +282,13 @@ class ConversationTitleUpdate(BaseModel):
     """PATCH body to rename a conversation."""
 
     title: str = Field(min_length=1, max_length=200)
+
+
+class QuotaRead(BaseModel):
+    """Today's message quota for the caller (guest or signed-in)."""
+
+    limit: int
+    used: int
+    remaining: int
+    is_anonymous: bool
+    enabled: bool

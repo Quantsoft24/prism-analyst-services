@@ -36,6 +36,11 @@ class AgentRun(UUIDPKMixin, TimestampMixin, Base):
     # ADK session — multiple agent_runs may share a session_id (multi-turn chat).
     session_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
 
+    # Per-guest identifier for anonymous (not-signed-in) runs — a client id
+    # (or IP fallback). Used only to enforce the guest daily message cap; signed
+    # -in runs identify by user_id and leave this null.
+    client_key: Mapped[str | None] = mapped_column(String(128), index=True)
+
     # Which agent ran. Free-form string for now ("company_intel", "bmc_orchestrator", ...).
     agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
 

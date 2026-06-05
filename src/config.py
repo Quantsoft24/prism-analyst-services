@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     SUPABASE_JWT_AUD: str = "authenticated"  # Supabase default audience claim
     # Where the configurable gating matrix lives (see src/auth/policy.py).
     ACCESS_POLICY_PATH: str = "config/access_policy.yml"
+    # Daily message caps per tier (see src/services/rate_limit.py).
+    RATE_LIMITS_PATH: str = "config/rate_limits.yml"
 
     # ── Agent runtime (Google ADK) ──
     # Provider: "ai_studio" (free key from aistudio.google.com) or "vertex"
@@ -150,6 +152,20 @@ class Settings(BaseSettings):
     # the wrong local service. Set PRISM_NEWS_URL to the real GCP host in .env.
     PRISM_NEWS_URL: str = "http://localhost:8014"
     PRISM_NEWS_API_KEY: str = ""
+
+    # ── Prism Filings (external corporate-filings / announcements service) ──
+    # Teammate-built FastAPI service (aaaddditya/Prism_filing_news, prod
+    # `http://35.234.221.166:8002`) aggregating 32 official Indian regulator/
+    # exchange RSS feeds (RBI/SEBI/BSE/NSE/PIB) into a single /filings query.
+    # Each filing is auto-tagged with company/sector/industry/scrip_code, so we
+    # can scope the Stock Dashboard's Announcements pane to the selected company.
+    # The frontend talks through PRISM's own /api/v1/stocks/announcements proxy
+    # (one CORS/mixed-content surface), mirroring the /reports → stock-chat path.
+    # Endpoint is open today (no caller auth) — must stay network-restricted.
+    #
+    # Default :8002 mirrors the upstream's external port for a same-host dev run;
+    # set PRISM_FILINGS_URL to the real GCP host in .env for prod.
+    PRISM_FILINGS_URL: str = "http://localhost:8002"
 
     # RAG / pdf-parsing / chunking settings retired with the read-on-demand
     # cutover (2026-05-24) — PRISM no longer maintains its own embedding/chunk

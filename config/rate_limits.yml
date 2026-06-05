@@ -1,0 +1,20 @@
+# Daily message caps (per UTC calendar day). Loaded at startup — tweak the
+# numbers here and restart to change limits. No code change needed.
+#
+#   guest_daily        → cap for anonymous (not-signed-in) users
+#   default_signed_in  → cap for a signed-in user whose firm tier isn't listed
+#   tiers.<name>       → cap per subscription tier (Firm.subscription_tier)
+#
+# Set enabled: false to turn the limiter off entirely.
+
+enabled: true
+
+guest_daily: 1
+
+default_signed_in: 50
+
+tiers:
+  free: 50
+  pilot: 200
+  pro: 1000
+  enterprise: 100000
