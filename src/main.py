@@ -35,6 +35,7 @@ from src.routers import (
     chat_router,
     companies_router,
     integrations_router,
+    me_router,
     news_router,
     portfolio_router,
     router_health_router,
@@ -76,10 +77,50 @@ def _configure_adk_env() -> None:
     os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 
+def _configure_auth() -> None:
+    """Install the token verifier when real auth is enabled.
+
+    Provider = Supabase (final_docs/12). Supabase's current signing key is
+    asymmetric (ECC P-256), so we verify via the project JWKS — derived from
+    ``SUPABASE_URL`` unless ``SUPABASE_JWKS_URL`` overrides it. ``SUPABASE_JWT_
+    SECRET`` is an optional HS256 fallback. If neither is configured while
+    ``AUTH_ENABLED`` is set, the verifier stays unset and
+    ``get_current_principal`` fails closed (501).
+    """
+    if not settings.AUTH_ENABLED:
+        return
+    from src.auth import SupabaseVerifier, set_verifier
+
+    jwks_url = settings.SUPABASE_JWKS_URL or (
+        f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json"
+        if settings.SUPABASE_URL
+        else ""
+    )
+    if jwks_url or settings.SUPABASE_JWT_SECRET:
+        set_verifier(
+            SupabaseVerifier(
+                jwks_url=jwks_url or None,
+                jwt_secret=settings.SUPABASE_JWT_SECRET or None,
+                audience=settings.SUPABASE_JWT_AUD,
+            )
+        )
+        logger.info(
+            "Auth enabled — Supabase verifier installed (jwks=%s, hs256_fallback=%s).",
+            bool(jwks_url),
+            bool(settings.SUPABASE_JWT_SECRET),
+        )
+    else:
+        logger.error(
+            "AUTH_ENABLED=true but neither SUPABASE_URL nor SUPABASE_JWT_SECRET "
+            "is set — auth will fail closed."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize DB pools + ModelRouter on startup; dispose cleanly on shutdown."""
     _configure_adk_env()
+    _configure_auth()
     init_engine()
 
     # Secondary read-only engine for the catalog DB (stock_chat Postgres) —
@@ -186,6 +227,7 @@ app.include_router(news_router, prefix=settings.API_PREFIX)
 app.include_router(stocks_router, prefix=settings.API_PREFIX)
 app.include_router(portfolio_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
+app.include_router(me_router, prefix=settings.API_PREFIX)
 # Debug router — actual access is gated inside the handler (404 in prod).
 # We mount unconditionally so the route table is consistent.
 app.include_router(router_health_router, prefix=settings.API_PREFIX)

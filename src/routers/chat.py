@@ -27,19 +27,55 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 
 from src.agents import build_company_intel_agent
-from src.core.auth import get_current_firm_id
+from src.auth.principal import Principal, get_current_principal
 from src.core.database import get_session
 from src.integrations.firm_state import enabled_integration_names
-from src.schemas.chat import ChatRunRequest
+from src.models.firm import Firm
+from src.repositories.conversation_repo import ConversationRepository
+from src.schemas.chat import (
+    ChatRunRequest,
+    ConversationDetail,
+    ConversationSummary,
+    ConversationTitleUpdate,
+    ConversationTurn,
+    QuotaRead,
+)
+from src.services import rate_limit
 from src.services.agent_runner import AgentRunner, ChatEvent
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["Chat"])
+
+
+async def _quota_state(
+    session: AsyncSession, principal: Principal, request: Request
+) -> tuple[int, int, str | None]:
+    """Resolve (messages used today, daily limit, guest_key) for the caller.
+
+    Anonymous callers are identified by the ``X-Guest-Id`` header (a per-browser
+    id) falling back to the client IP; signed-in callers by their tier.
+    """
+    guest_key: str | None = None
+    tier: str | None = None
+    if principal.is_anonymous:
+        guest_key = request.headers.get("X-Guest-Id") or (
+            request.client.host if request.client else None
+        )
+    else:
+        tier = await session.scalar(
+            select(Firm.subscription_tier).where(Firm.slug == principal.firm_id)
+        )
+    limit = rate_limit.cap_for(is_anonymous=principal.is_anonymous, tier=tier)
+    used = await rate_limit.used_today(
+        session, user_id=principal.user_id, client_key=guest_key
+    )
+    return used, limit, guest_key
 
 
 @router.post(
@@ -68,9 +104,23 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 )
 async def run_agent(
     body: ChatRunRequest,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> EventSourceResponse:
+    firm_id = principal.firm_id
+
+    # Daily message cap (configurable per tier — config/rate_limits.yml).
+    used, limit, guest_key = await _quota_state(session, principal, request)
+    if rate_limit.is_enabled() and used >= limit:
+        detail = (
+            f"You've reached the guest limit of {limit} messages for today. "
+            "Sign in to keep going."
+            if principal.is_anonymous
+            else f"You've reached your daily limit of {limit} messages. It resets tomorrow."
+        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=detail)
+
     # Resolve the agent. Only one is registered in Slice 3 — but the
     # Literal on ``body.agent`` constrains valid values at the Pydantic layer.
     if body.agent == "company_intel":
@@ -83,6 +133,8 @@ async def run_agent(
     runner = AgentRunner(
         agent=agent,
         firm_id=firm_id,
+        user_id=principal.user_id,  # attributes the agent_runs row to the user
+        client_key=guest_key,  # identifies anonymous callers for the daily cap
         session_id=body.session_id,
     )
 
@@ -94,6 +146,105 @@ async def run_agent(
     # and connection lifecycle. We hand it an async generator of dicts where
     # each dict has the keys ``event`` (SSE event name) and ``data`` (string).
     return EventSourceResponse(event_stream())
+
+
+@router.get(
+    "/conversations",
+    response_model=list[ConversationSummary],
+    summary="List the current user's recent conversations",
+)
+async def list_conversations(
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+    limit: int = Query(30, ge=1, le=100),
+) -> list[ConversationSummary]:
+    rows = await ConversationRepository(session).list_conversations(
+        firm_id=principal.firm_id, user_id=principal.user_id, limit=limit
+    )
+    return [ConversationSummary(**r) for r in rows]
+
+
+@router.get(
+    "/conversations/{session_id}",
+    response_model=ConversationDetail,
+    summary="Replay one conversation (its ordered turns)",
+)
+async def get_conversation(
+    session_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> ConversationDetail:
+    runs = await ConversationRepository(session).get_conversation(
+        session_id=session_id, firm_id=principal.firm_id, user_id=principal.user_id
+    )
+    if not runs:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    turns = [
+        ConversationTurn(
+            agent_run_id=r.id,
+            user_input=r.user_input,
+            final_answer=r.final_answer,
+            status=r.status,
+            created_at=r.created_at,
+            tool_trace=r.tool_trace,
+        )
+        for r in runs
+    ]
+    return ConversationDetail(session_id=session_id, turns=turns)
+
+
+@router.patch(
+    "/conversations/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Rename a conversation",
+)
+async def rename_conversation(
+    session_id: str,
+    body: ConversationTitleUpdate,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> None:
+    ok = await ConversationRepository(session).set_title(
+        session_id=session_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        title=body.title.strip(),
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+
+@router.delete(
+    "/conversations/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Hide a conversation from the user's history (soft delete)",
+)
+async def delete_conversation(
+    session_id: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> None:
+    hidden = await ConversationRepository(session).hide_conversation(
+        session_id=session_id, firm_id=principal.firm_id, user_id=principal.user_id
+    )
+    if hidden == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+
+@router.get("/quota", response_model=QuotaRead, summary="Today's message quota for the caller")
+async def read_quota(
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> QuotaRead:
+    used, limit, _ = await _quota_state(session, principal, request)
+    return QuotaRead(
+        limit=limit,
+        used=used,
+        remaining=max(0, limit - used),
+        is_anonymous=principal.is_anonymous,
+        enabled=rate_limit.is_enabled(),
+    )
 
 
 def _serialize_event(event: ChatEvent) -> dict[str, str]:

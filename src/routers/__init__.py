@@ -10,6 +10,7 @@ from src.routers.bmc import router as bmc_router
 from src.routers.chat import router as chat_router
 from src.routers.companies import router as companies_router
 from src.routers.integrations import router as integrations_router
+from src.routers.me import router as me_router
 from src.routers.news import router as news_router
 from src.routers.portfolio import router as portfolio_router
 from src.routers.router_health import router as router_health_router
@@ -22,6 +23,7 @@ __all__ = [
     "news_router",
     "portfolio_router",
     "integrations_router",
+    "me_router",
     "router_health_router",
     "stocks_router",
 ]

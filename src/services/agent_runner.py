@@ -104,10 +104,12 @@ class AgentRunner:
         firm_id: str,
         user_id: uuid.UUID | None = None,
         session_id: str | None = None,
+        client_key: str | None = None,
     ) -> None:
         self._agent = agent
         self._firm_id = firm_id
         self._user_id = user_id
+        self._client_key = client_key
         # ADK session_id is opaque — generate one if the caller didn't pass one.
         self._session_id = session_id or f"sess_{uuid.uuid4().hex[:16]}"
         self._agent_run_id: uuid.UUID | None = None
@@ -611,6 +613,7 @@ class AgentRunner:
             run = AgentRun(
                 firm_id=self._firm_id,
                 user_id=self._user_id,
+                client_key=self._client_key,
                 session_id=self._session_id,
                 agent_name=self._agent.name,
                 user_input=user_message,
