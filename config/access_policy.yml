@@ -1,0 +1,24 @@
+# Access policy — the single source of truth for what each feature requires.
+#
+# Levels:
+#   anonymous       — open to everyone (signed in or not)
+#   authenticated   — requires a signed-in user
+#   entitlement:<k> — requires a billing entitlement (enforced in P4)
+#
+# `default` applies to any feature key not listed under `features`.
+#
+# ⚠️  DEV DEFAULT = anonymous (everything open), per the team's decision.
+#     BEFORE enabling AUTH_ENABLED in PRODUCTION, set the real gating matrix
+#     here with the team (see final_docs/12_AUTH_USER_PROFILES_BILLING.md §8).
+#     Example of what a locked-down matrix might look like:
+#
+#       default: anonymous
+#       features:
+#         profile.read:   authenticated
+#         profile.write:  authenticated
+#         chat.run:       authenticated
+#         portfolio.save: authenticated
+#         reports.export: entitlement:reports
+
+default: anonymous
+features: {}

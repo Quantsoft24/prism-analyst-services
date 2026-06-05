@@ -36,6 +36,10 @@ dependencies = [
     # price-matrix returns + NAV/drawdown math for the Systematic Portfolio
     # Builder. Re-added 2026-05-31 (was dropped with the RAG stack below).
     "numpy>=2.1.0",
+    # PyJWT verifies the Supabase access-token JWT in src/auth/verifier.py.
+    # [crypto] pulls `cryptography` for ES256/RS256 — Supabase's current signing
+    # key is ECC P-256 (asymmetric, verified via JWKS); HS256 stays as fallback.
+    "pyjwt[crypto]>=2.9.0",
     # RAG stack retired with the read-on-demand cutover (2026-05-24):
     #   fsspec / numpy / pdfplumber / tiktoken — removed.
     # BMC export and BMC-specific renderers also retired — the external bmc

@@ -9,6 +9,7 @@ into an existing one.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -245,3 +246,49 @@ class ErrorEvent(BaseModel):
     message: str
     retriable: bool = False
     agent_run_id: uuid.UUID | None = None
+
+
+# ── Conversation history (derived from agent_runs by session_id) ───────────
+
+
+class ConversationSummary(BaseModel):
+    """One row in the user's conversation list (sidebar / history)."""
+
+    session_id: str
+    title: str  # first user message, truncated
+    turns: int
+    last_activity: datetime
+    preview: str = ""  # latest answer, truncated
+    agent_name: str | None = None
+
+
+class ConversationTurn(BaseModel):
+    """One turn (one agent_run) inside a conversation, for replay."""
+
+    agent_run_id: uuid.UUID
+    user_input: str
+    final_answer: str | None = None
+    status: str
+    created_at: datetime
+    tool_trace: list[dict[str, Any]] | None = None
+
+
+class ConversationDetail(BaseModel):
+    session_id: str
+    turns: list[ConversationTurn] = Field(default_factory=list)
+
+
+class ConversationTitleUpdate(BaseModel):
+    """PATCH body to rename a conversation."""
+
+    title: str = Field(min_length=1, max_length=200)
+
+
+class QuotaRead(BaseModel):
+    """Today's message quota for the caller (guest or signed-in)."""
+
+    limit: int
+    used: int
+    remaining: int
+    is_anonymous: bool
+    enabled: bool

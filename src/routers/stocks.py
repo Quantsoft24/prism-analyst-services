@@ -14,6 +14,7 @@ If the investment DB isn't configured the dependency raises and these routes
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
 import httpx
@@ -117,6 +118,88 @@ async def list_reports(
     try:
         async with httpx.AsyncClient(timeout=_REPORTS_TIMEOUT) as client:
             resp = await client.post(url, json=body)
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Filings service unreachable: {exc}",
+        ) from exc
+    if resp.status_code >= 400:
+        try:
+            detail: Any = resp.json().get("detail", resp.text)
+        except Exception:  # noqa: BLE001
+            detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    try:
+        return resp.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Filings service returned a non-JSON response.",
+        ) from exc
+
+
+_FILINGS_TIMEOUT = 10.0
+# Strip the trailing legal-form suffix from a security_name before matching
+# prism-filings' EXACT-match ``company`` param — its canonical names usually
+# carry none ("HDFC Bank Ltd." misses; "HDFC Bank" hits). Deliberately narrow:
+# only ``Ltd/Limited/Pvt/Private`` (with an optional trailing dot), which is
+# safe to drop on Indian listed names. We do NOT strip Corp/Inc/LLP (real name
+# words → over-stripping) nor a trailing "-$" prowess artifact (sometimes part
+# of the upstream's actual tag, e.g. "Baba Arts Ltd-$").
+_CORP_SUFFIX_RE = re.compile(r"[\s,]*\b(?:ltd|limited|pvt|private)\b\.?\s*$", re.IGNORECASE)
+
+
+def _canonical_company(name: str) -> str:
+    """``"HDFC Bank Ltd."`` → ``"HDFC Bank"`` for prism-filings' exact match.
+
+    Iteratively strips a trailing ``Ltd/Limited/Pvt/Private`` (handles stacked
+    forms like ``"… Pvt. Ltd."``). Idempotent; safe on already-clean names.
+    """
+    prev = None
+    out = name.strip()
+    while out and out != prev:
+        prev = out
+        out = _CORP_SUFFIX_RE.sub("", out).strip()
+    return out or name.strip()
+
+
+@router.get(
+    "/announcements",
+    summary="A company's regulatory announcements (Announcements pane)",
+    description=(
+        "Thin proxy to the prism-filings service's /filings query, scoped to one "
+        "company. ``company`` (the dashboard's security_name) is normalised to "
+        "prism-filings' canonical name (its match is exact, suffix-sensitive). "
+        "Optional ``regulator`` (RBI/SEBI/BSE/NSE/PIB) and ``filing_type`` "
+        "(category) narrow the feed; ``hours`` is the lookback (≤ 720 = 30d). "
+        "Returns the upstream JSON ({success, query, meta, filings[]}). A company "
+        "with no tagged filings comes back 200 with an empty ``filings`` array."
+    ),
+)
+async def list_announcements(
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    company: Annotated[str, Query(min_length=1, description="Company name (security_name).")],
+    regulator: Annotated[str | None, Query(description="RBI|SEBI|BSE|NSE|PIB.")] = None,
+    filing_type: Annotated[str | None, Query(description="Filing category (exact).")] = None,
+    hours: Annotated[int, Query(ge=1, le=720)] = 720,
+    page: Annotated[int, Query(ge=1)] = 1,
+    limit: Annotated[int, Query(ge=1, le=100)] = 12,
+) -> Any:
+    _ = firm_id  # auth-gated only; the upstream is firm-agnostic
+    params: dict[str, Any] = {
+        "company": _canonical_company(company),
+        "hours": hours,
+        "page": page,
+        "limit": limit,
+    }
+    if regulator:
+        params["regulator"] = regulator
+    if filing_type:
+        params["filing_type"] = filing_type
+    url = f"{settings.PRISM_FILINGS_URL.rstrip('/')}/filings"
+    try:
+        async with httpx.AsyncClient(timeout=_FILINGS_TIMEOUT) as client:
+            resp = await client.get(url, params=params)
     except httpx.RequestError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

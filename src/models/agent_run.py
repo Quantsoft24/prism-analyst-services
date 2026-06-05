@@ -13,8 +13,9 @@ Tenant-scoped via ``firm_id``. Append-only (no deletes) — soft delete only.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
-from sqlalchemy import ForeignKey, Numeric, String, Text
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -34,6 +35,11 @@ class AgentRun(UUIDPKMixin, TimestampMixin, Base):
 
     # ADK session — multiple agent_runs may share a session_id (multi-turn chat).
     session_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    # Per-guest identifier for anonymous (not-signed-in) runs — a client id
+    # (or IP fallback). Used only to enforce the guest daily message cap; signed
+    # -in runs identify by user_id and leave this null.
+    client_key: Mapped[str | None] = mapped_column(String(128), index=True)
 
     # Which agent ran. Free-form string for now ("company_intel", "bmc_orchestrator", ...).
     agent_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
@@ -60,6 +66,11 @@ class AgentRun(UUIDPKMixin, TimestampMixin, Base):
         Numeric(10, 6), default=0, server_default="0", nullable=False
     )
     latency_ms: Mapped[int | None] = mapped_column()
+
+    # Soft-delete: set when a user hides this conversation. The audit row is
+    # PRESERVED (cost/tokens/trace intact); it's just excluded from the user's
+    # conversation history. Never hard-deleted — append-only for compliance.
+    hidden_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     def __repr__(self) -> str:
         return f"<AgentRun id={self.id} agent={self.agent_name!r} status={self.status!r}>"

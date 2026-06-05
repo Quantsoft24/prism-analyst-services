@@ -22,6 +22,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth.principal import Principal, get_current_principal
 from src.core.auth import get_current_firm_id
 from src.core.database import get_session
 from src.core.investment_database import get_investment_session
@@ -109,8 +110,9 @@ async def screen(
 async def submit_backtest(
     req: BacktestRequest,
     session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> BacktestJobRead:
+    firm_id = principal.firm_id
     if req.start >= req.end:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -123,7 +125,10 @@ async def submit_backtest(
     cached = await repo.find_cached(firm_id, sh)
     if cached is not None:
         return _job_read(cached)
-    job = await repo.create(firm_id=firm_id, name=req.name, spec=spec, strategy_hash=sh)
+    job = await repo.create(
+        firm_id=firm_id, name=req.name, spec=spec, strategy_hash=sh,
+        created_by=principal.user_id,
+    )
     return _job_read(job)            # the worker fills in progress/result
 
 
@@ -225,7 +230,7 @@ async def validate_custom_factor(
 async def create_custom_factor(
     req: CustomFactorCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> CustomFactorRead:
     try:
         validate_expression(req.expression, set(REGISTRY))
@@ -234,8 +239,9 @@ async def create_custom_factor(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
         ) from exc
     cf = await CustomFactorStore(session).create(
-        firm_id=firm_id, name=req.name, expression=req.expression,
+        firm_id=principal.firm_id, name=req.name, expression=req.expression,
         direction=req.direction, normalization=req.normalization,
+        created_by=principal.user_id,
     )
     return _cf_read(cf)
 
@@ -272,9 +278,12 @@ def _strategy_read(s: PortfolioStrategy) -> StrategyRead:
 async def create_strategy(
     req: StrategyCreate,
     session: Annotated[AsyncSession, Depends(get_session)],
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> StrategyRead:
-    s = await StrategyStore(session).create(firm_id=firm_id, name=req.name, config=req.config)
+    s = await StrategyStore(session).create(
+        firm_id=principal.firm_id, name=req.name, config=req.config,
+        created_by=principal.user_id,
+    )
     return _strategy_read(s)
 
 
