@@ -207,6 +207,22 @@ class Settings(BaseSettings):
     INVESTMENT_DB_PASSWORD: str = ""
     INVESTMENT_DB_SSL_MODE: str = "require"  # RDS requires TLS
 
+    # ── SEBI DB (READ-ONLY secondary engine — the ``sebi`` Postgres backing the
+    # Regulatory Lens feature). Single content table ``content`` (~40k rows of
+    # SEBI circulars/regulations/orders with an AI-enriched ``ai_tags`` JSON
+    # column) + ``weekly_summaries`` (digest) + ``insight_feed`` (AI signals).
+    # Owned externally and exposed via a read-only ``frontend`` role — NEVER
+    # write through this engine. Provide a full ``SEBI_DATABASE_URL`` OR the
+    # ``SEBI_DB_*`` parts. If unset, the Regulatory Lens endpoints 503 and the
+    # rest of the app is unaffected. Plain VM Postgres (not RDS) → no TLS.
+    SEBI_DATABASE_URL: str = ""
+    SEBI_DB_HOST: str = ""
+    SEBI_DB_PORT: int = 15432
+    SEBI_DB_NAME: str = "sebi"
+    SEBI_DB_USER: str = "frontend"
+    SEBI_DB_PASSWORD: str = ""
+    SEBI_DB_SSL_MODE: str = "disable"  # plain VM Postgres, no TLS
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     def _build_url(self, driver: str, strip_sslmode: bool) -> str:
@@ -326,6 +342,52 @@ class Settings(BaseSettings):
         if mode in ("verify-ca", "verify-full"):
             return {"ssl": True}
         # require / prefer / allow — encrypt without chain verification
+        import ssl
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return {"ssl": ctx}
+
+    @property
+    def async_sebi_database_url(self) -> str:
+        """Async URL for the read-only SEBI DB (``sebi`` Postgres).
+
+        Prefers ``SEBI_DATABASE_URL``; otherwise builds from the ``SEBI_DB_*``
+        parts via SQLAlchemy's ``URL.create`` (percent-encodes the password).
+        Returns "" if neither is configured (Regulatory Lens endpoints then
+        degrade gracefully). Normalizes the driver to asyncpg and strips
+        ``sslmode`` (SSL goes through ``sebi_connect_args``)."""
+        if self.SEBI_DATABASE_URL:
+            url = self.SEBI_DATABASE_URL
+            for prefix in ("postgresql://", "postgres://"):
+                if url.startswith(prefix):
+                    url = "postgresql+asyncpg://" + url[len(prefix):]
+                    break
+            return _strip_sslmode(url)
+        if not self.SEBI_DB_HOST:
+            return ""
+        from sqlalchemy.engine import URL
+
+        return URL.create(
+            "postgresql+asyncpg",
+            username=self.SEBI_DB_USER,
+            password=self.SEBI_DB_PASSWORD,
+            host=self.SEBI_DB_HOST,
+            port=self.SEBI_DB_PORT,
+            database=self.SEBI_DB_NAME,
+        ).render_as_string(hide_password=False)
+
+    @property
+    def sebi_connect_args(self) -> dict:
+        """Asyncpg connect args for the SEBI DB — TLS handling. Mirrors
+        ``investment_connect_args``. The SEBI VM Postgres serves plaintext, so
+        the default ``disable`` yields ``{"ssl": False}``."""
+        mode = self.SEBI_DB_SSL_MODE
+        if mode == "disable":
+            return {"ssl": False}
+        if mode in ("verify-ca", "verify-full"):
+            return {"ssl": True}
         import ssl
 
         ctx = ssl.create_default_context()

@@ -53,6 +53,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["Chat"])
 
 
+def _guest_key(principal: Principal, request: Request) -> str | None:
+    """Per-browser id for an anonymous caller — the ``X-Guest-Id`` header (set by
+    the client) with the client IP as a fallback. ``None`` for signed-in users.
+
+    Critical for isolation: all guests share the ``__anonymous__`` firm, so this
+    is the ONLY thing that separates one guest's conversations from another's.
+    """
+    if not principal.is_anonymous:
+        return None
+    return request.headers.get("X-Guest-Id") or (
+        request.client.host if request.client else None
+    )
+
+
 async def _quota_state(
     session: AsyncSession, principal: Principal, request: Request
 ) -> tuple[int, int, str | None]:
@@ -61,13 +75,9 @@ async def _quota_state(
     Anonymous callers are identified by the ``X-Guest-Id`` header (a per-browser
     id) falling back to the client IP; signed-in callers by their tier.
     """
-    guest_key: str | None = None
+    guest_key = _guest_key(principal, request)
     tier: str | None = None
-    if principal.is_anonymous:
-        guest_key = request.headers.get("X-Guest-Id") or (
-            request.client.host if request.client else None
-        )
-    else:
+    if not principal.is_anonymous:
         tier = await session.scalar(
             select(Firm.subscription_tier).where(Firm.slug == principal.firm_id)
         )
@@ -154,12 +164,16 @@ async def run_agent(
     summary="List the current user's recent conversations",
 )
 async def list_conversations(
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
     limit: int = Query(30, ge=1, le=100),
 ) -> list[ConversationSummary]:
     rows = await ConversationRepository(session).list_conversations(
-        firm_id=principal.firm_id, user_id=principal.user_id, limit=limit
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
+        limit=limit,
     )
     return [ConversationSummary(**r) for r in rows]
 
@@ -171,11 +185,15 @@ async def list_conversations(
 )
 async def get_conversation(
     session_id: str,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> ConversationDetail:
     runs = await ConversationRepository(session).get_conversation(
-        session_id=session_id, firm_id=principal.firm_id, user_id=principal.user_id
+        session_id=session_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
     )
     if not runs:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
@@ -201,6 +219,7 @@ async def get_conversation(
 async def rename_conversation(
     session_id: str,
     body: ConversationTitleUpdate,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> None:
@@ -208,6 +227,7 @@ async def rename_conversation(
         session_id=session_id,
         firm_id=principal.firm_id,
         user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
         title=body.title.strip(),
     )
     if not ok:
@@ -221,11 +241,15 @@ async def rename_conversation(
 )
 async def delete_conversation(
     session_id: str,
+    request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> None:
     hidden = await ConversationRepository(session).hide_conversation(
-        session_id=session_id, firm_id=principal.firm_id, user_id=principal.user_id
+        session_id=session_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
     )
     if hidden == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")

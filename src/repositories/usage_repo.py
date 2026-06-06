@@ -10,9 +10,10 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import false, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth.principal import ANONYMOUS_FIRM
 from src.models.agent_run import AgentRun
 
 
@@ -20,8 +21,16 @@ class UsageRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def summary(self, *, firm_id: str, user_id: uuid.UUID | None) -> dict[str, Any]:
-        scope = AgentRun.user_id == user_id if user_id is not None else AgentRun.firm_id == firm_id
+    async def summary(
+        self, *, firm_id: str, user_id: uuid.UUID | None, client_key: str | None = None
+    ) -> dict[str, Any]:
+        if user_id is not None:
+            scope = AgentRun.user_id == user_id
+        elif firm_id == ANONYMOUS_FIRM:
+            # Guests share the anonymous firm → isolate per browser via client_key.
+            scope = AgentRun.client_key == client_key if client_key else false()
+        else:
+            scope = AgentRun.firm_id == firm_id
 
         row = (
             await self._session.execute(
