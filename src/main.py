@@ -29,6 +29,11 @@ from src.core.investment_database import (
     init_investment_engine,
     is_investment_configured,
 )
+from src.core.sebi_database import (
+    dispose_sebi_engine,
+    init_sebi_engine,
+    is_sebi_configured,
+)
 from src.integrations import dispose_registry, init_registry
 from src.routers import (
     bmc_router,
@@ -38,6 +43,7 @@ from src.routers import (
     me_router,
     news_router,
     portfolio_router,
+    regulatory_router,
     router_health_router,
     stocks_router,
 )
@@ -145,6 +151,16 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Investment DB engine failed to initialize: %s", exc)
 
+    # Read-only engine for the SEBI DB — powers Regulatory Lens
+    # (/api/v1/regulatory/*). Skipped silently if not configured; a failure
+    # here logs + continues (the regulatory routes 503 if accessed).
+    if is_sebi_configured():
+        try:
+            init_sebi_engine()
+            logger.info("SEBI DB engine initialized (read-only).")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SEBI DB engine failed to initialize: %s", exc)
+
     # Build the ModelRouter if enabled — collects all GEMINI_API_KEY* values
     # from settings and hands them to the singleton. Disabling lets us run
     # without LLM access (e.g., CI runs of non-LLM endpoints).
@@ -172,6 +188,7 @@ async def lifespan(app: FastAPI):
     finally:
         dispose_registry()
         dispose_router()
+        await dispose_sebi_engine()
         await dispose_investment_engine()
         await dispose_catalog_engine()
         await dispose_engine()
@@ -225,6 +242,7 @@ app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
 app.include_router(news_router, prefix=settings.API_PREFIX)
 app.include_router(stocks_router, prefix=settings.API_PREFIX)
+app.include_router(regulatory_router, prefix=settings.API_PREFIX)
 app.include_router(portfolio_router, prefix=settings.API_PREFIX)
 app.include_router(integrations_router, prefix=settings.API_PREFIX)
 app.include_router(me_router, prefix=settings.API_PREFIX)

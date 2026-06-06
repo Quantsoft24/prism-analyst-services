@@ -101,6 +101,21 @@
   config:
     entrypoint: "src.integrations.tools.prism_news:PRISM_NEWS_TOOLS"
 
+- name: sebi-regulatory
+  source: python
+  enabled: true
+  description: >
+    SEBI regulatory intelligence (Regulatory Lens) — search circulars,
+    regulations, enforcement orders, master circulars, board outcomes and more
+    by topic/type/severity; list the most recent filings; surface upcoming
+    compliance deadlines; and pull one document's AI summary + impact tags
+    (intent, topics, stakeholders, severity, deadlines). Use for "what has SEBI
+    said about X", "latest SEBI circulars/orders", "compliance deadlines", or
+    regulatory-impact questions. Read-only over the SEBI corpus (~40k docs).
+  tags: [regulatory, compliance, sebi, research]
+  config:
+    entrypoint: "src.integrations.tools.sebi_regulatory:SEBI_REGULATORY_TOOLS"
+
 # ── Commented examples — copy/uncomment to add each type ─────────────────────
 #
 # OpenAPI service (auto-generate a tool per operation; tool_filter restricts):
