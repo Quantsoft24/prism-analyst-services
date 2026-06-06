@@ -9,7 +9,7 @@
 
 enabled: true
 
-guest_daily: 1
+guest_daily: 10
 
 default_signed_in: 50
 

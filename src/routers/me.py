@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.policy import require
@@ -77,10 +77,17 @@ async def update_preferences(
 
 @router.get("/usage", response_model=UsageSummary, summary="The user's aggregate usage")
 async def read_usage(
+    request: Request,
     principal: Annotated[Principal, Depends(get_current_principal)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> UsageSummary:
+    # Guests share the anonymous firm → isolate per browser by X-Guest-Id.
+    client_key = (
+        request.headers.get("X-Guest-Id") or (request.client.host if request.client else None)
+        if principal.is_anonymous
+        else None
+    )
     data = await UsageRepository(session).summary(
-        firm_id=principal.firm_id, user_id=principal.user_id
+        firm_id=principal.firm_id, user_id=principal.user_id, client_key=client_key
     )
     return UsageSummary(**data)

@@ -1,9 +1,14 @@
 """Read access for chat conversation history (derived from ``agent_runs``).
 
 MVP with no new table: a "conversation" is the set of ``agent_runs`` sharing a
-``session_id``. Scoped to the user (``user_id``) when authenticated, else to the
-firm (dev / pre-auth). Title = first user message; preview = latest answer.
-A dedicated ``conversations`` table (rename/pin/share) is a later phase.
+``session_id``. Scoping:
+  * signed-in  → by ``user_id`` (globally unique).
+  * guest      → all guests share the ``__anonymous__`` firm, so they MUST be
+                 isolated per browser via ``client_key`` (the X-Guest-Id sent by
+                 the client; never the shared firm). No client_key → match
+                 nothing (can't safely identify the guest).
+  * dev/no-auth→ by ``firm_id`` (the dev firm).
+Title = first user message; preview = latest answer.
 """
 
 from __future__ import annotations
@@ -12,10 +17,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import false, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth.principal import ANONYMOUS_FIRM
 from src.models.agent_run import AgentRun
 from src.models.chat_conversation import ChatConversation
 
@@ -27,14 +33,25 @@ class ConversationRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    def _scope(self, firm_id: str, user_id: uuid.UUID | None):
-        # user_id is globally unique → scope by it when present; else by firm.
-        return AgentRun.user_id == user_id if user_id is not None else AgentRun.firm_id == firm_id
+    def _scope(self, *, firm_id: str, user_id: uuid.UUID | None, client_key: str | None):
+        if user_id is not None:
+            return AgentRun.user_id == user_id
+        if firm_id == ANONYMOUS_FIRM:
+            # Guests share the anonymous firm → isolate per browser. Without a
+            # client_key we cannot identify the guest, so return NOTHING rather
+            # than leak every guest's history.
+            return AgentRun.client_key == client_key if client_key else false()
+        return AgentRun.firm_id == firm_id
 
     async def list_conversations(
-        self, *, firm_id: str, user_id: uuid.UUID | None, limit: int = 30
+        self,
+        *,
+        firm_id: str,
+        user_id: uuid.UUID | None,
+        client_key: str | None = None,
+        limit: int = 30,
     ) -> list[dict[str, Any]]:
-        scope = self._scope(firm_id, user_id)
+        scope = self._scope(firm_id=firm_id, user_id=user_id, client_key=client_key)
         visible = AgentRun.hidden_at.is_(None)  # exclude soft-deleted runs
 
         # 1) Most-recently-active sessions + turn counts.
@@ -101,9 +118,14 @@ class ConversationRepository:
         return out
 
     async def get_conversation(
-        self, *, session_id: str, firm_id: str, user_id: uuid.UUID | None
+        self,
+        *,
+        session_id: str,
+        firm_id: str,
+        user_id: uuid.UUID | None,
+        client_key: str | None = None,
     ) -> list[AgentRun]:
-        scope = self._scope(firm_id, user_id)
+        scope = self._scope(firm_id=firm_id, user_id=user_id, client_key=client_key)
         q = (
             select(AgentRun)
             .where(AgentRun.session_id == session_id)
@@ -113,11 +135,16 @@ class ConversationRepository:
         return list((await self._session.execute(q)).scalars().all())
 
     async def hide_conversation(
-        self, *, session_id: str, firm_id: str, user_id: uuid.UUID | None
+        self,
+        *,
+        session_id: str,
+        firm_id: str,
+        user_id: uuid.UUID | None,
+        client_key: str | None = None,
     ) -> int:
         """Soft-delete: mark every (still-visible) run in the session as hidden.
         The audit rows are preserved. Returns how many runs were hidden."""
-        scope = self._scope(firm_id, user_id)
+        scope = self._scope(firm_id=firm_id, user_id=user_id, client_key=client_key)
         stmt = (
             update(AgentRun)
             .where(AgentRun.session_id == session_id, scope, AgentRun.hidden_at.is_(None))
@@ -128,13 +155,22 @@ class ConversationRepository:
         return res.rowcount or 0
 
     async def set_title(
-        self, *, session_id: str, firm_id: str, user_id: uuid.UUID | None, title: str
+        self,
+        *,
+        session_id: str,
+        firm_id: str,
+        user_id: uuid.UUID | None,
+        title: str,
+        client_key: str | None = None,
     ) -> bool:
         """Rename a conversation (overlay). Returns False if the session isn't
         the caller's (no visible run in scope) — so users can't retitle others'."""
         owns = await self._session.scalar(
             select(AgentRun.id)
-            .where(AgentRun.session_id == session_id, self._scope(firm_id, user_id))
+            .where(
+                AgentRun.session_id == session_id,
+                self._scope(firm_id=firm_id, user_id=user_id, client_key=client_key),
+            )
             .limit(1)
         )
         if owns is None:
