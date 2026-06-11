@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import re
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -136,6 +138,68 @@ async def list_reports(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Filings service returned a non-JSON response.",
         ) from exc
+
+
+# ── Filing-PDF proxy (citation → exact-page deep link) ──────────────────────
+# BSE/NSE serve filing PDFs with CORS / X-Frame-Options that block embedding
+# them directly in our Workspace. We stream them through PRISM so the Report-tab
+# viewer can open `…/reports/pdf?url=<bse pdf>#page=N` same-origin. SSRF-guarded:
+# only the exchange hosts are allowed (the URL comes from stock-chat's catalog).
+_PDF_PROXY_TIMEOUT = 30.0
+_PDF_ALLOWED_HOSTS = ("bseindia.com", "nseindia.com")
+
+
+@router.get(
+    "/reports/pdf",
+    summary="Stream a filing PDF (embeddable, for the citation deep-link viewer)",
+)
+async def report_pdf(
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    url: Annotated[str, Query(min_length=8, description="BSE/NSE filing PDF URL.")],
+) -> StreamingResponse:
+    _ = firm_id  # auth-gated; the PDFs are public exchange filings
+    host = (urlparse(url).hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in _PDF_ALLOWED_HOSTS):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only BSE/NSE filing URLs can be proxied.",
+        )
+    client = httpx.AsyncClient(timeout=_PDF_PROXY_TIMEOUT, follow_redirects=True)
+    try:
+        req = client.build_request(
+            "GET", url, headers={"User-Agent": "Mozilla/5.0 (PRISM filings viewer)"}
+        )
+        resp = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not fetch the filing PDF: {exc}",
+        ) from exc
+    if resp.status_code != 200:
+        await resp.aclose()
+        await client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The filing host returned HTTP {resp.status_code}.",
+        )
+
+    async def _stream():
+        try:
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
 
 
 _FILINGS_TIMEOUT = 10.0

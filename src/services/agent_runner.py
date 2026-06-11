@@ -44,11 +44,17 @@ from src.schemas.chat import (
     AgentThoughtEvent,
     ChartEvent,
     ChartPoint,
+    Citation,
+    ClarificationEvent,
+    ClarificationOption,
+    ClarificationQuestion,
     DataFreshnessEvent,
     ErrorEvent,
     FinalAnswer,
     FinalEvent,
     MetaEvent,
+    PlanEvent,
+    PlanStep,
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -86,6 +92,8 @@ ChatEvent = (
     | DataFreshnessEvent
     | ChartEvent
     | FinalEvent
+    | ClarificationEvent
+    | PlanEvent
     | ErrorEvent
 )
 
@@ -261,6 +269,10 @@ class AgentRunner:
         _identical_run: int = 0
         _IDENTICAL_RUN_LIMIT = 3
         _circuit_broken = False
+        # Agentic clarification: when a tool (request_clarification) asks the user
+        # to disambiguate, we terminate the turn with a ClarificationEvent and
+        # await their selection on the next turn. Holds the pending payload.
+        clarification_payload: dict[str, Any] | None = None
         # Token de-duplication. Some ADK / Gemini configurations re-emit the
         # same text part across consecutive events (observed in production
         # as 3x repeated chunks during streaming). We dedupe at the runner
@@ -338,6 +350,12 @@ class AgentRunner:
                         )
                         _circuit_broken = True
                         break  # exit the parts loop
+                    # `update_plan` is a META tool (the visible task checklist) —
+                    # no tool card, no evidence; its PlanEvent is emitted on the
+                    # response below.
+                    if tool_name == "update_plan":
+                        pending_calls[call_id] = (tool_name, time.perf_counter())
+                        continue
                     pending_calls[call_id] = (tool_name, time.perf_counter())
                     self._tool_trace.append({"tool": tool_name, "args": args, "call_id": call_id})
                     yield ToolCallEvent(tool=tool_name, args=args, call_id=call_id)
@@ -350,6 +368,41 @@ class AgentRunner:
                     response = getattr(fn_resp, "response", None) or {}
                     started = pending_calls.pop(call_id, (tool_name, time.perf_counter()))[1]
                     latency_ms = int((time.perf_counter() - started) * 1000)
+
+                    # `update_plan` → emit the task checklist (PlanEvent); no card.
+                    if tool_name == "update_plan":
+                        if isinstance(response, dict) and "_plan" in response:
+                            raw_steps = response["_plan"].get("steps") or []
+                            yield PlanEvent(steps=[PlanStep(**s) for s in raw_steps])
+                        continue
+
+                    # Agentic clarification → terminate the turn with a
+                    # ClarificationEvent and await the user's pick next turn (no
+                    # synthesis/rescue — there's no answer to compose). Two
+                    # sources, both deterministic (no LLM re-narration of ids):
+                    #   1. ``request_clarification`` returns a ``_clarification``
+                    #      payload (agent-composed, any format).
+                    #   2. ``resolve_company`` returns ``needs_clarification`` +
+                    #      a structured ``clarification`` block (options dict) —
+                    #      we surface it even if the model forgets to ask. (A
+                    #      prose ``clarification`` STRING, e.g. financials_query,
+                    #      is NOT a dict → handled by the agent, not here.)
+                    _clar = None
+                    if isinstance(response, dict):
+                        if "_clarification" in response:
+                            _clar = response["_clarification"]
+                        elif response.get("needs_clarification") and isinstance(
+                            response.get("clarification"), dict
+                        ):
+                            _clar = response["clarification"]
+                    if _clar is not None:
+                        yield ToolResultEvent(
+                            call_id=call_id, tool=tool_name, ok=True,
+                            result_summary="awaiting your selection", latency_ms=latency_ms,
+                        )
+                        clarification_payload = _clar
+                        final_seen = True
+                        break  # exit the parts loop
 
                     # Distinguish success from failure using the structured
                     # error contract (see src/integrations/tools/_errors.py).
@@ -458,10 +511,9 @@ class AgentRunner:
                     async for chunk in _TokenChunker.stream(text):
                         yield TokenEvent(text=chunk)
 
-            # Circuit-breaker fired inside the parts loop — stop iterating
-            # ADK events entirely. Without this break we'd keep streaming
-            # downstream events from the same broken turn.
-            if _circuit_broken:
+            # Circuit-breaker or clarification fired inside the parts loop —
+            # stop iterating ADK events entirely.
+            if _circuit_broken or clarification_payload is not None:
                 final_seen = True
                 break
 
@@ -473,6 +525,18 @@ class AgentRunner:
                         final_seen = True
                 except Exception:
                     pass
+
+        # Agentic clarification terminated the turn — emit the structured
+        # question(s) and stop. No prose/synthesis (the user must answer first);
+        # their selection arrives as the next message in this session.
+        if clarification_payload is not None:
+            event = _build_clarification_event(self._agent_run_id, clarification_payload)
+            yield event
+            await self._close_run_row(
+                status="awaiting_clarification",
+                final_answer=event.question,
+            )
+            return
 
         # Compute cost + write final audit row.
         raw_final = "".join(final_text_parts).strip()
@@ -488,41 +552,87 @@ class AgentRunner:
         structured = _validate_structured_freshness(structured, observed_freshness)
 
         # Stall detection: the model wrote prose like "I will re-run the
-        # query..." but the turn already ended without firing another
-        # tool. ADK accepted the narration as the final answer; the user
-        # sees a useless stall message. We treat this the same as empty
-        # prose — blank `prose` so the rescue path below fires. The
-        # detector is conservative (substantive-content guard) to avoid
-        # false-positives on real answers that mention a retry. See
-        # `_is_stall_response` for the exact logic.
+        # query..." but the turn already ended without firing another tool.
+        # Treat it as empty so the composer / fallback writes a real answer.
         if prose and _is_stall_response(prose):
             logger.warning(
-                "Agent run %s emitted stall prose (%d chars, no "
-                "substantive content); routing to synthesis rescue.",
+                "Agent run %s emitted stall prose (%d chars, no substantive "
+                "content); routing to the quality-tier composer.",
                 self._agent_run_id,
                 len(prose),
             )
-            prose = ""  # zero out so the empty-prose rescue path runs
+            prose = ""
 
-        # Safety net for the "empty prose" failure mode. Gemini sometimes
-        # terminates a turn after a tool call without writing the prose answer
-        # — either zero output, or (after the 2026-05-28 prompt change) ONLY
-        # the <answer_meta> block. The system prompt forbids this (Rule 0)
-        # but Flash is non-deterministic. Layered rescue (most-to-least useful):
-        #
-        #   1. structured.sections[0].body  → promote it to prose. Gemini
-        #      put the answer in the section body; just surface it.
-        #   2. structured.citations exist   → emit a short "data retrieved,
-        #      see Report tab" pointer. The right pane already has the data.
-        #   3. otherwise                    → existing generic fallback
-        #      that names the tools so users know something happened.
+        # GATHER-RESCUE (deterministic) — a non-clarification turn that ended with
+        # NO data gathered AND no answer means the orchestrator stopped after a
+        # routing tool without finishing (free-tier Flash flakiness). Re-invoke
+        # ONCE with an explicit gather nudge, then re-read the prose/structured.
+        # This does NOT depend on the first pass getting it right; worst case is
+        # the same generic fallback as before. See `_gather_rescue_pass`.
+        if (
+            clarification_payload is None
+            and not _circuit_broken
+            and not prose
+            and not _has_substantive_evidence(self._tool_trace)
+        ):
+            async for ev in self._gather_rescue_pass(
+                runner, genai_types, final_text_parts, observed_freshness
+            ):
+                yield ev
+            raw_final = "".join(final_text_parts).strip()
+            prose, structured = _split_structured_answer(raw_final)
+            structured = _validate_structured_freshness(structured, observed_freshness)
+            if prose and _is_stall_response(prose):
+                prose = ""
+
+        # PRIMARY answer path — when the turn gathered substantive evidence, the
+        # AUTHORITATIVE answer is composed on the quality tier from that evidence
+        # (the fast orchestrator is only a planner/gatherer; flash-lite is too
+        # weak to reliably write the final answer, and thinking-mode often ends
+        # the turn without it). Trivial turns (no data tools) keep the fast
+        # model's prose. Clarification turns already returned above.
+        if _has_substantive_evidence(self._tool_trace):
+            composed = await _compose_final_answer(user_message, self._tool_trace)
+            if composed:
+                composed, suggestions = _extract_follow_ups(composed)
+                prose = composed
+                base = (
+                    structured.model_copy(update={"text": composed})
+                    if structured is not None
+                    else FinalAnswer(text=composed)
+                )
+                structured = (
+                    base.model_copy(update={"suggestions": suggestions})
+                    if suggestions
+                    else base
+                )
+                logger.info(
+                    "Agent run %s: composed final answer on the quality tier "
+                    "(%d chars, %d follow-ups).",
+                    self._agent_run_id, len(composed), len(suggestions),
+                )
+
+        # Deterministic filing citations: stock_filings_read evidence carries the
+        # exact ``pdf_url`` + ``page`` per cited passage. Parse the (now composed)
+        # prose for `[Company | p.N]` and attach trustworthy, page-exact Citations
+        # the UI deep-links to — rather than trusting the LLM to transcribe URLs.
+        structured = _merge_filing_citations(structured, self._tool_trace)
+
+        # Safety net for the "still no prose" case — the quality composer ran
+        # above for substantive turns; this catches (a) trivial turns where the
+        # fast model emitted nothing, and (b) the rare case the composer itself
+        # failed (router off + no key, total provider outage). Layered, most-to-
+        # least useful:
+        #   1. structured.sections[0].body  → the answer was in the meta body.
+        #   2. structured.citations exist   → point to the Report/Sources tabs.
+        #   3. one more composer attempt    → in case it wasn't tried (no
+        #      substantive evidence flagged but tools did run).
+        #   4. generic deterministic message → guarantee the user sees SOMETHING.
         if not prose:
             if structured is not None and structured.sections:
                 first_body = (structured.sections[0].body or "").strip()
                 if first_body:
                     prose = first_body
-                    # Sync structured.text so the Report tab + chat thread
-                    # render the same content.
                     structured = structured.model_copy(update={"text": prose})
                     logger.warning(
                         "Agent run %s emitted only meta block; promoted "
@@ -541,43 +651,28 @@ class AgentRunner:
                     "surfacing pointer-to-Report-tab fallback.",
                     self._agent_run_id,
                 )
+            if not prose and not _has_substantive_evidence(self._tool_trace):
+                # Tools ran but none were flagged substantive (edge case) — try
+                # composing once before the generic message.
+                composed = await _compose_final_answer(user_message, self._tool_trace)
+                if composed:
+                    prose = composed
+                    structured = (
+                        structured.model_copy(update={"text": composed})
+                        if structured is not None
+                        else FinalAnswer(text=composed)
+                    )
             if not prose:
-                # Industry-grade rescue: when the orchestrator (Flash)
-                # ran tools but skipped synthesis, ask a higher-tier
-                # model (Pro) to compose the answer in a single targeted
-                # call. The retry is single-shot (no tools, no agent
-                # loop) so it can't hit the same multi-turn failure
-                # mode. ~1-2s latency on failure turns only; zero impact
-                # on the happy path. Matches the Claude / Cursor / Devin
-                # pattern for synthesis rescue.
-                rescued = await _rescue_empty_synthesis(
-                    user_message=user_message,
-                    tool_trace=self._tool_trace,
+                # Last-resort deterministic message — guarantees the user always
+                # sees SOMETHING when every compose path failed.
+                prose = _synthesize_empty_answer_fallback(self._tool_trace)
+                structured = None
+                logger.warning(
+                    "Agent run %s: composer returned empty too; surfacing "
+                    "generic fallback. %d tools called.",
+                    self._agent_run_id,
+                    len(self._tool_trace),
                 )
-                if rescued:
-                    prose = rescued
-                    # Sync the prose into structured.text so the Report
-                    # tab + chat thread render the same content.
-                    if structured is not None:
-                        structured = structured.model_copy(update={"text": prose})
-                    logger.warning(
-                        "Agent run %s rescued synthesis via single-shot "
-                        "Pro retry after orchestrator skipped prose.",
-                        self._agent_run_id,
-                    )
-                else:
-                    # Last-resort deterministic message. The rescue path
-                    # already covers every realistic failure (network,
-                    # empty Pro response, exception); this is here to
-                    # guarantee the user always sees SOMETHING.
-                    prose = _synthesize_empty_answer_fallback(self._tool_trace)
-                    structured = None
-                    logger.warning(
-                        "Agent run %s: rescue returned empty too; "
-                        "surfacing generic fallback. %d tools called.",
-                        self._agent_run_id,
-                        len(self._tool_trace),
-                    )
 
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
@@ -597,6 +692,144 @@ class AgentRunner:
             output_tokens=self._output_tokens,
             latency_ms=latency_ms,
         )
+
+    # ── Deterministic gather-rescue ──────────────────────────────────────────
+
+    async def _gather_rescue_pass(
+        self,
+        runner: Any,
+        genai_types: Any,
+        text_sink: list[str],
+        observed_freshness: set[str],
+    ) -> AsyncIterator[ChatEvent]:
+        """Recover a turn the orchestrator dropped before gathering any data.
+
+        The free-tier Flash orchestrator intermittently ends a turn right after
+        a *routing* tool (``resolve_company`` / ``update_plan``) without calling
+        the data tool that actually answers the question — so the turn reaches
+        the post-loop with no substantive evidence and no prose, and the user
+        gets the generic "couldn't put together an answer" fallback. This is
+        model flakiness, not a missing capability (the same query succeeds on a
+        retry), so we fix it deterministically instead of via the prompt: when
+        that exact state is detected, re-invoke the agent ONCE in the SAME
+        session with an explicit nudge to finish the job. The session already
+        holds the user's question + any resolved ``security_id``(s); tool
+        calls/results flow back into ``self._tool_trace`` so the existing
+        quality-tier composer writes the answer from the freshly-gathered
+        evidence. Worst case (the nudge also gathers nothing) is identical to
+        today's generic fallback — so this is strictly an improvement.
+        """
+        nudge = (
+            "[system] Your previous step ended WITHOUT calling any data tool, so "
+            "there is no answer yet. You ALREADY have everything you need — the "
+            "user's question and the resolved security_id(s) are in the "
+            "conversation above. Do NOT ask for clarification again and do NOT "
+            "re-resolve the companies. Call the right data tool now "
+            "(stock_filings_read / financials_query / stock_technicals / news_* / "
+            "bmc_*) with those id(s), then write the complete answer."
+        )
+        msg = genai_types.Content(role="user", parts=[genai_types.Part(text=nudge)])
+        pending: dict[str, float] = {}
+        logger.warning(
+            "Agent run %s: gather-rescue — orchestrator stopped before gathering; "
+            "re-invoking with an explicit gather nudge.",
+            self._agent_run_id,
+        )
+        try:
+            async for event in runner.run_async(
+                user_id=self._firm_id,
+                session_id=self._session_id,
+                new_message=msg,
+            ):
+                usage = getattr(event, "usage_metadata", None)
+                if usage:
+                    self._input_tokens = (
+                        getattr(usage, "prompt_token_count", self._input_tokens)
+                        or self._input_tokens
+                    )
+                    self._output_tokens = (
+                        getattr(usage, "candidates_token_count", self._output_tokens)
+                        or self._output_tokens
+                    )
+                content = getattr(event, "content", None)
+                for part in getattr(content, "parts", None) or []:
+                    fn_call = getattr(part, "function_call", None)
+                    if fn_call is not None:
+                        call_id = getattr(fn_call, "id", None) or f"call_{uuid.uuid4().hex[:8]}"
+                        tool_name = getattr(fn_call, "name", "unknown")
+                        args = dict(getattr(fn_call, "args", {}) or {})
+                        if tool_name == "update_plan":
+                            pending[call_id] = time.perf_counter()
+                            continue
+                        pending[call_id] = time.perf_counter()
+                        self._tool_trace.append(
+                            {"tool": tool_name, "args": args, "call_id": call_id}
+                        )
+                        yield ToolCallEvent(tool=tool_name, args=args, call_id=call_id)
+                        continue
+
+                    fn_resp = getattr(part, "function_response", None)
+                    if fn_resp is not None:
+                        call_id = getattr(fn_resp, "id", None) or ""
+                        tool_name = getattr(fn_resp, "name", "unknown")
+                        response = getattr(fn_resp, "response", None) or {}
+                        started = pending.pop(call_id, time.perf_counter())
+                        latency_ms = int((time.perf_counter() - started) * 1000)
+                        if tool_name == "update_plan":
+                            if isinstance(response, dict) and "_plan" in response:
+                                raw_steps = response["_plan"].get("steps") or []
+                                yield PlanEvent(steps=[PlanStep(**s) for s in raw_steps])
+                            continue
+                        # A re-fired clarification in the rescue is ignored (the
+                        # nudge forbids it); treat it as a normal result so the
+                        # turn still terminates with the generic fallback if the
+                        # model insists rather than looping.
+                        if is_error(response):
+                            yield ToolResultEvent(
+                                call_id=call_id, tool=tool_name, ok=False,
+                                error=extract_error_message(response) or "tool error",
+                                error_code=(
+                                    response.get("error_code")
+                                    if isinstance(response, dict) else None
+                                ),
+                                next_action=(
+                                    response.get("next_action")
+                                    if isinstance(response, dict) else None
+                                ),
+                                latency_ms=latency_ms,
+                            )
+                            continue
+                        for entry in self._tool_trace:
+                            if entry.get("call_id") == call_id:
+                                entry["response"] = _trim_response_for_rescue(response)
+                                break
+                        yield ToolResultEvent(
+                            call_id=call_id, tool=tool_name, ok=True,
+                            result_summary=_summarize_tool_response(response),
+                            latency_ms=latency_ms,
+                        )
+                        if isinstance(response, dict):
+                            freshness = response.get("data_freshness")
+                            if freshness:
+                                observed_freshness.add(str(freshness))
+                                yield DataFreshnessEvent(
+                                    call_id=call_id,
+                                    source=_freshness_source_label(tool_name),
+                                    as_of=str(freshness),
+                                )
+                        continue
+
+                    text = getattr(part, "text", None)
+                    if text and not bool(getattr(part, "thought", False)):
+                        text_sink.append(text)
+                        async for chunk in _TokenChunker.stream(text):
+                            yield TokenEvent(text=chunk)
+        except Exception:
+            logger.exception(
+                "Agent run %s: gather-rescue pass errored; falling through to the "
+                "existing fallback chain.",
+                self._agent_run_id,
+            )
 
     # ── Persistence ────────────────────────────────────────────────────────
 
@@ -1023,54 +1256,160 @@ def _trim_response_for_rescue(response: Any, max_rows: int = 20, max_str: int = 
     return out
 
 
-# System prompt for the synthesis-rescue single-shot call. Deliberately
-# narrow: write the answer, cite inline, no tool calls, no meta block.
-_RESCUE_SYSTEM_PROMPT = """You are a senior research analyst's writing assistant. \
-The research agent ran tools successfully but failed to compose a written \
-answer for the user. Your job is to write that answer using ONLY the tool \
-data provided below — do not invent numbers, dates, or companies. Use the \
-inline citation format [Source | period] sparingly. Write 2-4 sentences of \
-prose; include 2-4 supporting bullets if the data warrants them. Do NOT \
-call any tools, do NOT write a <answer_meta> block, do NOT apologise for \
-the agent's earlier silence. Prose only."""
+# System prompt for the quality-tier final-answer composer. The fast
+# orchestrator gathers evidence; THIS writes the user-facing answer.
+_COMPOSER_SYSTEM_PROMPT = """You are PRISM, an expert equity-research analyst writing \
+the FINAL answer for the user, using ONLY the tool evidence provided. Write the best, \
+most COMPLETE, decision-useful answer to the user's underlying question.
+
+How to write it:
+- LEAD with the direct answer — the key finding, number, or takeaway — in the first \
+sentence. No preamble ("Based on the evidence…"), no restating the question.
+- Be COMPLETE: address EVERY part of the question (each period, metric, topic, and \
+company). Include every material fact, figure, and date the evidence supports — do \
+NOT omit or over-compress. Do NOT invent anything not in the evidence.
+- STRUCTURE like an analyst note: a tight lead paragraph, then bullets for the \
+specifics. Scannable, concrete, no fluff. The chat renders Markdown (incl. tables).
+- HONOR the user's requested format: "in a table" → a Markdown table (NOT bullets); \
+"in short" → 1-2 lines; etc. For a multi-company / multi-metric COMPARISON, default \
+to a Markdown table (one row per company, one column per metric) — clearer than \
+parallel bullet lists — led by a one-sentence takeaway.
+- CITE filings, don't fabricate pages: when the evidence provides a \
+'[Company | p.N]' citation string (filing passages do), preserve it VERBATIM next to \
+the fact — these are clickable PDF deep-links, so never alter, merge, drop, or INVENT \
+them. For data that has NO such string (e.g. financial figures from the database), \
+just state the figure with its period/date — do NOT make up a '[… | p.N]' citation.
+- PARTIAL / THIN evidence: give everything useful the evidence DOES contain, state \
+plainly what is missing, and suggest the most useful next step (e.g. "I can pull the \
+full annual report", or ask for a specific quarter/period). NEVER dead-end with only \
+"content not available" when ANY useful detail exists.
+- If the user's latest message is only a company selection (e.g. "<Company> — \
+security_id N"), answer the QUESTION implied by the tool calls — never treat the \
+selection text as the question.
+
+After the answer, on its OWN LAST LINE, emit 2-3 short, specific follow-up \
+questions the user might naturally ask next that OUR tools can answer (a metric, \
+a period, a peer, the filing detail), formatted EXACTLY as:
+FOLLOW_UPS: <question 1> | <question 2> | <question 3>
+Put nothing after that line. Do NOT call tools and do NOT emit any <answer_meta> block."""
 
 
-async def _rescue_empty_synthesis(
+# Tools that GATHER substantive evidence (vs. routing/disambiguation helpers).
+# A turn that ran any of these gets the quality-tier composer; trivial turns
+# (acknowledgements, a lone resolve/clarify) keep the fast model's text.
+_NON_SUBSTANTIVE_TOOLS = frozenset(
+    {"resolve_company", "resolve_companies", "search_companies", "list_sectors",
+     "request_clarification", "update_plan"}
+)
+
+
+def _has_substantive_evidence(tool_trace: list[dict[str, Any]]) -> bool:
+    """True if the turn gathered real data (a non-routing tool returned)."""
+    return any(
+        e.get("tool") not in _NON_SUBSTANTIVE_TOOLS and e.get("response") is not None
+        for e in tool_trace
+    )
+
+
+def _strip_answer_meta(text: str) -> str:
+    """Drop any accidental ``<answer_meta>`` tail + surrounding whitespace."""
+    text = (text or "").strip()
+    meta_at = text.find("<answer_meta>")
+    return text[:meta_at].rstrip() if meta_at >= 0 else text
+
+
+def _extract_follow_ups(text: str) -> tuple[str, list[str]]:
+    """Split a trailing ``FOLLOW_UPS: a | b | c`` line off the composed answer →
+    (clean prose, up to 3 suggestions)."""
+    m = re.search(r"(?im)^\s*FOLLOW[_ ]?UPS:\s*(.+?)\s*$", text or "")
+    if not m:
+        return (text or "").strip(), []
+    sugg = [s.strip(" -•*") for s in m.group(1).split("|") if s.strip(" -•*")][:3]
+    return text[: m.start()].rstrip(), sugg
+
+
+def _clar_question(payload: dict[str, Any], default_id: str) -> ClarificationQuestion:
+    """Build one ClarificationQuestion from a payload dict."""
+    return ClarificationQuestion(
+        id=str(payload.get("id") or default_id),
+        question=payload.get("question", "Could you clarify?"),
+        mode=payload.get("mode", "single_select"),
+        options=[ClarificationOption(**o) for o in (payload.get("options") or [])],
+        allow_search=payload.get("allow_search", True),
+    )
+
+
+def _build_clarification_event(
+    agent_run_id: Any, payload: dict[str, Any],
+) -> ClarificationEvent:
+    """Normalize a clarification payload into a ClarificationEvent. Accepts either
+    a single-question payload (``{question, mode, options, allow_search}``) or a
+    multi-question one (``{questions: [...]}`` — e.g. from ``resolve_companies``,
+    so "Reliance"/"Adani"/"Tata" are disambiguated together in one card). The
+    back-compat single fields mirror ``questions[0]``."""
+    raw = payload.get("questions")
+    if isinstance(raw, list) and raw:
+        questions = [_clar_question(q, f"q{i}") for i, q in enumerate(raw)]
+    else:
+        questions = [_clar_question(payload, "q0")]
+    first = questions[0]
+    return ClarificationEvent(
+        agent_run_id=agent_run_id,
+        questions=questions,
+        question=first.question,
+        mode=first.mode,
+        options=first.options,
+        allow_search=first.allow_search,
+    )
+
+
+def _looks_like_clarification_pick(message: str) -> bool:
+    """The turn message is just a company selection from a clarification MCQ
+    (e.g. "Reliance Industries Ltd. — security_id 2228"), not a real question."""
+    return bool(re.search(r"security[_ ]?id\s*:?\s*\d", message or "", re.IGNORECASE))
+
+
+def _tool_questions(tool_trace: list[dict[str, Any]]) -> list[str]:
+    """The natural-language research questions the agent issued to data tools this
+    turn (the ``question`` arg of stock_filings_read / financials_query / …) — the
+    best signal of the user's underlying intent, especially on a pick-reply turn
+    where the message is just the company choice. Company-lookup ``query`` args
+    (resolve_company / search_companies) are intentionally excluded. Deduped,
+    order-preserving."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for e in tool_trace:
+        args = e.get("args") or {}
+        q = args.get("question")
+        if isinstance(q, str) and q.strip() and q not in seen:
+            seen.add(q)
+            out.append(q.strip())
+    return out
+
+
+async def _compose_final_answer(
     user_message: str,
     tool_trace: list[dict[str, Any]],
 ) -> str | None:
-    """Single-shot Pro call that composes prose when the orchestrator skips it.
+    """Compose the user-facing answer from gathered tool evidence on the
+    **quality tier** (`gemini-2.5-flash`→`gemini-2.5-pro`, or an `openai/*` model
+    if configured). This is the PRIMARY answer path for substantive turns — the
+    fast orchestrator only plans + calls tools; this writes the authentic,
+    complete answer, reliably (a plain no-tools generation, immune to the
+    thinking-mode "think-then-stop" that drops the fast model's final text).
 
-    Returns the rescued prose, or ``None`` on any failure (no API key,
-    network/timeout, empty response, exception). Caller falls back to the
-    deterministic message on ``None``.
-
-    Why a separate call instead of just looping back through the agent:
-      * Single-shot has NO tools attached → can't hit the same "model
-        decides to call another tool and skips synthesis" failure mode.
-      * Pro (not Flash) is far more reliable about following an explicit
-        "write the answer" directive — Flash is exactly what failed.
-      * No agent loop overhead; ~1-2s vs 5-10s for a full agent re-run.
-
-    Triggered only on the empty-prose path so steady-state cost is zero.
-    On failures (~5-10% of turns in early measurement) it adds one Pro
-    call (~$0.001) and ~1-2s of latency, in exchange for a real answer
-    instead of the generic "I ran N tool(s)…" message.
+    Returns the prose, or ``None`` on any failure (caller falls back). Routes via
+    the ModelRouter (multi-key 429 fallback); if the router is unavailable, falls
+    back to a direct single-shot call with a raw Gemini key.
     """
     if not tool_trace:
         return None
 
-    # Pick the first non-empty Gemini key — we share the same pool as the
-    # main router. If no key is set we can't rescue; caller falls back.
-    api_key = next((k for k in settings.gemini_api_keys if k), None)
-    if not api_key:
-        logger.warning("Rescue skipped: no GEMINI_API_KEY available.")
-        return None
-
-    # Build a compact summary of the tools and their (already-trimmed)
-    # responses. Last 3 tools max to keep the prompt lean.
+    # Compact the evidence: last 6 tool results, generous per-result cap so the
+    # filing `evidence[].quote` + `[Company | p.N]` survive (the source material
+    # the composer must use). `_trim_response_for_rescue` already bounded these.
     parts: list[str] = []
-    for entry in tool_trace[-3:]:
+    for entry in tool_trace[-6:]:
         tool = entry.get("tool", "?")
         args = entry.get("args", {})
         response = entry.get("response")
@@ -1080,45 +1419,75 @@ async def _rescue_empty_synthesis(
             response_str = json.dumps(response, default=str, ensure_ascii=False)
         except (TypeError, ValueError):
             response_str = repr(response)
-        # Defensive: even after _trim_response_for_rescue, cap one final time.
-        if len(response_str) > 2500:
-            response_str = response_str[:2500] + "..."
+        if len(response_str) > 8000:
+            response_str = response_str[:8000] + "…(truncated)"
         parts.append(f"{tool}(args={args}) →\n{response_str}")
 
     if not parts:
         return None
 
-    user_prompt = (
-        f"ORIGINAL USER QUESTION:\n{user_message}\n\n"
-        "TOOL CALLS AND RESPONSES (most recent last):\n\n"
-        + "\n\n---\n\n".join(parts)
-        + "\n\nNow write the analyst's answer using the data above."
-    )
+    # Surface the user's underlying question. On a clarification-pick turn the
+    # message is just the company choice, so the real intent lives in the tool
+    # questions — lead with those so the composer answers the right thing.
+    tool_qs = _tool_questions(tool_trace)
+    if _looks_like_clarification_pick(user_message) and tool_qs:
+        intent_block = (
+            f"USER PICKED: {user_message}\n"
+            "THE QUESTION TO ANSWER (from the tool calls): "
+            + " | ".join(tool_qs)
+        )
+    else:
+        intent_block = f"USER QUESTION: {user_message}"
+        if tool_qs:
+            intent_block += "\n(tools were asked: " + " | ".join(tool_qs) + ")"
 
+    user_prompt = (
+        intent_block
+        + "\n\nTOOL EVIDENCE (most recent last):\n\n"
+        + "\n\n---\n\n".join(parts)
+        + "\n\nWrite the complete analyst answer now, citing each fact with its "
+        "[Company | p.N] string verbatim."
+    )
+    messages = [
+        {"role": "system", "content": _COMPOSER_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    # PRIMARY — quality tier via the router (load-balanced, 429 fallback chain).
     try:
-        # Lazy import — keeps module load fast on the happy path.
+        from src.services.model_router import get_router
+
+        text = _strip_answer_meta(await get_router().acomplete(
+            tier="quality", messages=messages, temperature=0.2,
+        ))
+        if text:
+            return text
+    except Exception as exc:  # noqa: BLE001 — router off / 429 exhausted / etc.
+        logger.warning("Composer via router quality tier failed (%s): %s",
+                       type(exc).__name__, exc)
+
+    # FALLBACK — direct single-shot with a raw Gemini key (router disabled in
+    # some deploys/tests). Best-effort; ``None`` lets the caller degrade.
+    api_key = next((k for k in settings.gemini_api_keys if k), None)
+    if not api_key:
+        return None
+    try:
         import litellm
 
         resp = await litellm.acompletion(
             model="gemini/gemini-2.5-pro",
             api_key=api_key,
-            messages=[
-                {"role": "system", "content": _RESCUE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=600,
-            temperature=0.2,  # low temp — composing from given data, not creating
-            timeout=20,
+            messages=messages,
+            temperature=0.2,
+            timeout=25,
         )
-        text_obj = resp.choices[0].message.content if resp.choices else None
-        text = (text_obj or "").strip()
-        # Strip any accidental <answer_meta> tail Pro might still emit.
-        meta_at = text.find("<answer_meta>")
-        if meta_at >= 0:
-            text = text[:meta_at].rstrip()
+        text = _strip_answer_meta(
+            (resp.choices[0].message.content or "") if resp.choices else ""
+        )
         return text or None
     except Exception as exc:  # noqa: BLE001 — any failure → fall back
-        logger.warning("Synthesis rescue failed (%s): %s", type(exc).__name__, exc)
+        logger.warning("Composer direct fallback failed (%s): %s",
+                       type(exc).__name__, exc)
         return None
 
 
@@ -1153,6 +1522,138 @@ def _validate_structured_freshness(
         sorted(observed),
     )
     return structured.model_copy(update={"data_freshness": None})
+
+
+def _norm_cite_label(label: str | None) -> str:
+    """Comparable key for a citation label — alnum only, lowercased. So
+    ``"[ITC Ltd | p.5]"`` and the LLM's ``"ITC Ltd | p.5"`` collide."""
+    return re.sub(r"[^a-z0-9]+", "", (label or "").lower())
+
+
+# stock-chat's inline citation format in the prose answer: ``[Company | p.N]``
+# (tolerant of spaced initials like "I T C Ltd." and "p. 5" / "p.5" / "pp. 5").
+_INLINE_CITE_RE = re.compile(r"\[([^\]|]+?)\s*\|\s*pp?\.?\s*(\d{1,4})\b", re.IGNORECASE)
+# A page number embedded in a citation LABEL (e.g. "ITC Ltd p. 7", "… | p.5").
+_PAGE_IN_LABEL_RE = re.compile(r"\bpp?\.?\s*(\d{1,4})\b", re.IGNORECASE)
+
+
+def _filing_pdf_index(tool_trace: list[dict[str, Any]]) -> dict[str, str]:
+    """Map normalized company name → filing ``pdf_link`` from every
+    ``stock_filings_read`` result. ``selected_filings`` carries the PDF url in
+    BOTH synthesise modes (``evidence`` is empty when ``synthesise=true``, which
+    is what the agent uses), so it's the reliable source; ``evidence[].pdf_url``
+    is a fallback for the ``synthesise=false`` path."""
+    out: dict[str, str] = {}
+    for entry in tool_trace:
+        if entry.get("tool") != "stock_filings_read":
+            continue
+        resp = entry.get("response")
+        if not isinstance(resp, dict):
+            continue
+        for f in resp.get("selected_filings") or []:
+            if isinstance(f, dict) and f.get("pdf_link") and f.get("company_name"):
+                out.setdefault(_norm_cite_label(f["company_name"]), str(f["pdf_link"]))
+        for ev in resp.get("evidence") or []:
+            if isinstance(ev, dict) and ev.get("pdf_url") and ev.get("company_name"):
+                out.setdefault(_norm_cite_label(ev["company_name"]), str(ev["pdf_url"]))
+    return out
+
+
+def _evidence_citations(tool_trace: list[dict[str, Any]]) -> list[Citation]:
+    """Build filing citations DIRECTLY from ``stock_filings_read`` evidence — the
+    most reliable source. With ``synthesise=false`` (the default) each evidence
+    item carries its own ``citation`` string, ``page``, AND ``pdf_url``, so no
+    parsing or company-name join is needed. Deduped by (url, page)."""
+    out: list[Citation] = []
+    seen: set[tuple[str, int | None]] = set()
+    for entry in tool_trace:
+        if entry.get("tool") != "stock_filings_read":
+            continue
+        resp = entry.get("response")
+        if not isinstance(resp, dict):
+            continue
+        for ev in resp.get("evidence") or []:
+            if not isinstance(ev, dict) or not ev.get("pdf_url"):
+                continue
+            try:
+                page = int(ev.get("page")) if ev.get("page") is not None else None
+            except (TypeError, ValueError):
+                page = None
+            url = str(ev["pdf_url"])
+            key = (url, page)
+            if key in seen:
+                continue
+            seen.add(key)
+            label = ev.get("citation") or f"{ev.get('company_name', '')} p.{page}".strip()
+            out.append(Citation(label=str(label), url=url, source_kind="filing", page=page))
+    return out
+
+
+def _merge_filing_citations(
+    structured: FinalAnswer | None, tool_trace: list[dict[str, Any]],
+) -> FinalAnswer | None:
+    """Give filing citations a clickable ``url`` + exact ``page`` so the UI can
+    deep-link to the cited PDF page. PRIMARY path: build them straight from the
+    tool's ``evidence`` (synthesise=false default — each item has citation+page+
+    pdf_url). FALLBACK (synthesise=true, no evidence): parse the agent's prose /
+    citation labels and join to ``selected_filings`` pdf_link. All deterministic.
+    Keeps non-filing citations; replaces filing ones. No-op when no filings."""
+    if structured is None:
+        return structured
+
+    # PRIMARY — evidence carries everything; no parsing/guesswork.
+    ev_cites = _evidence_citations(tool_trace)
+    if ev_cites:
+        kept = [c for c in structured.citations if c.source_kind != "filing"]
+        return structured.model_copy(update={"citations": kept + ev_cites})
+
+    # FALLBACK — synthesise=true left evidence empty; derive from prose + filings.
+    pdf_index = _filing_pdf_index(tool_trace)
+    if not pdf_index:
+        return structured
+    # Single-company answers: every page-cite maps to the one PDF read.
+    sole_pdf = next(iter(pdf_index.values())) if len(pdf_index) == 1 else None
+
+    def _url_for(company_text: str) -> str | None:
+        norm = _norm_cite_label(company_text)
+        if norm in pdf_index:
+            return pdf_index[norm]
+        # Citation labels often pad the company ("ITC Ltd Annual Report 2025") —
+        # match when a filing's company key appears within (works for multi-
+        # company answers where there's no single-PDF fallback).
+        for key, url in pdf_index.items():
+            if key and key in norm:
+                return url
+        return sole_pdf
+
+    out: list[Citation] = []
+    seen: set[tuple[str, int]] = set()
+    # 1) Enrich the agent's own citations whose label carries a page number.
+    for c in structured.citations:
+        m = _PAGE_IN_LABEL_RE.search(c.label or "")
+        if m:
+            page = int(m.group(1))
+            company = re.sub(r"[\[\]|]", " ", _PAGE_IN_LABEL_RE.sub("", c.label or ""))
+            url = _url_for(company)
+            if url:
+                c = c.model_copy(update={"url": url, "page": page, "source_kind": "filing"})
+                seen.add((url, page))
+        out.append(c)
+    # 2) Add inline [Company | p.N] cites from the prose that aren't already listed.
+    for mm in _INLINE_CITE_RE.finditer(structured.text or ""):
+        company = mm.group(1).strip()
+        try:
+            page = int(mm.group(2))
+        except ValueError:
+            continue
+        url = _url_for(company)
+        if not url or (url, page) in seen:
+            continue
+        seen.add((url, page))
+        out.append(
+            Citation(label=f"[{company} | p.{page}]", url=url, source_kind="filing", page=page)
+        )
+    return structured.model_copy(update={"citations": out})
 
 
 def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:

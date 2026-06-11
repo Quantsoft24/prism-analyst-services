@@ -79,6 +79,12 @@ class DeploymentSpec:
     tpm: int
 
 
+def _provider_of(model_id: str) -> str:
+    """LiteLLM provider prefix of a model id (``"gemini/gemini-2.5-pro"`` →
+    ``"gemini"``). Bare ids (no slash) are treated as Gemini for back-compat."""
+    return model_id.split("/", 1)[0].lower() if "/" in model_id else "gemini"
+
+
 class ModelRouter:
     """Owns the LiteLLM ``Router`` instance and exposes tier-based access."""
 
@@ -127,6 +133,19 @@ class ModelRouter:
             settings.MODEL_ROUTER_STRATEGY,
         )
 
+    def _keys_for_provider(self, provider: str) -> list[str]:
+        """API key pool for a provider. Gemini uses the keys this router was
+        built with; other providers read their dedicated settings key (blank →
+        empty list → that model is skipped). Extend here for Anthropic etc."""
+        if provider == "gemini":
+            return self._api_keys
+        if provider == "openai":
+            key = (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
+            return [key] if key else []
+        # Generic convention: <PROVIDER>_API_KEY in settings (e.g. ANTHROPIC_API_KEY).
+        key = (getattr(settings, f"{provider.upper()}_API_KEY", "") or "").strip()
+        return [key] if key else []
+
     def _build_model_list_and_fallbacks(self) -> tuple[list[dict], list[dict]]:
         """Expand TIER_CONFIGS × api_keys into a flat deployment list.
 
@@ -139,7 +158,20 @@ class ModelRouter:
         for tier_name, config in TIER_CONFIGS.items():
             virtual = virtual_model_name(tier_name)
             for real_model in config["models"]:
-                for idx, api_key in enumerate(self._api_keys):
+                # Provider-aware keys: each model uses the key pool for ITS
+                # provider (gemini/* → Gemini keys, openai/* → OPENAI_API_KEY,
+                # etc.). A model whose provider key isn't configured is skipped
+                # (no broken deployment) — so adding `openai/<model>` to a tier
+                # is inert until OPENAI_API_KEY is set.
+                provider = _provider_of(real_model)
+                keys = self._keys_for_provider(provider)
+                if not keys:
+                    logger.info(
+                        "Router: skipping %r in tier %r — no %s API key configured.",
+                        real_model, tier_name, provider,
+                    )
+                    continue
+                for idx, api_key in enumerate(keys):
                     spec = DeploymentSpec(
                         virtual_name=virtual,
                         real_model=real_model,

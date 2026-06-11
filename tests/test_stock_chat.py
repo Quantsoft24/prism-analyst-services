@@ -81,7 +81,9 @@ def test_question_only_sends_minimal_payload(monkeypatch) -> None:
     )
     sent = calls[0]["json"]
     assert sent["question"] == "What did ITC discuss about sustainability?"
-    assert sent["synthesise"] is True
+    # Default synthesise=False → upstream returns evidence passages (with pdf_url
+    # + page) that our agent composes the answer from; enables citation deep-links.
+    assert sent["synthesise"] is False
     assert "company" not in sent
     # The forbidden v2 fields must NEVER appear in the payload.
     for forbidden in ("category", "period", "date_from", "date_to", "max_filings",
@@ -89,24 +91,27 @@ def test_question_only_sends_minimal_payload(monkeypatch) -> None:
         assert forbidden not in sent, f"Forbidden field {forbidden!r} found in payload"
 
 
-def test_single_company_hint_passed(monkeypatch) -> None:
+def test_single_security_id_passed(monkeypatch) -> None:
     _, calls = _invoke(
         monkeypatch,
         [_FakeResp(200, {"answer": "test", "selected_filings": []})],
         question="What risks did they flag?",
-        company="TCS",
+        security_id=2718,
     )
-    assert calls[0]["json"]["company"] == "TCS"
+    assert calls[0]["json"]["security_id"] == 2718
+    assert "company" not in calls[0]["json"]
 
 
-def test_company_list_passed(monkeypatch) -> None:
+def test_security_ids_list_passed(monkeypatch) -> None:
     _, calls = _invoke(
         monkeypatch,
         [_FakeResp(200, {"answer": "test", "selected_filings": []})],
         question="Compare their board outcomes",
-        company=["ICICI Bank", "HDFC Bank"],
+        security_ids=[1259, 1081],
     )
-    assert calls[0]["json"]["company"] == ["ICICI Bank", "HDFC Bank"]
+    assert calls[0]["json"]["security_ids"] == [1259, 1081]
+    # security_ids takes precedence — no single security_id key.
+    assert "security_id" not in calls[0]["json"]
 
 
 def test_synthesise_false_forwarded(monkeypatch) -> None:
@@ -119,16 +124,17 @@ def test_synthesise_false_forwarded(monkeypatch) -> None:
     assert calls[0]["json"]["synthesise"] is False
 
 
-def test_no_forbidden_fields_in_payload(monkeypatch) -> None:
-    """Even when various kwargs are attempted, forbidden fields stay out."""
+def test_only_question_synthesise_security_id_in_payload(monkeypatch) -> None:
+    """The payload carries only question + synthesise + the resolved id —
+    catalog filters stay out (the service's planner derives them)."""
     _, calls = _invoke(
         monkeypatch,
         [_FakeResp(200, {"answer": "ok", "selected_filings": []})],
         question="q",
-        company="Reliance",
+        security_id=2228,
     )
     sent = calls[0]["json"]
-    assert set(sent.keys()) == {"question", "synthesise", "company"}
+    assert set(sent.keys()) == {"question", "synthesise", "security_id"}
 
 
 # ── Response shape tests ───────────────────────────────────────────────────
