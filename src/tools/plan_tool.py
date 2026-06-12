@@ -21,13 +21,15 @@ _VALID_STATUS = {"pending", "in_progress", "done"}
 
 
 async def update_plan(tasks: list[dict]) -> dict:
-    """Show or update the user-visible task checklist for a MULTI-STEP request.
+    """Declare the user-visible task checklist for a MULTI-STEP request.
 
-    Call this FIRST when a question needs several steps (e.g. resolve companies →
-    pull financials → compose a comparison), passing the whole list with the first
-    task ``in_progress``. Then call it AGAIN whenever a task completes, flipping
-    that task to ``done`` and the next to ``in_progress``. Skip it for trivial
-    one-step answers. Keep titles short and user-facing ("Compare FY24 margins").
+    Call this ONCE near the start when a question needs several steps (e.g. resolve
+    companies → pull financials → compose a comparison), passing the whole ordered
+    list with the first task ``in_progress`` and the rest ``pending``. You do NOT
+    need to call it again or update statuses — the runner ticks each task off
+    automatically as that step's tool work actually completes, so the checklist
+    stays in sync with the real work. Skip it for trivial one-step answers. Keep
+    titles short and user-facing ("Compare FY24 margins").
 
     Args:
         tasks: ordered list of ``{"title": str, "status": "pending"|"in_progress"

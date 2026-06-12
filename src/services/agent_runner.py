@@ -123,6 +123,17 @@ class AgentRunner:
         self._agent_run_id: uuid.UUID | None = None
         self._started_at: float = 0.0
         self._tool_trace: list[dict[str, Any]] = []
+        # Task checklist. The agent declares the step TITLES once via update_plan;
+        # the RUNNER owns the statuses and advances them deterministically as each
+        # tool actually completes (``_gather_count`` = successful tool results so
+        # far → how many steps are done). This keeps the checklist in lockstep with
+        # real work instead of the model's unreliable, laggy update_plan calls.
+        self._last_plan_steps: list[dict[str, Any]] | None = None
+        # Runner-synthesized checklist (the fallback when the agent doesn't declare
+        # one via update_plan) — built from the tool sequence so a multi-step turn
+        # ALWAYS shows a synced checklist. Agent-declared titles take precedence.
+        self._auto_plan_steps: list[dict[str, Any]] = []
+        self._gather_count: int = 0
         self._input_tokens = 0
         self._output_tokens = 0
 
@@ -359,6 +370,19 @@ class AgentRunner:
                     pending_calls[call_id] = (tool_name, time.perf_counter())
                     self._tool_trace.append({"tool": tool_name, "args": args, "call_id": call_id})
                     yield ToolCallEvent(tool=tool_name, args=args, call_id=call_id)
+                    # Fallback checklist: if the agent didn't declare a plan, build
+                    # one from the tool sequence (deduped friendly titles) so a
+                    # multi-step turn always shows a synced checklist. The 2nd
+                    # distinct phase is when it first renders.
+                    if not self._last_plan_steps:
+                        title = _plan_step_title(tool_name)
+                        if not self._auto_plan_steps or self._auto_plan_steps[-1]["title"] != title:
+                            self._auto_plan_steps.append(
+                                {"id": f"a{len(self._auto_plan_steps)}", "title": title}
+                            )
+                        evt = self._build_plan_event(self._gather_count)
+                        if evt is not None:
+                            yield evt
                     continue
 
                 fn_resp = getattr(part, "function_response", None)
@@ -369,11 +393,21 @@ class AgentRunner:
                     started = pending_calls.pop(call_id, (tool_name, time.perf_counter()))[1]
                     latency_ms = int((time.perf_counter() - started) * 1000)
 
-                    # `update_plan` → emit the task checklist (PlanEvent); no card.
+                    # `update_plan` → the agent DECLARES the step titles; the
+                    # runner renders statuses at the current progress (so even a
+                    # late declaration reflects tools already finished). No card.
                     if tool_name == "update_plan":
                         if isinstance(response, dict) and "_plan" in response:
                             raw_steps = response["_plan"].get("steps") or []
-                            yield PlanEvent(steps=[PlanStep(**s) for s in raw_steps])
+                            # Accept the agent's declared plan ONLY if it's a real
+                            # multi-step plan (>=2) AND the runner's fallback hasn't
+                            # already started — otherwise a lazy, late 1-step
+                            # "plan" would replace the better synced fallback.
+                            if len(raw_steps) >= 2 and len(self._auto_plan_steps) < 2:
+                                self._last_plan_steps = raw_steps
+                                evt = self._build_plan_event(self._gather_count)
+                                if evt is not None:
+                                    yield evt
                         continue
 
                     # Agentic clarification → terminate the turn with a
@@ -478,6 +512,13 @@ class AgentRunner:
                     chart_evt = _try_emit_chart(tool_name, call_id, response)
                     if chart_evt is not None:
                         yield chart_evt
+                    # Runner-driven checklist: a tool just finished → advance the
+                    # plan one step, IN SYNC with the real work (not the model's
+                    # discretionary, laggy update_plan calls).
+                    self._gather_count += 1
+                    evt = self._build_plan_event(self._gather_count)
+                    if evt is not None:
+                        yield evt
                     continue
 
                 # Text part — either a "thought" (Gemini thinking mode, if ever
@@ -535,6 +576,14 @@ class AgentRunner:
             await self._close_run_row(
                 status="awaiting_clarification",
                 final_answer=event.question,
+                result_payload={
+                    "structured": None,
+                    "plan": [
+                        s.model_dump()
+                        for s in (self._build_plan_event(self._gather_count) or PlanEvent(steps=[])).steps
+                    ],
+                    "clarification": event.model_dump(mode="json"),
+                },
             )
             return
 
@@ -677,11 +726,30 @@ class AgentRunner:
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
 
+        # Final checklist state (every step done — including any trailing "compose"
+        # step that had no tool of its own). Computed once for both the live
+        # PlanEvent and the persisted replay payload (agent OR runner-built plan).
+        done_plan = self._build_plan_event(len(self._active_plan() or []))
+        done_steps = [s.model_dump() for s in done_plan.steps] if done_plan is not None else []
+
         await self._close_run_row(
             status="complete",
             final_answer=prose,
             cost_usd=cost,
+            result_payload={
+                # Persist the SAME structured payload the UI rendered live so a
+                # reopened conversation replays citations / confidence / freshness
+                # / sources / follow-ups — not just the prose.
+                "structured": (
+                    structured.model_dump(mode="json") if structured is not None else None
+                ),
+                "plan": done_steps,
+                "clarification": None,
+            },
         )
+
+        if done_plan is not None:
+            yield done_plan
 
         yield FinalEvent(
             answer=prose,
@@ -692,6 +760,39 @@ class AgentRunner:
             output_tokens=self._output_tokens,
             latency_ms=latency_ms,
         )
+
+    # ── Runner-driven task checklist ─────────────────────────────────────────
+
+    def _active_plan(self) -> list[dict[str, Any]] | None:
+        """The checklist steps to render: the agent's declared titles if it gave
+        any, else the runner-synthesized fallback (only once it has ≥2 distinct
+        phases — a single tool isn't worth a checklist)."""
+        if self._last_plan_steps:
+            return self._last_plan_steps
+        if len(self._auto_plan_steps) >= 2:
+            return self._auto_plan_steps
+        return None
+
+    def _build_plan_event(self, progress: int) -> "PlanEvent | None":
+        """Render the checklist at a given progress (# of completed steps).
+
+        Step TITLES come from the agent (update_plan) or, as a fallback, the
+        runner's tool-derived titles. The runner owns the STATUSES — steps
+        ``[0, progress)`` are ``done``, step ``progress`` is ``in_progress`` (the
+        one being worked), the rest ``pending``. ``progress`` is driven by real
+        tool completion (``_gather_count``), so the checklist ticks off in sync
+        with the work, not the model's whims.
+        """
+        steps = self._active_plan()
+        if not steps:
+            return None
+        n = len(steps)
+        p = max(0, min(progress, n))
+        rendered = []
+        for i, s in enumerate(steps):
+            status = "done" if i < p else ("in_progress" if i == p else "pending")
+            rendered.append(PlanStep(id=str(s.get("id") or f"s{i}"), title=str(s.get("title") or ""), status=status))
+        return PlanEvent(steps=rendered)
 
     # ── Deterministic gather-rescue ──────────────────────────────────────────
 
@@ -778,7 +879,11 @@ class AgentRunner:
                         if tool_name == "update_plan":
                             if isinstance(response, dict) and "_plan" in response:
                                 raw_steps = response["_plan"].get("steps") or []
-                                yield PlanEvent(steps=[PlanStep(**s) for s in raw_steps])
+                                if len(raw_steps) >= 2 and len(self._auto_plan_steps) < 2:
+                                    self._last_plan_steps = raw_steps
+                                    evt = self._build_plan_event(self._gather_count)
+                                    if evt is not None:
+                                        yield evt
                             continue
                         # A re-fired clarification in the rescue is ignored (the
                         # nudge forbids it); treat it as a normal result so the
@@ -817,6 +922,11 @@ class AgentRunner:
                                     source=_freshness_source_label(tool_name),
                                     as_of=str(freshness),
                                 )
+                        # Keep the checklist advancing during the rescue pass too.
+                        self._gather_count += 1
+                        evt = self._build_plan_event(self._gather_count)
+                        if evt is not None:
+                            yield evt
                         continue
 
                     text = getattr(part, "text", None)
@@ -865,6 +975,7 @@ class AgentRunner:
         cost_usd: float | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        result_payload: dict[str, Any] | None = None,
     ) -> None:
         """Update the row this runner opened. Safe to call once at end of run."""
         if self._agent_run_id is None:
@@ -879,6 +990,7 @@ class AgentRunner:
                 error_code=error_code,
                 error_message=error_message,
                 latency_ms=latency_ms,
+                result_payload=result_payload,
             )
 
     async def _update_row(
@@ -891,22 +1003,24 @@ class AgentRunner:
         error_code: str | None,
         error_message: str | None,
         latency_ms: int,
+        result_payload: dict[str, Any] | None = None,
     ) -> None:
-        stmt = (
-            update(AgentRun)
-            .where(AgentRun.id == self._agent_run_id)
-            .values(
-                status=status,
-                final_answer=final_answer,
-                cost_usd=cost_usd,
-                error_code=error_code,
-                error_message=error_message,
-                latency_ms=latency_ms,
-                tool_trace=self._tool_trace,
-                input_tokens=self._input_tokens,
-                output_tokens=self._output_tokens,
-            )
-        )
+        values: dict[str, Any] = {
+            "status": status,
+            "final_answer": final_answer,
+            "cost_usd": cost_usd,
+            "error_code": error_code,
+            "error_message": error_message,
+            "latency_ms": latency_ms,
+            "tool_trace": self._tool_trace,
+            "input_tokens": self._input_tokens,
+            "output_tokens": self._output_tokens,
+        }
+        # Only overwrite result_payload when we have one — never clobber a stored
+        # payload with null on an error/intermediate close.
+        if result_payload is not None:
+            values["result_payload"] = result_payload
+        stmt = update(AgentRun).where(AgentRun.id == self._agent_run_id).values(**values)
         await session.execute(stmt)
 
 
@@ -1713,6 +1827,32 @@ def _freshness_source_label(tool_name: str) -> str:
     if tool_name == "web_search":
         return "web search"
     return tool_name
+
+
+_TOOL_STEP_TITLES = {
+    "resolve_company": "Identify the company",
+    "resolve_companies": "Identify the companies",
+    "search_companies": "Search companies",
+    "financials_query": "Pull financial data",
+    "stock_filings_read": "Read filings",
+    "stock_filings_list": "List filings",
+    "stock_technicals": "Fetch market data",
+    "web_search": "Search the web",
+}
+
+
+def _plan_step_title(tool_name: str) -> str:
+    """A short, user-facing checklist title for a tool — used to synthesize the
+    runner's fallback checklist when the agent didn't declare one."""
+    if tool_name in _TOOL_STEP_TITLES:
+        return _TOOL_STEP_TITLES[tool_name]
+    if tool_name.startswith("news_"):
+        return "Gather recent news"
+    if tool_name.startswith("bmc_"):
+        return "Analyze the business model"
+    if tool_name.startswith(("sebi_", "regulatory")):
+        return "Check regulatory data"
+    return tool_name.replace("_", " ").capitalize()
 
 
 class _TokenChunker:

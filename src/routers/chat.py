@@ -197,17 +197,24 @@ async def get_conversation(
     )
     if not runs:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-    turns = [
-        ConversationTurn(
-            agent_run_id=r.id,
-            user_input=r.user_input,
-            final_answer=r.final_answer,
-            status=r.status,
-            created_at=r.created_at,
-            tool_trace=r.tool_trace,
+    turns = []
+    for r in runs:
+        payload = r.result_payload or {}
+        turns.append(
+            ConversationTurn(
+                agent_run_id=r.id,
+                user_input=r.user_input,
+                final_answer=r.final_answer,
+                status=r.status,
+                created_at=r.created_at,
+                tool_trace=r.tool_trace,
+                # Restore the rich view from result_payload (null on legacy rows
+                # → Pydantic coerces the stored dicts back into the typed models).
+                structured=payload.get("structured"),
+                plan=payload.get("plan") or [],
+                clarification=payload.get("clarification"),
+            )
         )
-        for r in runs
-    ]
     return ConversationDetail(session_id=session_id, turns=turns)
 
 

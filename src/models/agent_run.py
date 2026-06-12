@@ -58,6 +58,14 @@ class AgentRun(UUIDPKMixin, TimestampMixin, Base):
     # JSONB so we can query later (e.g. "all runs that called google_search").
     tool_trace: Mapped[list | None] = mapped_column(JSONB, server_default="[]")
 
+    # Renderable structured outputs of the turn beyond the prose `final_answer`,
+    # so reopening a past conversation replays the SAME rich view the user saw
+    # live (citations/confidence/freshness/sources/follow-ups, task checklist,
+    # clarification) — not a degraded prose-only version. Shape:
+    #   {"structured": FinalAnswer|null, "plan": [PlanStep], "clarification": ClarificationEvent|null}
+    # Null on legacy rows (they replay prose-only, as before).
+    result_payload: Mapped[dict | None] = mapped_column(JSONB)
+
     # Cost + token telemetry — populated from ADK event usage_metadata.
     model: Mapped[str | None] = mapped_column(String(64))
     input_tokens: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)

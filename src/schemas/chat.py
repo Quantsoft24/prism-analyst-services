@@ -330,7 +330,15 @@ class ConversationSummary(BaseModel):
 
 
 class ConversationTurn(BaseModel):
-    """One turn (one agent_run) inside a conversation, for replay."""
+    """One turn (one agent_run) inside a conversation, for replay.
+
+    ``structured`` / ``plan`` / ``clarification`` are restored from the stored
+    ``result_payload`` so reopening a past conversation renders the SAME rich
+    view the user saw live (citations, confidence, freshness, sources, follow-up
+    chips, task checklist, and a resumable pending clarification) — not a
+    degraded prose-only replay. Null/empty on legacy rows saved before this was
+    persisted.
+    """
 
     agent_run_id: uuid.UUID
     user_input: str
@@ -338,6 +346,9 @@ class ConversationTurn(BaseModel):
     status: str
     created_at: datetime
     tool_trace: list[dict[str, Any]] | None = None
+    structured: FinalAnswer | None = None
+    plan: list[PlanStep] = Field(default_factory=list)
+    clarification: ClarificationEvent | None = None
 
 
 class ConversationDetail(BaseModel):
