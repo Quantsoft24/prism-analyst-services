@@ -62,9 +62,14 @@ TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
     # are `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3.1-flash-lite`.
     "fast": {
         "description": "Tool-using agent steps, intent detection, Q&A. Function-calling required.",
+        # gemini-2.5-flash is PRIMARY: the company_intel orchestrator (the only
+        # `fast` consumer) needs strong instruction-following so it keeps the
+        # user's qualifiers (period/topic) in tool-call args. flash-lite drops
+        # them ("…board meetings 2025" → "summary of board meetings"), fetching
+        # the wrong data. flash-lite stays as a fast fallback for burst capacity.
         "models": [
-            "gemini/gemini-2.5-flash-lite",     # primary free workhorse — fast, function-calling
-            "gemini/gemini-2.5-flash",          # more capable flash — burst capacity
+            "gemini/gemini-2.5-flash",          # primary — best tool-use / instruction-following
+            "gemini/gemini-2.5-flash-lite",     # fast fallback — burst capacity
             "gemini/gemini-3.1-flash-lite",     # newer-gen flash-lite — extra capacity
         ],
         "rpm": 12,

@@ -173,6 +173,9 @@ class Citation(BaseModel):
     source_kind: Literal["filing", "web", "bmc", "tool"] = "tool"
     as_of: str | None = None  # ISO date or null
     tool_call_id: str | None = None  # links to a ToolCallEvent.call_id
+    # Page in the source PDF this citation points at (filings). Lets the UI deep
+    # link to the exact page in the Report-tab viewer. Populated in Phase 6.
+    page: int | None = None
 
 
 class FinalKpi(BaseModel):
@@ -217,6 +220,9 @@ class FinalAnswer(BaseModel):
     data_freshness: str | None = None  # earliest source date present in the answer
     kpis: list[FinalKpi] = Field(default_factory=list)
     sections: list[FinalSection] = Field(default_factory=list)
+    # 2-3 suggested next questions our tools can answer — rendered as clickable
+    # chips. Composed in the same pass (no extra LLM call).
+    suggestions: list[str] = Field(default_factory=list)
 
 
 class FinalEvent(BaseModel):
@@ -235,6 +241,67 @@ class FinalEvent(BaseModel):
     input_tokens: int
     output_tokens: int
     latency_ms: int
+
+
+class ClarificationOption(BaseModel):
+    """One selectable answer in a clarification question (single/multi select)."""
+
+    id: str                       # stable client key
+    label: str                    # e.g. "Reliance Industries Ltd."
+    hint: str | None = None       # e.g. "RELIANCE · NSE/BSE · Oil, Gas …"
+    value: Any                    # what the client sends back (e.g. a security_id)
+
+
+class ClarificationQuestion(BaseModel):
+    """One question in a clarification form. Several can be asked together (e.g.
+    disambiguating "Reliance", "Adani", and "Tata" in one comparison) so the user
+    answers them all at once — Claude-Code-style multi-question prompts."""
+
+    id: str                       # stable key — e.g. the term being disambiguated ("Reliance")
+    question: str
+    mode: Literal["single_select", "multi_select", "open_text"] = "single_select"
+    options: list[ClarificationOption] = Field(default_factory=list)
+    # The UI offers a securities search box (the "none of these" path).
+    allow_search: bool = True
+
+
+class ClarificationEvent(BaseModel):
+    """Terminal event: the agent needs the user to disambiguate before it can
+    proceed. The UI renders an interactive form with ONE OR MORE questions (each a
+    radio/MCQ, checkboxes, or free-text, plus a master_securities search box for
+    company picks). The user answers them all and the combined selection is sent
+    as the next ``/chat/run`` message in the same session; the agent resumes.
+
+    Replaces a prose "which one did you mean?" with a structured, clickable
+    picker — the core of the agentic clarification flow.
+    """
+
+    type: Literal["clarification"] = "clarification"
+    agent_run_id: uuid.UUID | None = None
+    # The form's questions (one or many). Clients should render `questions`.
+    questions: list[ClarificationQuestion] = Field(default_factory=list)
+    # ── Back-compat single-question mirror (= questions[0]); prefer `questions`. ──
+    question: str = ""
+    mode: Literal["single_select", "multi_select", "open_text"] = "single_select"
+    options: list[ClarificationOption] = Field(default_factory=list)
+    allow_search: bool = True
+
+
+class PlanStep(BaseModel):
+    """One task in the agent's visible plan/checklist."""
+
+    id: str = ""
+    title: str
+    status: Literal["pending", "in_progress", "done"] = "pending"
+
+
+class PlanEvent(BaseModel):
+    """The agent's task list (Claude-Code-style checklist). Emitted whenever the
+    agent declares or updates its plan via ``update_plan``; the UI renders the
+    latest ``steps`` as checkboxes that tick off as work progresses."""
+
+    type: Literal["plan"] = "plan"
+    steps: list[PlanStep] = Field(default_factory=list)
 
 
 class ErrorEvent(BaseModel):
@@ -263,7 +330,15 @@ class ConversationSummary(BaseModel):
 
 
 class ConversationTurn(BaseModel):
-    """One turn (one agent_run) inside a conversation, for replay."""
+    """One turn (one agent_run) inside a conversation, for replay.
+
+    ``structured`` / ``plan`` / ``clarification`` are restored from the stored
+    ``result_payload`` so reopening a past conversation renders the SAME rich
+    view the user saw live (citations, confidence, freshness, sources, follow-up
+    chips, task checklist, and a resumable pending clarification) — not a
+    degraded prose-only replay. Null/empty on legacy rows saved before this was
+    persisted.
+    """
 
     agent_run_id: uuid.UUID
     user_input: str
@@ -271,6 +346,9 @@ class ConversationTurn(BaseModel):
     status: str
     created_at: datetime
     tool_trace: list[dict[str, Any]] | None = None
+    structured: FinalAnswer | None = None
+    plan: list[PlanStep] = Field(default_factory=list)
+    clarification: ClarificationEvent | None = None
 
 
 class ConversationDetail(BaseModel):

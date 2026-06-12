@@ -4,7 +4,7 @@ Backs the Stock Dashboard. Two tables only — ``master_securities`` (NSE/BSE
 security master) and ``prices_and_securities`` (daily OHLC / volume / value /
 market-cap). These are OWNED externally; we treat them as strictly read-only.
 
-Parallels ``src/core/catalog_database.py`` but:
+Like the other read-only secondaries (SEBI), it:
   * Uses its own ``DeclarativeBase`` (``InvestmentBase``) so PRISM's Alembic
     history never sees these models (no risk of accidental CREATE/DROP).
   * Initialised only when the investment DB is configured (``INVESTMENT_DB_*``

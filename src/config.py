@@ -40,6 +40,19 @@ class Settings(BaseSettings):
     GEMINI_API_KEY_2: str = ""
     GEMINI_API_KEY_3: str = ""
     GEMINI_API_KEY_4: str = ""
+    GEMINI_API_KEY_5: str = ""
+    GEMINI_API_KEY_6: str = ""
+    GEMINI_API_KEY_7: str = ""
+    GEMINI_API_KEY_8: str = ""
+
+    # ── LLM: OpenAI (optional, provider-swap ready) ──
+    # Blank by default — Gemini-only runs are unaffected. Set this (gitignored
+    # .env only) to route any ``openai/<model>`` entries added to a tier in
+    # ``model_router_config.py`` through the ModelRouter. The router pairs
+    # ``openai/*`` deployments with this key (Gemini models keep using the
+    # Gemini keys). Lets us use a stronger composer (e.g. GPT-4.x) for the
+    # ``quality`` tier without touching router code.
+    OPENAI_API_KEY: str = ""
 
     # ── LLM: OpenRouter (fallback) ──
     OPENROUTER_API_KEY: str = ""
@@ -92,7 +105,11 @@ class Settings(BaseSettings):
 
     # Hard caps per agent invocation — fail-safes, not optimization knobs.
     AGENT_MAX_ITERATIONS: int = 10
-    AGENT_TIMEOUT_SECONDS: int = 60
+    # A multi-step turn (resolve → gather → quality-tier compose) plus the
+    # router's multi-key 429 back-off can legitimately need >60s on the free
+    # tier; 60s was clipping otherwise-good turns into a timeout. 90s gives the
+    # fallback chain room without making a stuck turn hang absurdly long.
+    AGENT_TIMEOUT_SECONDS: int = 90
     AGENT_MAX_COST_INR: float = 10.0  # abort if estimated cost exceeds this
 
     # ── Model Router (Slice 4 — multi-key + multi-model fallback) ──
@@ -181,16 +198,6 @@ class Settings(BaseSettings):
     # network-restricted to the PRISM backend's IP. Dev: localhost; prod: VM IP.
     BMC_URL: str = "http://localhost:8012"
 
-    # ── Catalog DB (READ-ONLY secondary engine pointing at the stock_chat
-    # Postgres). PRISM's company lookup tools + /api/v1/companies router read
-    # from `company_industry` here (4,773 rows) instead of maintaining a
-    # duplicate `companies` table in PRISM's primary DB. Same for any future
-    # read against `filings_index` / `document_texts`. NEVER write through
-    # this engine — those tables are owned by the stock-chat / bmc services.
-    # If left blank, falls back to ``POSTGRES_URL`` (the teammate's env-var name).
-    CATALOG_DATABASE_URL: str = ""
-    POSTGRES_URL: str = ""  # back-compat: read teammate's .env if set
-
     # ── Investment DB (READ-ONLY secondary engine — new AWS RDS ``investment``
     # Postgres backing the Stock Dashboard). Two tables only: ``master_securities``
     # (8,230 NSE/BSE securities) + ``prices_and_securities`` (21.5M daily OHLC /
@@ -277,24 +284,6 @@ class Settings(BaseSettings):
         does, which is exactly what managed providers like Neon expect.
         """
         return self._build_url("psycopg", strip_sslmode=False)
-
-    @property
-    def async_catalog_database_url(self) -> str:
-        """Async URL for the read-only catalog DB (stock_chat Postgres).
-        Prefers ``CATALOG_DATABASE_URL``; falls back to ``POSTGRES_URL`` (the
-        teammate's existing env-var name). Returns "" if neither is set —
-        callers should handle gracefully (catalog features just don't load).
-        Strips ``sslmode`` and normalizes the driver to asyncpg (same logic
-        as the primary URL builder)."""
-        raw = self.CATALOG_DATABASE_URL or self.POSTGRES_URL
-        if not raw:
-            return ""
-        url = raw
-        for prefix in ("postgresql://", "postgres://"):
-            if url.startswith(prefix):
-                url = "postgresql+asyncpg://" + url[len(prefix):]
-                break
-        return _strip_sslmode(url)
 
     @property
     def async_investment_database_url(self) -> str:
@@ -409,15 +398,29 @@ class Settings(BaseSettings):
 
     @property
     def gemini_api_keys(self) -> list[str]:
-        """All non-empty Gemini API keys, for round-robin."""
+        """All non-empty Gemini API keys, for round-robin + 429 fallback.
+        The ModelRouter replicates every model across ALL of these, so adding
+        keys directly widens free-tier headroom (the composer leans on this)."""
         keys = [
             self.GEMINI_API_KEY,
             self.GEMINI_API_KEY_1,
             self.GEMINI_API_KEY_2,
             self.GEMINI_API_KEY_3,
             self.GEMINI_API_KEY_4,
+            self.GEMINI_API_KEY_5,
+            self.GEMINI_API_KEY_6,
+            self.GEMINI_API_KEY_7,
+            self.GEMINI_API_KEY_8,
         ]
-        return [k for k in keys if k]
+        # De-dupe (a key pasted twice would double-count as one deployment) while
+        # preserving order.
+        seen: set[str] = set()
+        out: list[str] = []
+        for k in keys:
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+        return out
 
 
 def _strip_sslmode(url: str) -> str:
