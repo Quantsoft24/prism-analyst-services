@@ -18,11 +18,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
-from src.core.catalog_database import (
-    dispose_catalog_engine,
-    init_catalog_engine,
-    is_catalog_configured,
-)
 from src.core.database import dispose_engine, init_engine
 from src.core.investment_database import (
     dispose_investment_engine,
@@ -38,7 +33,6 @@ from src.integrations import dispose_registry, init_registry
 from src.routers import (
     bmc_router,
     chat_router,
-    companies_router,
     integrations_router,
     me_router,
     news_router,
@@ -129,18 +123,6 @@ async def lifespan(app: FastAPI):
     _configure_auth()
     init_engine()
 
-    # Secondary read-only engine for the catalog DB (stock_chat Postgres) —
-    # powers /api/v1/companies + the chat agent's company lookup tools.
-    # Skipped silently if the URL isn't set (keeps tests / minimal deploys
-    # working). Failures here log + continue; companies endpoints will 503
-    # if accessed without the catalog being up.
-    if is_catalog_configured():
-        try:
-            init_catalog_engine()
-            logger.info("Catalog DB engine initialized (read-only).")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Catalog DB engine failed to initialize: %s", exc)
-
     # Read-only engine for the investment DB (AWS RDS) — powers the Stock
     # Dashboard (/api/v1/stocks/*). Skipped silently if not configured; a
     # failure here logs + continues (the stocks routes 503 if accessed).
@@ -190,7 +172,6 @@ async def lifespan(app: FastAPI):
         dispose_router()
         await dispose_sebi_engine()
         await dispose_investment_engine()
-        await dispose_catalog_engine()
         await dispose_engine()
 
 
@@ -237,7 +218,6 @@ async def root() -> dict[str, str]:
 
 
 # ── Versioned API routers ──
-app.include_router(companies_router, prefix=settings.API_PREFIX)
 app.include_router(chat_router, prefix=settings.API_PREFIX)
 app.include_router(bmc_router, prefix=settings.API_PREFIX)
 app.include_router(news_router, prefix=settings.API_PREFIX)

@@ -15,14 +15,10 @@ from src.schemas.chat import (
     ToolResultEvent,
 )
 from src.schemas.common import PageMeta, Paginated
-from src.schemas.company import CompanyAliasRead, CompanyDetail, CompanyRead
 
 __all__ = [
     "PageMeta",
     "Paginated",
-    "CompanyRead",
-    "CompanyDetail",
-    "CompanyAliasRead",
     "ChatRunRequest",
     "MetaEvent",
     "ToolCallEvent",
@@ -32,3 +28,4 @@ __all__ = [
     "ErrorEvent",
 ]
 # Filings schemas retired with the RAG layer (2026-05-24).
+# Company schemas retired with the catalog DB (company data → master_securities).

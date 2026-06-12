@@ -7,9 +7,6 @@ model module so that all tables are registered against ``Base.metadata``.
 from src.models.agent_run import AgentRun
 from src.models.base import Base
 from src.models.billing import Entitlement, Plan, Subscription
-
-# Catalog DB models (read-only, separate Base — kept out of Alembic's metadata).
-from src.models.catalog import CompanyIndustry  # noqa: F401
 from src.models.chat_conversation import ChatConversation
 from src.models.firm import Firm
 from src.models.integration import FirmIntegration
@@ -31,7 +28,6 @@ __all__ = [
     "PortfolioBacktest",
     "PortfolioCustomFactor",
     "PortfolioStrategy",
-    "CompanyIndustry",
     "UserPreference",
     "Plan",
     "Subscription",

@@ -11,12 +11,14 @@ right one for any question:
 The legacy ``/tools/ask`` and ``/tools/search-narrative`` are intentionally NOT
 wired — the service's own docs say "do not use for new integrations".
 
-**v3 contract (2026-05):** ``stock_filings_read`` sends only 3 fields —
-``question``, ``company`` (optional hint), and ``synthesise``. Every catalog
-filter (category, period, dates, industry, text_match, max_filings) is derived
-by the service's own LLM planner, which has domain context the upstream agent
-lacks (the catalog's exact category enum, the screener industry taxonomy,
-date-phrase semantics). The upstream agent MUST NOT pre-fill those fields.
+**Contract (security_id migration, 2026-06):** the agent resolves the company
+FIRST via ``resolve_company`` (clarifying if ambiguous) and passes the resulting
+``security_id`` — ``stock_filings_read`` / ``stock_filings_lookup`` /
+``stock_technicals`` all key off ``security_id`` (``security_ids`` for a
+comparison) rather than a free-text name, so the service pins the exact company
+by id instead of fuzzy-guessing. Every catalog filter (category, period, dates,
+text_match, max_filings) is still derived by the service's own LLM planner from
+the question; the agent MUST NOT pre-fill those.
 
 Base URL: ``settings.STOCK_CHAT_URL`` (env ``STOCK_CHAT_URL``). No caller auth —
 the service is network-restricted to the PRISM backend.
@@ -155,22 +157,27 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
 
 async def stock_filings_read(
     question: str,
-    company: str | list[str] | None = None,
-    synthesise: bool = True,
+    security_id: int | None = None,
+    security_ids: list[int] | None = None,
+    synthesise: bool = False,
 ) -> dict:
-    """Answer a NARRATIVE question about what an Indian listed company (or a whole
+    """Pull NARRATIVE EVIDENCE about what an Indian listed company (or a whole
     sector) said, disclosed, announced, decided, or commented on in its NSE/BSE
     filings — strategy, risks, MD&A, sustainability, governance, board decisions,
     dividends, regulatory disclosures, board members / directors. Searches a
-    650k-filing catalog, reads the actual PDF(s), and returns a synthesised
-    answer plus verbatim evidence passages with ``[Company | p.N]`` citations.
+    650k-filing catalog, reads the actual PDF(s), and returns **verbatim evidence
+    passages** — each with a ``[Company | p.N]`` citation, the page, and the source
+    ``pdf_url`` — that **YOU compose the answer from** (default ``synthesise=false``).
+    Every passage's citation deep-links to the exact PDF page in the UI, so always
+    write each fact you use with its ``[Company | p.N]`` citation verbatim.
 
-    **SIMPLIFIED CONTRACT (v3):** This tool's internal LLM planner handles ALL
-    catalog filtering — category, period, dates, sector industry matching,
-    text keywords, and how many PDFs to open. Do NOT pre-fill those fields;
-    the planner has domain-specific context (the catalog's exact category enum,
-    screener industry taxonomy, and date-phrase semantics) that the upstream
-    agent lacks. Just pass the question and an optional company hint.
+    **CONTRACT (v3):** Resolve the company FIRST via ``resolve_company`` and pass
+    its ``security_id`` (or ``security_ids`` for a multi-company comparison) — the
+    service then pins the exact company by id, so we never let it silently pick the
+    wrong "Reliance". For a SECTOR/general question with no specific company, pass
+    just the ``question`` (the planner infers the sector). This tool's internal LLM
+    planner handles ALL catalog filtering (category, period, dates, sector, text
+    keywords, how many PDFs to open) — do NOT pre-fill those.
 
     WHEN TO USE:
       • The user asks what a company/sector *said* or *disclosed* qualitatively.
@@ -195,31 +202,33 @@ async def stock_filings_read(
     the user. If ``selected_filings[].is_scanned`` is true, note the gap.
 
     Args:
-        question: The user's natural-language question (required). Pass it
-            verbatim — the service's 6-tier company resolver handles short
-            forms (TCS, RIL, L&T, M&M, HUL, SBI), 1-2 char typos
-            (Relianse, Bharat Petrolium), &/and variants, punctuation
-            (Dr. Reddy's), and BSE numeric scrip codes.
-        company: Optional company hint — a single name/ticker (``"TCS"``),
-            a list for comparisons (``["ICICI Bank", "HDFC Bank"]``), or
-            omitted (the planner extracts company names from the question).
-            Pass the user's input as-is; do NOT pre-resolve via
-            ``lookup_company`` — the service has its own resolver.
-        synthesise: ``True`` (default) → prose answer with inline
-            ``[Company | p.N]`` citations for direct user display.
-            ``False`` → evidence passages + bulk document excerpts only,
-            for when the orchestrator blends output from multiple tools.
+        question: The user's natural-language question (required), in their words.
+        security_id: The ``master_securities`` security_id from ``resolve_company``
+            for a SINGLE company. The id pins the exact company (matched against
+            both NSE and BSE), bypassing the service's fuzzy resolver.
+        security_ids: A list of security_ids for a multi-company COMPARISON
+            ("Compare ICICI and HDFC board outcomes") — resolve each company
+            first, then pass all their ids. Takes precedence over ``security_id``.
+            Omit both for a sector/general question (the planner infers it).
+        synthesise: Leave at the default ``False`` — the tool then returns the
+            verbatim ``evidence`` passages (each with its ``[Company | p.N]``
+            citation, page, and ``pdf_url``) and ``answer`` is null; YOU write the
+            answer from those passages and cite them. (``True`` makes the upstream
+            write the prose itself but returns NO evidence — so citations can't
+            deep-link to PDF pages; only use it if explicitly asked for raw prose.)
 
     Returns:
-        dict with ``answer``, ``plan``, ``needs_clarification`` /
-        ``clarification_question``, ``resolved_companies``,
-        ``selected_filings`` (enriched), ``evidence``,
+        dict with ``evidence`` (the passages you answer from — usually ``answer``
+        is null), ``plan``, ``needs_clarification`` / ``clarification_question``,
+        ``resolved_companies``, ``selected_filings`` (enriched, with ``pdf_link``),
         ``candidates_considered``, ``data_freshness``.
         ``{"error": ...}`` on a transport/service failure.
     """
     payload: dict = {"question": question, "synthesise": synthesise}
-    if company:
-        payload["company"] = company
+    if security_ids:
+        payload["security_ids"] = security_ids
+    elif security_id is not None:
+        payload["security_id"] = security_id
 
     data = await _post("/tools/read", payload, _READ_TIMEOUT)
     if data.get("ok") is False or "error" in data:
@@ -242,6 +251,7 @@ async def stock_filings_read(
         "candidates_considered": data.get("candidates_considered"),
         "selected_filings": [
             {
+                "newsid": f.get("newsid"),
                 "company_name": f.get("company_name"),
                 "headline": f.get("headline"),
                 "category": f.get("category"),
@@ -251,9 +261,12 @@ async def stock_filings_read(
                 "is_scanned": f.get("is_scanned"),
                 "why_selected": f.get("why_selected"),
                 "sections_read": f.get("sections_read"),
+                "pdf_link": f.get("pdf_link"),  # → citation deep-link (Phase 6)
             }
             for f in selected
         ],
+        # evidence carries {newsid, page, citation, pdf_url, quote} — the runner
+        # turns each into a deterministic filing Citation (url + page).
         "evidence": data.get("evidence"),
         "data_freshness": latest_dt,
         **({"retry_count": data["retry_count"]} if "retry_count" in data else {}),
@@ -261,9 +274,7 @@ async def stock_filings_read(
 
 
 async def stock_filings_lookup(
-    company: str | None = None,
-    companies: list[str] | None = None,
-    ticker: str | None = None,
+    security_id: int | None = None,
     category: str | None = None,
     period: str | None = None,
     date_from: str | None = None,
@@ -271,20 +282,20 @@ async def stock_filings_lookup(
     text_match: list[str] | None = None,
     limit: int = 50,
 ) -> dict:
-    """List WHICH Indian NSE/BSE filings exist for a company/sector — pure catalog
-    metadata, no PDF read, no LLM. Fast.
+    """List WHICH Indian NSE/BSE filings exist for ONE company — pure catalog
+    metadata, no PDF read, no LLM. Fast. Returns a clickable ``pdf_link`` per row.
 
     WHEN TO USE: the user wants to know what filings are available or how many
     ("list Reliance's annual reports", "how many board meetings did TCS file in
-    2026", "what corporate actions happened this quarter"). To answer a question
-    *from* a filing's content, use ``stock_filings_read`` instead.
+    2026"). To answer a question *from* a filing's content, use
+    ``stock_filings_read`` instead.
+
+    Resolve the company FIRST via ``resolve_company`` and pass its ``security_id``.
 
     Args:
-        company: Single company (name or ticker) — best-match resolved.
-        companies: Multiple companies.
-        ticker: Exact scrip code or NSE symbol.
+        security_id: The ``master_securities`` security_id from ``resolve_company``.
         category: "Annual Report" | "Result" | "Board Meeting" | "AGM/EGM" |
-            "Corp. Action" | "Company Update" | "Insider Trading / SAST".
+            "Corp. Action" | "Company Update" | "Insider Trading / SAST" (optional).
         period: Fiscal to-year, e.g. "2025".
         date_from: ISO YYYY-MM-DD lower bound.
         date_to: ISO YYYY-MM-DD upper bound.
@@ -292,17 +303,13 @@ async def stock_filings_lookup(
         limit: Max rows to return (default 50).
 
     Returns:
-        dict with ``total`` (full match count), ``resolved_companies``, and
-        ``filings`` (the current page: company, category, period, date, exchange,
-        headline, …). ``{"error": ...}`` on failure.
+        dict with ``total``, ``resolved_companies``, and ``filings`` (each:
+        newsid, company, category, period, date, exchange, headline, pdf_status,
+        and ``pdf_link`` — the clickable PDF URL). ``{"error": ...}`` on failure.
     """
     payload: dict = {"limit": limit, "order_by_date_desc": True}
-    if company:
-        payload["company"] = company
-    if companies:
-        payload["companies"] = companies
-    if ticker:
-        payload["ticker"] = ticker
+    if security_id is not None:
+        payload["security_id"] = security_id
     if category:
         payload["category"] = category
     if period:
@@ -327,6 +334,7 @@ async def stock_filings_lookup(
         "resolved_companies": data.get("resolved_companies"),
         "filings": [
             {
+                "newsid": f.get("newsid"),
                 "company_name": f.get("company_name"),
                 "category": f.get("category"),
                 "subcategory": f.get("subcategory"),
@@ -335,6 +343,8 @@ async def stock_filings_lookup(
                 "exchange": f.get("exchange"),
                 "headline": f.get("headline"),
                 "pdf_status": f.get("pdf_status"),
+                # PDF URL for the citation→exact-page deep link (Phase 6).
+                "pdf_link": f.get("download_url") or f.get("pdf_link"),
             }
             for f in filings
         ],
@@ -343,9 +353,7 @@ async def stock_filings_lookup(
 
 
 async def stock_technicals(
-    company: str | None = None,
-    ticker: str | None = None,
-    exchange: str = "NSE",
+    security_id: int,
     period: str = "1y",
 ) -> dict:
     """Live price + technical indicators for an Indian listed company — current
@@ -355,12 +363,10 @@ async def stock_technicals(
     WHEN TO USE: market-data questions ("what's TCS trading at", "is Infosys above
     its 200-day MA", "RSI for HDFC Bank"). NOT for anything from filings.
 
-    Provide EITHER ``company`` OR ``ticker`` (at least one is required).
+    Resolve the company FIRST via ``resolve_company`` and pass its ``security_id``.
 
     Args:
-        company: Company name — resolved to a symbol.
-        ticker: Exact symbol (e.g. "TCS").
-        exchange: "NSE" | "BSE" — only used with ``ticker``.
+        security_id: The ``master_securities`` security_id from ``resolve_company``.
         period: yfinance history window ("1y", "6mo", "5d", …), default "1y".
 
     Returns:
@@ -369,17 +375,13 @@ async def stock_technicals(
         On non-ok status the indicator fields are null and ``error`` has detail.
         ``{"error": ...}`` on a transport failure.
     """
-    if not company and not ticker:
+    if security_id is None:
         return make_error(
-            message="Need either a company name or a ticker for technicals.",
-            code="missing_company_hint",
+            message="Need a resolved security_id for technicals — call resolve_company first.",
+            code="missing_security_id",
             next_action="ask_user_to_clarify",
         )
-    payload: dict = {"exchange": exchange, "period": period}
-    if company:
-        payload["company"] = company
-    if ticker:
-        payload["ticker"] = ticker
+    payload: dict = {"security_id": security_id, "period": period}
     data = await _post("/tools/technicals", payload, _FAST_TIMEOUT)
     # Technicals are intrinsically "as of now" — mark for UI freshness chip.
     if data.get("ok") is not False and "error" not in data:

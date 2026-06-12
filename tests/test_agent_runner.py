@@ -567,7 +567,7 @@ class TestInitialPlanThought:
         # Phrasings must NEVER promise a specific tool — the agent might
         # choose differently and we'd have lied. This sanity-checks all
         # the templates above.
-        forbidden = ("lookup_company", "stock_filings_read", "financials_query",
+        forbidden = ("resolve_company", "stock_filings_read", "financials_query",
                      "bmc_get", "stock_technicals", "web_search")
         for msg in [
             "compare TCS and Infosys", "what is the profit of reliance",
@@ -804,9 +804,19 @@ class TestRescueEmptySynthesis:
         from src.services import agent_runner as ar
         monkeypatch.setattr(ar.settings, "GEMINI_API_KEY", keys[0] if keys else "")
         for i, k in enumerate(["GEMINI_API_KEY_1", "GEMINI_API_KEY_2",
-                               "GEMINI_API_KEY_3", "GEMINI_API_KEY_4"]):
+                               "GEMINI_API_KEY_3", "GEMINI_API_KEY_4",
+                               "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+                               "GEMINI_API_KEY_7", "GEMINI_API_KEY_8"]):
             monkeypatch.setattr(ar.settings, k, keys[i + 1] if len(keys) > i + 1 else "")
-        return await ar._rescue_empty_synthesis("the question", trace)
+        # Force the router-off path so these tests deterministically exercise the
+        # direct single-shot fallback (the composer tries the quality tier first).
+        import src.services.model_router as mr
+
+        def _no_router():
+            raise RuntimeError("router disabled in test")
+
+        monkeypatch.setattr(mr, "get_router", _no_router)
+        return await ar._compose_final_answer("the question", trace)
 
     def test_empty_trace_returns_none(self, monkeypatch) -> None:
         # No tools ran → nothing to compose from → skip rescue.
@@ -908,8 +918,8 @@ class TestRescueEmptySynthesis:
         ))
         assert result is None
 
-    def test_rescue_only_uses_last_3_tools(self, monkeypatch) -> None:
-        # Bound the prompt size by keeping at most 3 recent tool entries.
+    def test_composer_only_uses_last_6_tools(self, monkeypatch) -> None:
+        # Bound the prompt size by keeping at most 6 recent tool entries.
         captured_messages: list = []
 
         async def fake_acompletion(**kwargs):
@@ -921,15 +931,14 @@ class TestRescueEmptySynthesis:
 
         trace = [
             {"tool": f"tool_{i}", "args": {}, "response": {"r": i}}
-            for i in range(5)
+            for i in range(8)
         ]
         asyncio.run(self._run(monkeypatch, trace))
 
         user_msg = next(m["content"] for m in captured_messages if m["role"] == "user")
-        # Only the last 3 tools' names should appear in the user message.
-        assert "tool_2" in user_msg
-        assert "tool_3" in user_msg
-        assert "tool_4" in user_msg
+        # Only the last 6 tools' names should appear in the user message.
+        for i in range(2, 8):
+            assert f"tool_{i}" in user_msg
         assert "tool_0" not in user_msg
         assert "tool_1" not in user_msg
 
@@ -1078,3 +1087,176 @@ def _make_litellm_response(content: str):
             self.choices = [_Choice(c)]
 
     return _Resp(content)
+
+
+class TestMergeFilingCitations:
+    """Page-exact filing citations parsed from inline [Company | p.N] markers in
+    the prose, joined to selected_filings' pdf_link (the synthesise=true path)."""
+
+    def _trace(self):
+        # synthesise=true: evidence is empty; pdf_link lives in selected_filings.
+        return [{
+            "tool": "stock_filings_read",
+            "response": {
+                "selected_filings": [
+                    {"company_name": "ITC Ltd", "pdf_link": "https://www.bseindia.com/x.pdf"},
+                ],
+                "evidence": [],
+            },
+        }]
+
+    def test_evidence_is_primary_source(self):
+        # synthesise=false: evidence carries citation+page+pdf_url directly — used
+        # verbatim, no prose parsing or company-name join needed.
+        from src.schemas.chat import Citation, FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        trace = [{"tool": "stock_filings_read", "response": {"selected_filings": [], "evidence": [
+            {"citation": "[ITC Ltd | p.5]", "page": "5",
+             "pdf_url": "https://www.bseindia.com/itc.pdf", "company_name": "ITC Ltd"},
+            {"citation": "[ITC Ltd | p.42]", "page": "42",
+             "pdf_url": "https://www.bseindia.com/itc.pdf", "company_name": "ITC Ltd"},
+        ]}}]
+        s = FinalAnswer(text="answer the agent composed [ITC Ltd | p.5]",
+                        citations=[Citation(label="Web", url="https://ex.com", source_kind="web")])
+        out = _merge_filing_citations(s, trace)
+        fil = [c for c in out.citations if c.source_kind == "filing"]
+        assert {c.page for c in fil} == {5, 42}
+        assert all(c.url == "https://www.bseindia.com/itc.pdf" for c in fil)
+        assert any(c.source_kind == "web" for c in out.citations)  # non-filing kept
+
+    def test_builds_pageexact_citations_from_inline_markers(self):
+        from src.schemas.chat import Citation, FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        # spaced initials ("I T C Ltd.") + "p. 5" / "p.17" variants must all match.
+        s = FinalAnswer(
+            text="Net Zero by 2050 [I T C Ltd. | p. 5]. Packaging shift [ITC Ltd | p.17].",
+            citations=[Citation(label="Web note", url="https://ex.com", source_kind="web")],
+        )
+        out = _merge_filing_citations(s, self._trace())
+        fil = [c for c in out.citations if c.source_kind == "filing"]
+        assert {c.page for c in fil} == {5, 17}
+        assert all(c.url == "https://www.bseindia.com/x.pdf" for c in fil)
+        assert any(c.source_kind == "web" for c in out.citations)  # non-filing kept
+
+    def test_enriches_citation_with_page_in_label(self):
+        # The LLM's <answer_meta> citations sometimes carry the page in the LABEL
+        # ("ITC Ltd p. 7") rather than inline in the prose — enrich those too.
+        from src.schemas.chat import Citation, FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        s = FinalAnswer(text="Sustainability points.", citations=[
+            Citation(label="ITC Ltd p. 7", source_kind="filing"),
+            Citation(label="ITC Ltd p. 9", source_kind="filing"),
+        ])
+        out = _merge_filing_citations(s, self._trace())
+        assert {c.page for c in out.citations} == {7, 9}
+        assert all(c.url == "https://www.bseindia.com/x.pdf" for c in out.citations)
+
+    def test_adds_inline_pagecite_alongside_pageless_cite(self):
+        from src.schemas.chat import Citation, FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        # a page-less LLM cite is left alone; the inline page-cite is added w/ url+page.
+        s = FinalAnswer(
+            text="Sustainability agenda [ITC Ltd | p.5].",
+            citations=[Citation(label="ITC Annual Report 2025", source_kind="filing")],
+        )
+        out = _merge_filing_citations(s, self._trace())
+        assert any(c.page == 5 and c.url for c in out.citations)
+
+    def test_multi_company_matches_by_substring(self):
+        from src.schemas.chat import Citation, FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        trace = [{"tool": "stock_filings_read", "response": {"selected_filings": [
+            {"company_name": "ITC Ltd", "pdf_link": "https://www.bseindia.com/itc.pdf"},
+            {"company_name": "HDFC Bank Ltd", "pdf_link": "https://www.bseindia.com/hdfc.pdf"},
+        ], "evidence": []}}]
+        s = FinalAnswer(text="cmp", citations=[
+            Citation(label="ITC Ltd Annual Report 2025, p. 5", source_kind="filing"),
+            Citation(label="HDFC Bank Ltd FY25, p. 12", source_kind="filing"),
+        ])
+        out = _merge_filing_citations(s, trace)
+        by_url = {c.url: c.page for c in out.citations}
+        assert by_url.get("https://www.bseindia.com/itc.pdf") == 5
+        assert by_url.get("https://www.bseindia.com/hdfc.pdf") == 12
+
+    def test_single_pdf_fallback_on_company_mismatch(self):
+        from src.schemas.chat import FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        # inline company doesn't match the filing's name, but only ONE PDF was
+        # read → attribute the cite to it.
+        s = FinalAnswer(text="A point [Some Other Co | p.9].")
+        out = _merge_filing_citations(s, self._trace())
+        fil = [c for c in out.citations if c.source_kind == "filing"]
+        assert len(fil) == 1 and fil[0].page == 9
+
+    def test_noop_without_filings(self):
+        from src.schemas.chat import FinalAnswer
+        from src.services.agent_runner import _merge_filing_citations
+
+        s = FinalAnswer(text="x")
+        assert _merge_filing_citations(s, []) is s            # no tool results → unchanged
+        assert _merge_filing_citations(None, self._trace()) is None
+
+
+class TestComposerIntent:
+    """The composer answers the user's underlying question — even on a turn
+    whose message is just a clarification pick ("Company — security_id N")."""
+
+    def test_detects_clarification_pick(self):
+        from src.services.agent_runner import _looks_like_clarification_pick as f
+
+        assert f("Reliance Industries Ltd. — security_id 2228")
+        assert f("security_id: 1192")
+        assert not f("What were Reliance's 2025 board meetings?")
+
+    def test_tool_questions_only_question_arg_deduped(self):
+        from src.services.agent_runner import _tool_questions as f
+
+        trace = [
+            {"tool": "resolve_company", "args": {"query": "Reliance"}},  # excluded
+            {"tool": "stock_filings_read",
+             "args": {"question": "board meeting outcomes 2025", "security_id": 2228}},
+            {"tool": "stock_filings_read", "args": {"question": "board meeting outcomes 2025"}},
+        ]
+        assert f(trace) == ["board meeting outcomes 2025"]
+
+    def test_pick_turn_surfaces_tool_question_in_prompt(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_acompletion(**kwargs):
+            captured.update(kwargs)
+            return _make_litellm_response("answer")
+
+        import litellm
+        monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+
+        import src.services.model_router as mr
+
+        def _no_router():
+            raise RuntimeError("router off in test")
+
+        monkeypatch.setattr(mr, "get_router", _no_router)
+
+        from src.services import agent_runner as ar
+        monkeypatch.setattr(ar.settings, "GEMINI_API_KEY", "k")
+        for k in ["GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3",
+                  "GEMINI_API_KEY_4", "GEMINI_API_KEY_5", "GEMINI_API_KEY_6",
+                  "GEMINI_API_KEY_7", "GEMINI_API_KEY_8"]:
+            monkeypatch.setattr(ar.settings, k, "")
+
+        trace = [{
+            "tool": "stock_filings_read",
+            "args": {"question": "board meeting outcomes 2025", "security_id": 2228},
+            "response": {"evidence": [{"quote": "approved dividend"}]},
+        }]
+        asyncio.run(ar._compose_final_answer(
+            "Reliance Industries Ltd. — security_id 2228", trace))
+
+        umsg = next(m["content"] for m in captured["messages"] if m["role"] == "user")
+        assert "THE QUESTION TO ANSWER" in umsg
+        assert "board meeting outcomes 2025" in umsg
