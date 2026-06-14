@@ -9,11 +9,17 @@ Supported integration types (all native to Google ADK 1.33):
 
 | Type | ADK primitive | Use when |
 |------|---------------|----------|
-| `openapi` | `OpenAPIToolset` | The API has an OpenAPI/Swagger spec — every endpoint becomes a tool automatically. **Preferred.** |
-| `rest` | `FunctionTool` (thin wrapper) | A REST endpoint with no machine-readable spec. |
+| `openapi` | `OpenAPIToolset` | The API has an OpenAPI/Swagger spec — every endpoint becomes a tool automatically. **Preferred** when the spec is clean and you want every operation. |
 | `mcp` | `MCPToolset` | The tool is exposed over the Model Context Protocol (stdio or HTTP/SSE). |
-| `python` | `FunctionTool` | An in-process Python function (like the NRE/BMC tools today). |
+| `python` | `FunctionTool` | An in-process Python function **or a thin typed wrapper around a REST endpoint** (how every teammate service is onboarded today). |
 | `agent` | `AgentTool` | A specialist sub-agent callable by other agents. |
+
+> **There is no `rest` source type.** A teammate REST API is onboarded as a
+> `python`-typed wrapper (mirroring `src/integrations/tools/stock_chat.py`): a
+> few hand-written `FunctionTool`s that call the endpoint with `httpx`, so you
+> expose only the agent-useful operations and inherit the structured error
+> contract. All the realized teammate REST integrations — `stock_chat`,
+> `prism_financials`, `prism_news`, `bmc`, `sebi_regulatory` — landed this way.
 
 ---
 
@@ -35,7 +41,7 @@ Supported integration types (all native to Google ADK 1.33):
 ### Identity & purpose
 - **Name:**
 - **One-line purpose** (what it does + when the agent should call it):
-- **Type:** `openapi` | `rest` | `mcp` | `python` | `agent`
+- **Type:** `openapi` | `mcp` | `python` | `agent`  (a REST endpoint → `python` wrapper)
 - **Owner / contact + repo:**
 
 ### Interface  (fill the sub-section matching the type)
@@ -44,7 +50,7 @@ Supported integration types (all native to Google ADK 1.33):
 - Spec URL or file (OpenAPI 2 or 3?):
 - Base URL(s): dev / staging / prod:
 
-**If `rest` (no spec) — repeat per endpoint:**
+**If `python` wrapping a REST endpoint (no usable spec) — repeat per endpoint:**
 - Method + path:
 - Request schema (field · type · required?):
 - Response schema:

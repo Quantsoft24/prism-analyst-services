@@ -4,6 +4,8 @@ Direct read-only reads against the investment RDS (like ``companies.py``, NOT
 an httpx proxy like ``news.py``). Powers the frontend Stock Dashboard:
 
   * ``GET /api/v1/stocks/securities``            — the full search index
+  * ``GET /api/v1/stocks/indices/latest``        — index levels + day move (landing)
+  * ``GET /api/v1/stocks/movers``                — top gainers/losers/most-active
   * ``GET /api/v1/stocks/{security_id}``         — one security's master detail
   * ``GET /api/v1/stocks/{security_id}/prices``  — daily OHLC/volume/value/mcap
   * ``GET /api/v1/stocks/{security_id}/balance-sheet`` / ``/income-statement``
@@ -32,6 +34,10 @@ from src.schemas.stock import (
     BalanceSheetResponse,
     FinancialBasis,
     IncomeStatementResponse,
+    IndexLatest,
+    MoverKind,
+    MoverRow,
+    MoversResponse,
     PricePoint,
     PriceSeriesResponse,
     SecurityDetail,
@@ -282,6 +288,78 @@ async def list_announcements(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Filings service returned a non-JSON response.",
         ) from exc
+
+
+# ── Market overview (landing) ───────────────────────────────────────────────
+# Declared BEFORE /{security_id} so "indices" / "movers" aren't matched as an
+# int security_id. Both read straight from the investment DB (cached in-repo).
+
+
+@router.get(
+    "/indices/latest",
+    response_model=list[IndexLatest],
+    summary="Latest level + day move + sparkline for each index (landing strip)",
+    description=(
+        "One row per index in ``indices_list`` (the 5 NSE universes: Nifty 50 / "
+        "Next 50 / 100 / 200 / 500). Each carries the latest close (level), the "
+        "day-over-day % change, and a short ``spark`` array of recent closes "
+        "(oldest → newest) for an inline sparkline."
+    ),
+)
+async def indices_latest(
+    session: Annotated[AsyncSession, Depends(get_investment_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    spark_days: Annotated[int, Query(ge=2, le=120, description="Sparkline length.")] = 30,
+) -> list[IndexLatest]:
+    _ = firm_id
+    repo = StockRepository(session)
+    return await repo.get_indices_latest(spark_days)
+
+
+@router.get(
+    "/movers",
+    response_model=MoversResponse,
+    summary="Top gainers / losers / most-active (Nifty 200 universe)",
+    description=(
+        "Latest-trading-day movers computed over the current Nifty 200 "
+        "constituents — restricting the universe keeps the scan fast and the "
+        "list institutionally relevant (no illiquid penny stocks). ``kind`` is "
+        "``gainers`` | ``losers`` | ``most_active``. Computed once per ~30-min "
+        "window and cached (prices are end-of-day)."
+    ),
+)
+async def stock_movers(
+    session: Annotated[AsyncSession, Depends(get_investment_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    kind: Annotated[MoverKind, Query(description="gainers | losers | most_active")] = "gainers",
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> MoversResponse:
+    _ = firm_id
+    repo = StockRepository(session)
+    universe, trade_date, movers = await repo.get_movers(kind, limit)
+    return MoversResponse(kind=kind, universe=universe, trade_date=trade_date, movers=movers)
+
+
+@router.get(
+    "/top-companies",
+    response_model=list[MoverRow],
+    summary="Largest companies by market cap (Nifty 200 universe)",
+    description=(
+        "The biggest Nifty 200 constituents by latest market cap — powers the "
+        "BMC dashboard's 'suggested to build' list. Reuses the cached movers "
+        "universe (no extra scan); each row carries security_id, symbol, "
+        "security_name, sector, and market_cap (₹ crore). Declared before "
+        "``/{security_id}`` so the literal isn't matched as an int path."
+    ),
+)
+async def top_companies(
+    session: Annotated[AsyncSession, Depends(get_investment_session)],
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    limit: Annotated[int, Query(ge=1, le=50)] = 12,
+) -> list[MoverRow]:
+    _ = firm_id
+    repo = StockRepository(session)
+    return await repo.get_top_companies(limit)
 
 
 @router.get(

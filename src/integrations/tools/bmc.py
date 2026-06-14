@@ -30,6 +30,7 @@ import logging
 import httpx
 
 from src.config import settings
+from src.core.agent_context import current_firm_id
 from src.integrations.tools._errors import make_error
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,16 @@ async def _request(method: str, path: str, *, timeout: float, body: dict | None 
     fix themselves in 250 ms).
     """
     url = f"{_base_url()}{path}"
+    # Pin every BMC call to THIS run's firm so the agent reads/writes the SAME
+    # tenant the frontend `/bmc` proxy uses (BMC persists by firm_id). Without
+    # this the service falls back to DEFAULT_FIRM_ID and the canvas is invisible
+    # on /bmc + never cache-hits. GET → query param; POST → body.
+    firm_id = current_firm_id.get()
+    if firm_id:
+        if method.upper() == "GET":
+            params = {**(params or {}), "firm_id": firm_id}
+        else:
+            body = {**(body or {}), "firm_id": firm_id}
     retry_count = 0
     for attempt in (1, 2):
         try:
@@ -160,6 +171,9 @@ def _trim_bmc(data: dict) -> dict:
                 "category": f.get("category"),
                 "announcement_dt": f.get("announcement_dt"),
                 "page_count": f.get("page_count"),
+                # Keep the source-PDF link so the UI can render "View full source
+                # filing" and so evidence markers deep-link to the cited page.
+                "pdf_url": f.get("pdf_url"),
             }
             for f in (data.get("selected_filings") or [])
         ],
@@ -202,15 +216,28 @@ async def bmc_get(ticker: str) -> dict:
     return _trim_bmc(data)
 
 
-async def bmc_generate(ticker: str, fiscal_period: str | None = None) -> dict:
+async def bmc_generate(
+    ticker: str,
+    fiscal_period: str | None = None,
+    security_id: int | None = None,
+) -> dict:
     """Generate and persist a NEW Business Model Canvas (immutable new version).
     Cold ~25–35 s; ~$0.014 in upstream LLM cost. Use this ONLY when a canvas
     doesn't exist yet, or the user explicitly asks to "refresh" / "regenerate".
 
+    Resolve the company FIRST via ``resolve_company`` and pass its ``security_id``
+    here — this pins the EXACT NSE/BSE entity (matched against
+    ``filings_index.security_id_bse OR security_id_nse``) and skips the service's
+    fuzzy resolver, so we never silently build the canvas for the wrong "Reliance".
+    Pass the resolved canonical symbol (e.g. ``"RELIANCE"``) as ``ticker`` — never
+    the user's raw term.
+
     Args:
-        ticker: same flexible matcher as ``bmc_get``.
+        ticker: resolved symbol / canonical name. Used as the persistence key.
         fiscal_period: optional FY anchor (e.g. ``"2025"`` for FY24-25). When
             omitted, the latest Annual Report is used.
+        security_id: integer fast-path from ``resolve_company`` — bypasses the
+            fuzzy ticker resolver.
 
     Returns:
         Same trimmed BMC shape as ``bmc_get``, with a fresh ``version``.
@@ -218,6 +245,8 @@ async def bmc_generate(ticker: str, fiscal_period: str | None = None) -> dict:
     body: dict = {}
     if fiscal_period:
         body["fiscal_period"] = fiscal_period
+    if security_id is not None:
+        body["security_id"] = security_id
     data = await _request("POST", f"/bmc/{ticker}/run", body=body, timeout=_HEAVY_TIMEOUT)
     return _trim_bmc(data)
 
