@@ -10,6 +10,7 @@ from src.models.billing import Entitlement, Plan, Subscription
 from src.models.chat_conversation import ChatConversation
 from src.models.firm import Firm
 from src.models.integration import FirmIntegration
+from src.models.message_feedback import MessageFeedback
 from src.models.portfolio import (
     PortfolioBacktest,
     PortfolioCustomFactor,
@@ -25,6 +26,7 @@ __all__ = [
     "FirmMembership",
     "AgentRun",
     "FirmIntegration",
+    "MessageFeedback",
     "PortfolioBacktest",
     "PortfolioCustomFactor",
     "PortfolioStrategy",

@@ -241,6 +241,10 @@ class FinalEvent(BaseModel):
     input_tokens: int
     output_tokens: int
     latency_ms: int
+    # The model stopped because it hit its output-token cap (Gemini
+    # finish_reason=MAX_TOKENS), i.e. the answer is cut off mid-thought → the UI
+    # offers a "Continue generating" action. False on a clean STOP.
+    truncated: bool = False
 
 
 class ClarificationOption(BaseModel):
@@ -327,6 +331,15 @@ class ConversationSummary(BaseModel):
     last_activity: datetime
     preview: str = ""  # latest answer, truncated
     agent_name: str | None = None
+    is_pinned: bool = False
+
+
+class FeedbackRead(BaseModel):
+    """The user's rating of one answer (surfaced for replay)."""
+
+    rating: int  # +1 (👍) / -1 (👎)
+    reasons: list[str] = Field(default_factory=list)
+    comment: str | None = None
 
 
 class ConversationTurn(BaseModel):
@@ -349,6 +362,7 @@ class ConversationTurn(BaseModel):
     structured: FinalAnswer | None = None
     plan: list[PlanStep] = Field(default_factory=list)
     clarification: ClarificationEvent | None = None
+    feedback: FeedbackRead | None = None
 
 
 class ConversationDetail(BaseModel):
@@ -356,10 +370,38 @@ class ConversationDetail(BaseModel):
     turns: list[ConversationTurn] = Field(default_factory=list)
 
 
-class ConversationTitleUpdate(BaseModel):
-    """PATCH body to rename a conversation."""
+class ShareRead(BaseModel):
+    """The active public share for a conversation (owner view). The client builds
+    the full URL from `token` (`<origin>/shared/<token>`)."""
 
-    title: str = Field(min_length=1, max_length=200)
+    token: str
+    shared_at: datetime
+
+
+class SharedConversationRead(BaseModel):
+    """A frozen, read-only conversation snapshot served at a public share token —
+    no session id, no follow-up, just the shared turns."""
+
+    title: str
+    shared_at: datetime
+    turns: list[ConversationTurn] = Field(default_factory=list)
+
+
+class ConversationUpdate(BaseModel):
+    """PATCH body — any subset of: rename, pin/unpin, archive/unarchive."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    pinned: bool | None = None
+    archived: bool | None = None
+
+
+class FeedbackCreate(BaseModel):
+    """POST body to rate one answer. `rating` +1 (👍) / -1 (👎); `reasons` +
+    `comment` capture the optional 👎 detail."""
+
+    rating: Literal[1, -1]
+    reasons: list[str] = Field(default_factory=list, max_length=8)
+    comment: str | None = Field(default=None, max_length=2000)
 
 
 class QuotaRead(BaseModel):
