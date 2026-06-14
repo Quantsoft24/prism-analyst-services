@@ -6,9 +6,10 @@ Job:
   produce a concise, cited answer. For current events / news, delegate to
   the ``web_search`` subagent (Google Search grounding).
 
-Tool inventory (14 total):
-  * 3 ours · ``resolve_company`` / ``search_companies`` /
-    ``list_sectors`` (master_securities resolver on the investment DB; resolves
+Tool inventory (23 with all integrations enabled — borrowed tools attach only
+when the firm has that integration on, so a given run may see fewer):
+  * 4 ours · ``resolve_company`` / ``resolve_companies`` / ``search_companies``
+    / ``list_sectors`` (master_securities resolver on the investment DB; resolves
     to a ``security_id`` and returns a clarification when the name is ambiguous)
   * 1 ours · ``web_search`` (AgentTool wrapping Gemini google_search)
   * 3 borrowed · stock-chat HTTP — ``stock_filings_read`` /
@@ -17,6 +18,10 @@ Tool inventory (14 total):
     ``bmc_get_version`` / ``bmc_block_chat`` / ``bmc_diff``
   * 1 borrowed · prism-financials HTTP — ``financials_query`` (text-to-SQL over
     CMIE Prowess; the exact-numbers / ratios / rankings path)
+  * 4 borrowed · prism-news HTTP — ``news_search`` / ``news_sentiment`` /
+    ``news_trending`` / ``news_compare``
+  * 4 borrowed · sebi-regulatory HTTP — ``sebi_search`` / ``sebi_recent`` /
+    ``sebi_deadlines`` / ``sebi_document``
 
 The 5 NRE math tools (``compute_growth`` / ``compute_cagr`` /
 ``compute_margin`` / ``compute_ratio`` / ``compute_percent_of``) are still NOT

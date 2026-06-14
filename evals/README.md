@@ -13,6 +13,12 @@ python evals/run.py --only blinkit-not-found,compare-table
 python evals/run.py --firm EVAL_RUN         # use a dedicated dev firm for quota
 ```
 
+Because the harness drives the **real** `/chat/run` pipeline, every case burns a
+message against that firm's **daily quota** (`config/rate_limits.yml`) — and
+over-cap runs come back as `429`s, not test failures. `--firm` defaults to
+`EVAL_RUN` for exactly this reason: keep evals on a dedicated firm so they don't
+exhaust an interactive firm's allowance (and vice versa).
+
 Exit code is non-zero if any case fails (CI-friendly).
 
 ## Add a case
