@@ -60,6 +60,49 @@ class PriceSeriesResponse(BaseModel):
     points: list[PricePoint]
 
 
+# ── Market overview (landing) ───────────────────────────────────────────────
+
+
+class IndexLatest(BaseModel):
+    """One index's latest level + day move + a short sparkline (recent closes,
+    ascending). Powers the indices strip on the dashboard landing."""
+
+    index_id: int
+    index_name: str | None = None
+    trade_date: date | None = None
+    level: float | None = None        # latest close
+    change_pct: float | None = None   # day-over-day % change
+    spark: list[float] = []           # recent closes, oldest → newest
+
+
+MoverKind = Literal["gainers", "losers", "most_active"]
+
+
+class MoverRow(BaseModel):
+    """One row in the top-movers list (a single security's latest-day move)."""
+
+    security_id: int
+    security_name: str | None = None
+    symbol: str | None = None
+    exchange: str | None = None
+    sector: str | None = None
+    close: float | None = None
+    prev_close: float | None = None
+    change_pct: float | None = None   # (close / prev_close - 1) * 100
+    trade_value: float | None = None  # ₹ (turnover) — drives "most active"
+    market_cap: float | None = None   # ₹ crore
+
+
+class MoversResponse(BaseModel):
+    """Top gainers / losers / most-active for the latest trading day, computed
+    over a fixed index universe (Nifty 200 constituents)."""
+
+    kind: MoverKind
+    universe: str                     # e.g. "NIFTY 200"
+    trade_date: date | None = None
+    movers: list[MoverRow]
+
+
 # ── Annual financials (Balance Sheet) ───────────────────────────────────────
 
 FinancialBasis = Literal["standalone", "consolidated"]

@@ -1,5 +1,12 @@
 # DECISIONS — `systematic_portfolio_builder`
 
+> **Scope:** this file covers the **`systematic_portfolio_builder`** feature only.
+> Other major architectural decisions live in `../PRISM_HANDOFF.md`'s changelog —
+> the chat phases (1–6 + 9); the read-only **share** security model (a frozen
+> `shared_run_ids` snapshot, public-by-token, with within-firm hardening deferred
+> to the auth rollout); the **SEBI Regulatory Lens**; and the **auth/billing
+> foundation**.
+
 Records where the implementation **deviates from the mock**, the **data-driven
 calls** we made, and the **institutional-correctness** choices. The mock's data
 and factor list were illustrative; everything here is backed by the six

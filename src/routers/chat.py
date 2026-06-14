@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -42,9 +43,13 @@ from src.schemas.chat import (
     ChatRunRequest,
     ConversationDetail,
     ConversationSummary,
-    ConversationTitleUpdate,
     ConversationTurn,
+    ConversationUpdate,
+    FeedbackCreate,
+    FeedbackRead,
     QuotaRead,
+    SharedConversationRead,
+    ShareRead,
 )
 from src.services import rate_limit
 from src.services.agent_runner import AgentRunner, ChatEvent
@@ -168,12 +173,18 @@ async def list_conversations(
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
     limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    q: Annotated[str | None, Query(max_length=200, description="Search question/answer/title.")] = None,
+    archived: bool = Query(False, description="Show only archived conversations."),
 ) -> list[ConversationSummary]:
     rows = await ConversationRepository(session).list_conversations(
         firm_id=principal.firm_id,
         user_id=principal.user_id,
         client_key=_guest_key(principal, request),
         limit=limit,
+        offset=offset,
+        q=q,
+        archived=archived,
     )
     return [ConversationSummary(**r) for r in rows]
 
@@ -189,7 +200,8 @@ async def get_conversation(
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> ConversationDetail:
-    runs = await ConversationRepository(session).get_conversation(
+    repo = ConversationRepository(session)
+    runs = await repo.get_conversation(
         session_id=session_id,
         firm_id=principal.firm_id,
         user_id=principal.user_id,
@@ -197,9 +209,12 @@ async def get_conversation(
     )
     if not runs:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    # The caller's 👍/👎 per turn, so replay can show the saved rating.
+    feedback = await repo.get_feedback_for_runs([r.id for r in runs])
     turns = []
     for r in runs:
         payload = r.result_payload or {}
+        fb = feedback.get(r.id)
         turns.append(
             ConversationTurn(
                 agent_run_id=r.id,
@@ -213,6 +228,7 @@ async def get_conversation(
                 structured=payload.get("structured"),
                 plan=payload.get("plan") or [],
                 clarification=payload.get("clarification"),
+                feedback=FeedbackRead(**fb) if fb else None,
             )
         )
     return ConversationDetail(session_id=session_id, turns=turns)
@@ -221,22 +237,29 @@ async def get_conversation(
 @router.patch(
     "/conversations/{session_id}",
     status_code=status.HTTP_204_NO_CONTENT,
-    summary="Rename a conversation",
+    summary="Update a conversation (rename / pin / archive)",
 )
-async def rename_conversation(
+async def update_conversation(
     session_id: str,
-    body: ConversationTitleUpdate,
+    body: ConversationUpdate,
     request: Request,
     session: Annotated[AsyncSession, Depends(get_session)],
     principal: Annotated[Principal, Depends(get_current_principal)],
 ) -> None:
-    ok = await ConversationRepository(session).set_title(
-        session_id=session_id,
-        firm_id=principal.firm_id,
-        user_id=principal.user_id,
-        client_key=_guest_key(principal, request),
-        title=body.title.strip(),
-    )
+    repo = ConversationRepository(session)
+    scope = {
+        "session_id": session_id,
+        "firm_id": principal.firm_id,
+        "user_id": principal.user_id,
+        "client_key": _guest_key(principal, request),
+    }
+    ok = True
+    if body.title is not None:
+        ok = await repo.set_title(**scope, title=body.title.strip()) and ok
+    if body.pinned is not None:
+        ok = await repo.set_pinned(**scope, pinned=body.pinned) and ok
+    if body.archived is not None:
+        ok = await repo.set_archived(**scope, archived=body.archived) and ok
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
 
@@ -260,6 +283,112 @@ async def delete_conversation(
     )
     if hidden == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+
+@router.post(
+    "/conversations/{session_id}/share",
+    response_model=ShareRead,
+    summary="Create (or get) a read-only public share link for a conversation",
+)
+async def create_share(
+    session_id: str,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> ShareRead:
+    share = await ConversationRepository(session).create_or_get_share(
+        session_id=session_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
+    )
+    if share is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return ShareRead(**share)
+
+
+@router.delete(
+    "/conversations/{session_id}/share",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Revoke a conversation's public share link",
+)
+async def revoke_share(
+    session_id: str,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> None:
+    ok = await ConversationRepository(session).revoke_share(
+        session_id=session_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+
+@router.get(
+    "/shared/{token}",
+    response_model=SharedConversationRead,
+    summary="Fetch a frozen, read-only shared conversation (public — no auth)",
+)
+async def get_shared(
+    token: str,
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> SharedConversationRead:
+    snapshot = await ConversationRepository(session).get_shared_snapshot(token)
+    if snapshot is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This shared link is no longer available.",
+        )
+    turns = []
+    for r in snapshot["runs"]:
+        payload = r.result_payload or {}
+        turns.append(
+            ConversationTurn(
+                agent_run_id=r.id,
+                user_input=r.user_input,
+                final_answer=r.final_answer,
+                status=r.status,
+                created_at=r.created_at,
+                tool_trace=r.tool_trace,
+                structured=payload.get("structured"),
+                plan=payload.get("plan") or [],
+                clarification=payload.get("clarification"),
+                # feedback intentionally omitted — a public snapshot carries no
+                # per-user ratings.
+            )
+        )
+    return SharedConversationRead(
+        title=snapshot["title"], shared_at=snapshot["shared_at"], turns=turns
+    )
+
+
+@router.post(
+    "/runs/{agent_run_id}/feedback",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Rate one answer (👍/👎 with optional reasons + comment)",
+)
+async def submit_feedback(
+    agent_run_id: uuid.UUID,
+    body: FeedbackCreate,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> None:
+    ok = await ConversationRepository(session).upsert_feedback(
+        agent_run_id=agent_run_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
+        rating=body.rating,
+        reasons=body.reasons,
+        comment=body.comment,
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer not found.")
 
 
 @router.get("/quota", response_model=QuotaRead, summary="Today's message quota for the caller")

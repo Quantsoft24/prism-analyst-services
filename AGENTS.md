@@ -22,13 +22,14 @@ graphify update .                           # refresh after edits (AST only)
 The graph lives at `graphify-out/`. `Read` and `Grep` are fallbacks when the
 graph excerpt is genuinely insufficient — not first-line tools.
 
-## The 18 agent tools
+## The agent tools (23 when all integrations are enabled)
 
 | Source | Tool | What it does |
 |---|---|---|
-| `company_tools.py` | `lookup_company` | Ticker / ISIN / **alias** / fuzzy name. |
-| `company_tools.py` | `search_companies` | Sector filter + fuzzy resolution. |
-| `company_tools.py` | `list_covered_sectors` | The canonical sector list. |
+| `company_tools.py` | `resolve_company` | Name / ticker / ISIN → one `security_id`, OR a structured clarification (MCQ) when ambiguous. **Call FIRST** for any company-scoped question. Replaces the retired catalog-backed `lookup_company`. |
+| `company_tools.py` | `resolve_companies` | Batch resolve for comparisons — asks all disambiguations in one form. |
+| `company_tools.py` | `search_companies` | Browse view: name/ticker fragment + sector filter (distinct companies). |
+| `company_tools.py` | `list_sectors` | The `master_securities` sector taxonomy. |
 | `web_search.py` | `web_search` | Gemini AgentTool with `google_search` grounding. |
 | `stock_chat.py` | `stock_filings_read` (**v3**) | Narrative filings Q&A. Sends only `question`+`company`+`synthesise`; service's own planner derives every other filter. |
 | `stock_chat.py` | `stock_filings_lookup` | Filings catalog metadata only. |
@@ -36,6 +37,18 @@ graph excerpt is genuinely insufficient — not first-line tools.
 | `bmc.py` × 6 | `bmc_get` / `_generate` / `_library` / `_get_version` / `_block_chat` / `_diff` | 9-block Business Model Canvas. |
 | `prism_financials.py` | `financials_query` | Exact numbers / ratios / rankings / time-series via text-to-SQL over CMIE Prowess. |
 | `prism_news.py` × 4 | `news_sentiment` / `news_trending` / `news_search` / `news_compare` | Live Indian-market news + per-company sentiment verdict. |
+| `sebi_regulatory.py` × 4 | `sebi_search` / `sebi_recent` / `sebi_deadlines` / `sebi_document` | In-process read-only SEBI corpus (Regulatory Lens) — search circulars/orders, recent filings, compliance deadlines, one doc's AI summary + impact tags. |
+
+Count: company_tools(4) + web_search(1) + stock_chat(3) + bmc(6) +
+prism_financials(1) + prism_news(4) + sebi_regulatory(4) = **23**. (The
+docstring header in `company_intel.py` still says "14 total / 3 ours" — it
+predates `resolve_companies`, `prism_news`, and `sebi_regulatory`; trust this
+table + `config/integrations.yml`.)
+
+`company_tools` is the only built-in/in-process tool set on the agent; the rest
+arrive through the integration registry. `sebi_regulatory` is registered as a
+`python` integration (`config/integrations.yml`) and reads via `sebi_repo.py`
+over the SEBI engine — it is NOT UI-only.
 
 (The **Stock Dashboard** investment-DB data is a UI feature with NO agent tool —
 direct DB reads via `stock_repo.py` + `/api/v1/stocks/*`.)
@@ -82,23 +95,50 @@ Use **backticks** for code/identifiers and **angle brackets** for placeholders.
 The one allowed exception is `<answer_meta>{{…}}` (the prompt is an f-string).
 Regression guard: `tests/test_agent_prompts.py::_adk_template_hits`.
 
-## Three databases — when to use which
+## Three database engines — when to use which
 
-- **Primary (Neon, `DATABASE_URL`)**: writes — `agent_runs`, `firms`, `users`,
-  `firm_memberships`, `firm_integrations`. Alembic-controlled.
-- **Catalog (teammate VM `35.234.221.166:5434/stock_chat`, `POSTGRES_URL` /
-  `CATALOG_DATABASE_URL`)**: reads only — `company_industry`, **`company_aliases`**,
-  `filings_index`, `document_texts`, `bmc_*`, `chunks`. Use
-  `catalog_session_scope()` from `src.core.catalog_database`.
-- **Investment (AWS RDS, `INVESTMENT_DB_*`)**: reads only — `master_securities`,
-  `prices_and_securities`, `annual_data`. Backs the **Stock Dashboard**
-  (`/api/v1/stocks/*`), which is a UI feature with **no agent tool** (direct DB
-  reads via `stock_repo.py`). Own `InvestmentBase`; use
-  `investment_session_scope()` / `get_investment_session` from
-  `src.core.investment_database`. Inited gracefully in `main.py` lifespan
-  (skipped if unconfigured → routes 503). Each engine is **separate** — never
-  cross-join across them. NB: a dual-listed company has two `security_id`s (one
-  per exchange); values in `prices_/annual_` are ₹ crore.
+There are **three** engines (`src/core/`); the old "catalog DB"
+(`company_industry` / `company_aliases`) is **retired** — `catalog_database.py`
+and `company_repo.py` are gone. Company lookup is now the `resolve_company`
+agent tool over `master_securities` → returns a `security_id` (with an agentic
+clarification MCQ when ambiguous).
+
+- **Primary (`DATABASE_URL`, Neon dev / RDS prod)**: the only writable engine —
+  `agent_runs`, `chat_conversations` (title/pin/archive/**share**),
+  `message_feedback`, `firms`, `users`, `firm_memberships`, `firm_integrations`,
+  billing, user preferences, and the portfolio-builder tables. Alembic-controlled.
+- **Investment RDS (AWS, `INVESTMENT_DB_*`, READ-ONLY)**: `master_securities`
+  (the company resolver lands every query on a `security_id`),
+  `prices_and_securities`, `annual_data`, and the index tables. Backs the
+  **Stock Dashboard** (`/api/v1/stocks/*`) — a UI feature with **no agent tool**
+  (direct reads via `stock_repo.py`) — plus the resolver and portfolio backtests.
+  Own `InvestmentBase`; use `investment_session_scope()` / `get_investment_session`
+  from `src.core.investment_database`. Inited gracefully in `main.py` lifespan
+  (skipped if unconfigured → routes 503). NB: a dual-listed company has two
+  `security_id`s (one per exchange); values in `prices_/annual_` are ₹ crore.
+- **SEBI Postgres (`SEBI_DB_*`, READ-ONLY)**: the regulatory corpus behind the
+  Regulatory Lens (`/api/v1/regulatory/*`) and the `sebi_regulatory` agent tools.
+  Reached via `is_sebi_configured()` + `sebi_session_scope()` from
+  `src.core.sebi_database`; read through `src/repositories/sebi_repo.py`. Degrades
+  to empty/disabled when unset.
+
+Each engine is **separate** — never cross-join across them.
+
+## Auth, chat history & where things live
+
+- **Auth foundation exists** — don't treat the firm as a throwaway dev stub.
+  `src/auth/` resolves a provider-agnostic `Principal`; with `AUTH_ENABLED=true`
+  it's derived from a Supabase JWT, and `config/access_policy.yml` is the
+  anonymous/feature `require(...)` matrix. Billing models (`models/billing.py`)
+  are in place. When auth is off, requests resolve to `DEV_FIRM_ID`.
+- **Chat history / feedback / share** live in `conversation_repo.py` behind the
+  `chat.py` router: `list_conversations` (search / pagination / archived),
+  `get_conversation`, `set_title` / `set_pinned` / `set_archived`,
+  `hide_conversation`, `upsert_feedback` / `get_feedback_for_runs`, and the
+  read-only share surface `create_or_get_share` / `revoke_share` /
+  `get_shared_snapshot`.
+- **SEBI engine** is reached via `is_sebi_configured()` + `sebi_session_scope()`
+  (`src/core/sebi_database.py`) and read through `sebi_repo.py`.
 
 ## Adding a tool — the integration framework
 
@@ -119,9 +159,10 @@ Regression guard: `tests/test_agent_prompts.py::_adk_template_hits`.
 
 - `.env` is gitignored — production env-var changes are SSH-applied, not
   deployed via PR. Use the appended-via-ssh pattern in `PRISM_HANDOFF.md` §0.
-- `_normalize_query` in `company_repo.py` ↔ `_normalize` in
-  `scripts/setup_company_aliases.py` MUST stay identical. Break one and alias
-  lookups silently miss.
+- Company resolution is the `resolve_company` tool over `master_securities`
+  (`src/services/company_resolver.py`) — there are **no** alias tables or
+  `company_repo.py` anymore. Don't reintroduce hardcoded aliases; the resolver
+  derives acronyms + does typo-tolerant matching from the securities master.
 - `google.adk` isn't installed in the Windows venv. Tests that need it skip-
   fail locally and pass in CI. Don't add skip markers.
 - `stock_filings_read` (v3) accepts ONLY `question` / `company` / `synthesise`
@@ -133,7 +174,7 @@ Regression guard: `tests/test_agent_prompts.py::_adk_template_hits`.
 ```bash
 ruff check src/ tests/                          # CI lint
 pytest tests/test_prism_financials.py -v        # one file, no DB
-pytest tests/test_company_repo.py -v            # needs CI Postgres
+pytest tests/test_company_resolver.py -v        # needs CI Postgres
 graphify update .                               # after any edit
 ```
 

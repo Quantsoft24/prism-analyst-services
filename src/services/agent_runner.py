@@ -29,11 +29,13 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import update
+from sqlalchemy import false, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agents.base import PrismAgent
+from src.auth.principal import ANONYMOUS_FIRM
 from src.config import settings
+from src.core.agent_context import current_firm_id
 from src.core.database import session_scope
 from src.integrations.tools._errors import (
     extract_error_message,
@@ -154,6 +156,10 @@ class AgentRunner:
         background cleanup task can mark stale runs as 'abandoned' later.
         """
         self._started_at = time.perf_counter()
+        # Make this run's firm_id available to per-tenant tools (e.g. BMC, which
+        # persists by firm_id) without exposing it to the LLM. Async tools awaited
+        # inline in this run inherit the ContextVar. See core/agent_context.py.
+        current_firm_id.set(self._firm_id)
         try:
             self._agent_run_id = await self._open_run_row(user_message)
         except Exception as exc:
@@ -249,11 +255,17 @@ class AgentRunner:
             app_name="prism", user_id=self._firm_id, session_id=self._session_id
         )
         if existing is None:
-            await sess_svc.create_session(
+            session = await sess_svc.create_session(
                 app_name="prism",
                 user_id=self._firm_id,
                 session_id=self._session_id,
             )
+            # A resumed conversation whose in-memory ADK session was lost (server
+            # restart / a different worker / cache eviction): seed the fresh
+            # session with this conversation's persisted transcript so the agent
+            # continues with full prior context — nothing lost. No-op for a
+            # genuinely new chat (no prior turns). See `_rehydrate_session`.
+            await self._rehydrate_session(sess_svc, session)
 
         new_message = genai_types.Content(
             role="user", parts=[genai_types.Part(text=user_message)]
@@ -263,6 +275,9 @@ class AgentRunner:
         pending_calls: dict[str, tuple[str, float]] = {}  # call_id -> (tool_name, start_ts)
         final_text_parts: list[str] = []
         final_seen = False
+        # Set if the model stops on its output-token cap (finish_reason=MAX_TOKENS)
+        # → the answer is cut off and the UI offers "Continue generating".
+        truncated = False
         # All `data_freshness` values surfaced by tools THIS turn. Used as
         # the allow-list when validating the agent's structured
         # ``data_freshness`` claim — see ``_validate_structured_freshness``.
@@ -564,6 +579,12 @@ class AgentRunner:
                 try:
                     if check():
                         final_seen = True
+                        # finish_reason=MAX_TOKENS → the answer was cut off at the
+                        # output cap. The enum stringifies as "FinishReason.MAX_TOKENS"
+                        # (name/value "MAX_TOKENS"); match defensively across forms.
+                        fr = getattr(event, "finish_reason", None)
+                        if fr is not None and "MAX_TOKENS" in str(getattr(fr, "name", fr)):
+                            truncated = True
                 except Exception:
                     pass
 
@@ -612,6 +633,18 @@ class AgentRunner:
             )
             prose = ""
 
+        # BMC COLD MISS — a bmc_get found no saved canvas and none was generated.
+        # OVERRIDE the answer (incl. the agent's own freeform "could not be found —
+        # want me to generate?" prose, which dead-ends) with a deterministic honest
+        # handoff; the UI's "Open full canvas" card routes the user to /bmc to
+        # generate it there. Fires ONLY on a true cold miss — `_bmc_cold_miss_message`
+        # returns None when a canvas exists or other real evidence was gathered, so
+        # successful/cache-hit turns are untouched.
+        bmc_miss = _bmc_cold_miss_message(self._tool_trace)
+        if bmc_miss:
+            prose = bmc_miss
+            structured = FinalAnswer(text=prose)
+
         # GATHER-RESCUE (deterministic) — a non-clarification turn that ended with
         # NO data gathered AND no answer means the orchestrator stopped after a
         # routing tool without finishing (free-tier Flash flakiness). Re-invoke
@@ -634,13 +667,22 @@ class AgentRunner:
             if prose and _is_stall_response(prose):
                 prose = ""
 
+        # BUSINESS MODEL CANVAS — render node-by-node DETERMINISTICALLY (bold block
+        # title + cited bullets, all nine blocks), bypassing the composer. The
+        # canvas is a structured artifact; letting the LLM "summarize" it is what
+        # caused dropped blocks + mangled citations. This is faithful + reliable.
+        bmc_canvas = _first_bmc_canvas(self._tool_trace)
+        if bmc_canvas is not None:
+            prose = _render_bmc_answer(bmc_canvas)
+            structured = FinalAnswer(text=prose, suggestions=_bmc_followups(bmc_canvas))
+
         # PRIMARY answer path — when the turn gathered substantive evidence, the
         # AUTHORITATIVE answer is composed on the quality tier from that evidence
         # (the fast orchestrator is only a planner/gatherer; flash-lite is too
         # weak to reliably write the final answer, and thinking-mode often ends
         # the turn without it). Trivial turns (no data tools) keep the fast
         # model's prose. Clarification turns already returned above.
-        if _has_substantive_evidence(self._tool_trace):
+        elif _has_substantive_evidence(self._tool_trace):
             composed = await _compose_final_answer(user_message, self._tool_trace)
             if composed:
                 composed, suggestions = _extract_follow_ups(composed)
@@ -759,6 +801,7 @@ class AgentRunner:
             input_tokens=self._input_tokens,
             output_tokens=self._output_tokens,
             latency_ms=latency_ms,
+            truncated=truncated,
         )
 
     # ── Runner-driven task checklist ─────────────────────────────────────────
@@ -940,6 +983,74 @@ class AgentRunner:
                 "existing fallback chain.",
                 self._agent_run_id,
             )
+
+    # ── Session rehydration (context continuity on resume) ──────────────────
+
+    def _scope_clause(self):
+        """Principal scope, mirroring ``conversation_repo._scope``: signed-in by
+        user_id, guest by client_key, dev/no-auth by firm_id. Guards a resumed
+        session from ever reading another principal's history."""
+        if self._user_id is not None:
+            return AgentRun.user_id == self._user_id
+        if self._firm_id == ANONYMOUS_FIRM:
+            return AgentRun.client_key == self._client_key if self._client_key else false()
+        return AgentRun.firm_id == self._firm_id
+
+    async def _load_prior_turns(self) -> list[tuple[str, str]]:
+        """Completed ``(user_input, final_answer)`` turns already persisted for
+        this session_id — oldest → newest, scoped to the caller, excluding the
+        current in-flight run (which has no final_answer yet)."""
+        stmt = (
+            select(AgentRun.user_input, AgentRun.final_answer)
+            .where(
+                AgentRun.session_id == self._session_id,
+                AgentRun.hidden_at.is_(None),
+                AgentRun.final_answer.is_not(None),
+                self._scope_clause(),
+            )
+            .order_by(AgentRun.created_at.asc())
+        )
+        if self._agent_run_id is not None:
+            stmt = stmt.where(AgentRun.id != self._agent_run_id)
+        async with session_scope() as session:
+            rows = (await session.execute(stmt)).all()
+        return [(r.user_input, r.final_answer) for r in rows if r.user_input and r.final_answer]
+
+    async def _rehydrate_session(self, sess_svc: Any, session: Any) -> None:
+        """Seed a freshly-created ADK session with this conversation's persisted
+        transcript so a resumed chat continues with full prior context even when
+        the in-memory session was lost (restart / different worker). No-op for a
+        genuinely new conversation (no prior completed turns)."""
+        from google.adk.events import Event
+        from google.genai import types as genai_types
+
+        turns = await self._load_prior_turns()
+        if not turns:
+            return
+        for user_input, final_answer in turns:
+            await sess_svc.append_event(
+                session,
+                Event(
+                    author="user",
+                    content=genai_types.Content(
+                        role="user", parts=[genai_types.Part(text=user_input)]
+                    ),
+                ),
+            )
+            await sess_svc.append_event(
+                session,
+                Event(
+                    author=self._agent.name,
+                    content=genai_types.Content(
+                        role="model", parts=[genai_types.Part(text=final_answer)]
+                    ),
+                ),
+            )
+        logger.info(
+            "prism: rehydrated session %s with %d prior turn(s) of context",
+            self._session_id,
+            len(turns),
+        )
 
     # ── Persistence ────────────────────────────────────────────────────────
 
@@ -1425,6 +1536,41 @@ def _has_substantive_evidence(tool_trace: list[dict[str, Any]]) -> bool:
     )
 
 
+def _bmc_cold_miss_message(tool_trace: list[dict[str, Any]]) -> str | None:
+    """Honest message for a Business Model Canvas COLD MISS: a ``bmc_get`` found
+    no saved canvas and none was generated this turn (the free-tier orchestrator
+    sometimes stops after the 404 instead of calling ``bmc_generate``).
+
+    Rather than block the chat turn on a 30-60s in-chat generate (slow + brushes
+    the agent timeout), we return a clear message; the UI's "Open full canvas"
+    card routes the user to ``/bmc`` to generate it there (proper progress UI).
+
+    Returns ``None`` when a canvas EXISTS (the agent did generate / it was cached)
+    or the turn ALSO gathered real non-BMC evidence — those go to the composer."""
+    bmc_ticker: str | None = None
+    for t in tool_trace:
+        tool = str(t.get("tool", ""))
+        if not tool.startswith("bmc_"):
+            continue
+        resp = t.get("response")
+        if isinstance(resp, dict) and resp.get("blocks"):
+            return None  # a real canvas came back — not a cold miss
+        if tool == "bmc_get" and isinstance(t.get("args"), dict):
+            bmc_ticker = t["args"].get("ticker") or bmc_ticker
+    if not bmc_ticker:
+        return None
+    # Don't override a turn that gathered real non-BMC data.
+    if _has_substantive_evidence(
+        [t for t in tool_trace if not str(t.get("tool", "")).startswith("bmc_")]
+    ):
+        return None
+    return (
+        f"There's no saved Business Model Canvas for **{bmc_ticker}** yet. "
+        "Click **Open full canvas** below to generate one — it builds a "
+        "filing-grounded 9-block canvas (~30–60s) with clickable citations."
+    )
+
+
 def _strip_answer_meta(text: str) -> str:
     """Drop any accidental ``<answer_meta>`` tail + surrounding whitespace."""
     text = (text or "").strip()
@@ -1529,12 +1675,20 @@ async def _compose_final_answer(
         response = entry.get("response")
         if response is None:
             continue
-        try:
-            response_str = json.dumps(response, default=str, ensure_ascii=False)
-        except (TypeError, ValueError):
-            response_str = repr(response)
-        if len(response_str) > 8000:
-            response_str = response_str[:8000] + "…(truncated)"
+        # BMC: the raw 9-block JSON (with every evidence excerpt) blows past the
+        # 8000-char cap and truncates to ~5 blocks — so the brief silently drops
+        # Revenue Streams / Cost Structure / etc. Feed a COMPACT all-9-block view
+        # (titles + bullets + per-bullet page hints, no excerpts) so the composer
+        # sees the WHOLE model and can cite single pages.
+        if str(tool).startswith("bmc_") and isinstance(response, dict) and response.get("blocks"):
+            response_str = _compact_bmc(response)
+        else:
+            try:
+                response_str = json.dumps(response, default=str, ensure_ascii=False)
+            except (TypeError, ValueError):
+                response_str = repr(response)
+            if len(response_str) > 8000:
+                response_str = response_str[:8000] + "…(truncated)"
         parts.append(f"{tool}(args={args}) →\n{response_str}")
 
     if not parts:
@@ -1562,6 +1716,29 @@ async def _compose_final_answer(
         + "\n\nWrite the complete analyst answer now, citing each fact with its "
         "[Company | p.N] string verbatim."
     )
+    # Business Model Canvas: the full 9-block canvas is rendered separately (the
+    # /bmc surface + a handoff card), and the composer's evidence is capped (so a
+    # full inline reproduction truncates anyway). Ask for a crisp overview instead.
+    if any(str(e.get("tool", "")).startswith("bmc_") for e in tool_trace):
+        user_prompt += (
+            "\n\nBUSINESS MODEL CANVAS — this OVERRIDES the 'be complete' rule. Do "
+            "NOT reproduce all nine blocks (the full interactive canvas is shown "
+            "separately). Write a TIGHT, scannable analyst brief in this EXACT shape:\n"
+            "  • A one-sentence LEAD: what the company does + how it makes money.\n"
+            "  • Then 5-6 Markdown bullets that SYNTHESIZE across ALL the canvas "
+            "blocks above (do not just take the first few). COVER the essentials: "
+            "customer segments, HOW IT MAKES MONEY (revenue streams), cost drivers, "
+            "key resources/moat, and key partnerships/channels. One crisp fact per "
+            "bullet, CONCRETE and QUANTIFIED wherever the evidence allows. No filler.\n"
+            "MANDATORY CITATIONS — every bullet AND every quantified lead fact MUST "
+            "end with a citation marker `[<company_name> | p.<page>]`:\n"
+            "  - use the COMPANY NAME from the evidence's evidence[] rows (e.g. "
+            "'Reliance Industries Ltd'), NEVER the newsid / filing id;\n"
+            "  - exactly ONE page per marker — never combine pages (write two markers "
+            "`[X | p.5] [X | p.10]`, never `[X | p.5, p.10]`);\n"
+            "  - take the page from the SAME evidence row the fact came from. These "
+            "deep-link to the cited PDF page, so an uncited claim is not acceptable here."
+        )
     messages = [
         {"role": "system", "content": _COMPOSER_SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
@@ -1703,6 +1880,151 @@ def _evidence_citations(tool_trace: list[dict[str, Any]]) -> list[Citation]:
     return out
 
 
+def _bmc_citations(tool_trace: list[dict[str, Any]]) -> list[Citation]:
+    """Build filing citations from BMC block evidence (``bmc_get`` / ``bmc_generate``
+    → ``blocks[].evidence[]``), so the composer's ``[Company | p.N]`` markers
+    deep-link to the cited PDF page (same UX as stock-filings). Each evidence row
+    carries ``company_name``, ``page``, and ``pdf_url`` (with ``#page=N``). The
+    label leads with the company name so the inline-marker matcher resolves it.
+    Deduped by (url, page)."""
+    out: list[Citation] = []
+    seen: set[tuple[str, int | None]] = set()
+    for entry in tool_trace:
+        if not str(entry.get("tool", "")).startswith("bmc_"):
+            continue
+        resp = entry.get("response")
+        if not isinstance(resp, dict):
+            continue
+        company_top = resp.get("company_name") or ""
+        for block in resp.get("blocks") or []:
+            if not isinstance(block, dict):
+                continue
+            for ev in block.get("evidence") or []:
+                if not isinstance(ev, dict) or not ev.get("pdf_url"):
+                    continue
+                try:
+                    page = int(ev.get("page")) if ev.get("page") is not None else None
+                except (TypeError, ValueError):
+                    page = None
+                url = str(ev["pdf_url"])
+                key = (url, page)
+                if key in seen:
+                    continue
+                seen.add(key)
+                company = ev.get("company_name") or company_top or ""
+                label = (f"{company} — p.{page}" if page is not None else str(company or "filing")).strip(" —")
+                out.append(Citation(label=label, url=url, source_kind="filing", page=page))
+    return out
+
+
+def _compact_bmc(resp: dict[str, Any]) -> str:
+    """Compact ALL nine BMC blocks for the composer: company + each block's title,
+    summary bullets (with their `[N]` markers rewritten to the cited page), and
+    key_insights — but NOT the bulky verbatim excerpts. This keeps the full 9-block
+    canvas well under the evidence cap (the raw JSON truncates to ~5 blocks), so
+    the brief reflects the WHOLE model (incl. revenue streams + cost structure)."""
+    company = resp.get("company_name") or resp.get("ticker") or "the company"
+    blocks = resp.get("blocks") or []
+    lines = [
+        f"Business Model Canvas for {company} — all {len(blocks)} blocks. "
+        "Cite each fact as [" + str(company) + " | p.<page>] using the page shown "
+        "next to it (one page per marker):"
+    ]
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        marker_to_page = {
+            ev.get("marker"): ev.get("page")
+            for ev in (b.get("evidence") or [])
+            if isinstance(ev, dict) and ev.get("marker")
+        }
+
+        def _pageize(text: str) -> str:
+            return re.sub(
+                r"\[(\d+)\]",
+                lambda m: (f"(p.{marker_to_page['[' + m.group(1) + ']']})"
+                           if marker_to_page.get("[" + m.group(1) + "]") is not None
+                           else ""),
+                text,
+            )
+
+        lines.append(f"\n## {b.get('title') or b.get('block_id')}")
+        for bl in b.get("summary_bullets") or []:
+            lines.append(f"- {_pageize(str(bl))}")
+        for ki in b.get("key_insights") or []:
+            lines.append(f"  (insight) {ki}")
+    out = "\n".join(lines)
+    return out[:12000] + "…(truncated)" if len(out) > 12000 else out
+
+
+def _first_bmc_canvas(tool_trace: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The first BMC tool response that actually carries a 9-block canvas."""
+    for entry in tool_trace:
+        if str(entry.get("tool", "")).startswith("bmc_"):
+            resp = entry.get("response")
+            if isinstance(resp, dict) and resp.get("blocks"):
+                return resp
+    return None
+
+
+def _render_bmc_answer(resp: dict[str, Any]) -> str:
+    """Render the Business Model Canvas node-by-node, DETERMINISTICALLY: each block
+    as a **bold title** followed by its details as bullets, with every bullet's
+    ``[N]`` marker rewritten to a clickable ``[Company | p.<page>]`` citation. This
+    is faithful to the canvas (all nine blocks, exact facts, exact pages) — the
+    composer is bypassed for BMC so it can't summarize, drop blocks, or mangle
+    citations."""
+    company = resp.get("company_name") or resp.get("ticker") or "Company"
+    parts = [
+        f"Here's **{company}**'s business model across the nine building blocks, "
+        f"built from its own filings — every fact links to its source page.",
+    ]
+    for b in resp.get("blocks") or []:
+        if not isinstance(b, dict):
+            continue
+        title = b.get("title") or str(b.get("block_id", "")).replace("_", " ").title()
+        marker_to_page = {
+            ev.get("marker"): ev.get("page")
+            for ev in (b.get("evidence") or [])
+            if isinstance(ev, dict) and ev.get("marker")
+        }
+
+        def _fmt(text: str, _m2p: dict = marker_to_page) -> str:
+            # [N] -> clickable [Company | p.<page>]
+            text = re.sub(
+                r"\[(\d+)\]",
+                lambda m: (f"[{company} | p.{_m2p['[' + m.group(1) + ']']}]"
+                           if _m2p.get("[" + m.group(1) + "]") is not None else ""),
+                text,
+            )
+            # Make the figures an analyst scans for pop (₹/INR/Rs crore·lakh, %).
+            text = re.sub(
+                r"(?:₹|INR|Rs\.?)\s?[\d,]+(?:\.\d+)?\s*(?:crore|cr|lakh|billion|million|bn|mn)?",
+                lambda m: f"**{m.group(0).strip()}**",
+                text,
+            )
+            text = re.sub(r"(?<!\d)(\d+(?:\.\d+)?%)", r"**\1**", text)
+            return text.strip()
+
+        parts.append(f"\n**{title}**")
+        bullets = b.get("summary_bullets") or []
+        if bullets:
+            parts.extend(f"- {_fmt(str(bl))}" for bl in bullets)
+        else:
+            parts.append("- _No filing evidence disclosed for this block._")
+    return "\n".join(parts)
+
+
+def _bmc_followups(resp: dict[str, Any]) -> list[str]:
+    """Three useful next questions our tools can answer for a BMC turn."""
+    c = resp.get("company_name") or resp.get("ticker") or "this company"
+    return [
+        f"How has {c}'s business model changed over recent years?",
+        f"What are the main risks to {c}'s business model?",
+        f"Which segment drives most of {c}'s revenue?",
+    ]
+
+
 def _merge_filing_citations(
     structured: FinalAnswer | None, tool_trace: list[dict[str, Any]],
 ) -> FinalAnswer | None:
@@ -1715,8 +2037,21 @@ def _merge_filing_citations(
     if structured is None:
         return structured
 
-    # PRIMARY — evidence carries everything; no parsing/guesswork.
+    # PRIMARY — evidence carries everything; no parsing/guesswork. Includes BMC
+    # block evidence so a Business Model Canvas answer's [Company | p.N] markers
+    # deep-link to the cited PDF page too.
     ev_cites = _evidence_citations(tool_trace)
+    bmc_cites = _bmc_citations(tool_trace)
+    if bmc_cites:
+        # The chat brief cites a handful of facts; the full 15-source set lives on
+        # /bmc. Scope the Sources chip to the pages actually referenced inline so
+        # "N sources" matches the brief (keep all if the model emitted no markers).
+        referenced = {
+            int(m.group(2)) for m in _INLINE_CITE_RE.finditer(structured.text or "")
+        }
+        if referenced:
+            bmc_cites = [c for c in bmc_cites if c.page in referenced]
+    ev_cites = ev_cites + bmc_cites
     if ev_cites:
         kept = [c for c in structured.citations if c.source_kind != "filing"]
         return structured.model_copy(update={"citations": kept + ev_cites})

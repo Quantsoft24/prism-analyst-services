@@ -85,6 +85,9 @@ async def _forward_json(
 
 class BMCRunRequest(BaseModel):
     fiscal_period: str | None = None
+    # Integer fast-path (BSE/NSE security_id) — pins the exact entity and skips
+    # the BMC service's fuzzy ticker resolver. Forwarded verbatim in the body.
+    security_id: int | None = None
 
 
 class BMCChatRequest(BaseModel):
@@ -113,6 +116,18 @@ async def run_bmc(
         f"/bmc/{ticker}/run",
         body={**body.model_dump(exclude_none=True), "firm_id": firm_id},
         timeout=_HEAVY_TIMEOUT,
+    )
+
+
+@router.get("/library", summary="All saved canvases for this firm (latest per company)")
+async def list_all_canvases(
+    firm_id: Annotated[str, Depends(get_current_firm_id)],
+) -> Any:
+    # MUST be declared BEFORE GET /{ticker} so the literal "library" segment is
+    # not captured as a ticker (FastAPI matches in declaration order). Upstream
+    # returns {firm_id, total, entries:[...]}, forwarded verbatim.
+    return await _forward_json(
+        "GET", "/bmc/library", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
     )
 
 
