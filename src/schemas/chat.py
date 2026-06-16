@@ -205,6 +205,25 @@ class FinalSection(BaseModel):
     kind: Literal["summary", "anomaly", "note"] = "summary"
 
 
+class DeepDiveSuggestion(BaseModel):
+    """A curated "explore further" action surfaced under an answer as a compact
+    chip that deep-links the user into a dedicated tool interface.
+
+    Deterministically synthesized from the turn's ``tool_trace`` + the user's
+    intent (NO extra LLM call) — see ``src/services/deep_dive.py``. The frontend
+    maps ``action`` → a tool route (a small ``ACTION_ROUTES`` registry) and
+    renders ``label``; ``context`` carries the lightweight, already-supported
+    deep-link params for that route (e.g. ``ticker`` for the BMC canvas,
+    ``security_id`` for the stock dashboard, ``company`` for news). Unknown
+    ``action`` values are silently dropped client-side (graceful degradation),
+    so new tools can be added registry-first without breaking old clients.
+    """
+
+    action: Literal["bmc", "stock_dashboard", "news", "regulatory", "portfolio"]
+    label: str  # chip text, e.g. "Business Model Canvas"
+    context: dict[str, Any] = Field(default_factory=dict)  # deep-link params (may be empty)
+
+
 class FinalAnswer(BaseModel):
     """Structured answer payload. Replaces the bare string in ``FinalEvent.answer``.
 
@@ -223,6 +242,10 @@ class FinalAnswer(BaseModel):
     # 2-3 suggested next questions our tools can answer — rendered as clickable
     # chips. Composed in the same pass (no extra LLM call).
     suggestions: list[str] = Field(default_factory=list)
+    # "Explore further" deep-dive chips → tool interfaces (BMC, stock dashboard,
+    # news, regulatory, portfolio). Rule-based, capped + deduped + silent by
+    # default; synthesized in ``src/services/deep_dive.py``.
+    suggested_actions: list[DeepDiveSuggestion] = Field(default_factory=list)
 
 
 class FinalEvent(BaseModel):

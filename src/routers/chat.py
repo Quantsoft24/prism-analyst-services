@@ -391,6 +391,27 @@ async def submit_feedback(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer not found.")
 
 
+@router.delete(
+    "/runs/{agent_run_id}/feedback",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove a rating (toggle 👍/👎 back to neutral)",
+)
+async def clear_feedback(
+    agent_run_id: uuid.UUID,
+    request: Request,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    principal: Annotated[Principal, Depends(get_current_principal)],
+) -> None:
+    ok = await ConversationRepository(session).clear_feedback(
+        agent_run_id=agent_run_id,
+        firm_id=principal.firm_id,
+        user_id=principal.user_id,
+        client_key=_guest_key(principal, request),
+    )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer not found.")
+
+
 @router.get("/quota", response_model=QuotaRead, summary="Today's message quota for the caller")
 async def read_quota(
     request: Request,

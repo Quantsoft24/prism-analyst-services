@@ -126,6 +126,12 @@ class Settings(BaseSettings):
     # "latency-based-routing" (paid tier when SLO matters).
     MODEL_ROUTER_STRATEGY: str = "usage-based-routing-v2"
 
+    # ── Chat UX: deep-dive "explore further" suggestions ──
+    # Max number of deep-dive suggestion chips surfaced under an answer. Capped
+    # so we never overwhelm the user; tune here (or via env) without touching
+    # the rule logic. See src/services/deep_dive.py.
+    DEEP_DIVE_MAX_SUGGESTIONS: int = 3
+
     # ── Integrations (agent tools / MCP / sub-agents) ──
     # Declarative registry of agent-callable resources. Same YAML→DB migration
     # seam as the ingestion registry. See docs/INTEGRATION_INTAKE.md.
