@@ -62,6 +62,7 @@ from src.schemas.chat import (
     ToolResultEvent,
     ToolRetryEvent,
 )
+from src.services.deep_dive import synthesize as synthesize_deep_dive
 
 if TYPE_CHECKING:
     pass
@@ -764,6 +765,17 @@ class AgentRunner:
                     self._agent_run_id,
                     len(self._tool_trace),
                 )
+
+        # DEEP-DIVE "explore further" chips — deterministic, rule-based handoffs
+        # into the tool UIs (BMC / stock dashboard / news / regulatory / portfolio)
+        # synthesized from THIS turn's tool_trace + the user's intent (no LLM call,
+        # silent by default). Attached to the structured payload so they persist in
+        # result_payload and replay in history. See src/services/deep_dive.py.
+        deep_dive = synthesize_deep_dive(user_message, self._tool_trace)
+        if deep_dive:
+            if structured is None:
+                structured = FinalAnswer(text=prose)
+            structured = structured.model_copy(update={"suggested_actions": deep_dive})
 
         cost = _estimate_cost_usd(self._agent.model, self._input_tokens, self._output_tokens)
         latency_ms = int((time.perf_counter() - self._started_at) * 1000)
