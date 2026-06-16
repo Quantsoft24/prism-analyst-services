@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import false, func, or_, select, update
+from sqlalchemy import delete, false, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -451,6 +451,33 @@ class ConversationRepository:
             )
         )
         await self._session.execute(stmt)
+        await self._session.commit()
+        return True
+
+    async def clear_feedback(
+        self,
+        *,
+        agent_run_id: uuid.UUID,
+        firm_id: str,
+        user_id: uuid.UUID | None,
+        client_key: str | None = None,
+    ) -> bool:
+        """Remove the caller's rating of one answer (toggle 👍/👎 back to
+        neutral). False if the run isn't the caller's; idempotent otherwise
+        (no row → success)."""
+        owns = await self._session.scalar(
+            select(AgentRun.id)
+            .where(
+                AgentRun.id == agent_run_id,
+                self._scope(firm_id=firm_id, user_id=user_id, client_key=client_key),
+            )
+            .limit(1)
+        )
+        if owns is None:
+            return False
+        await self._session.execute(
+            delete(MessageFeedback).where(MessageFeedback.agent_run_id == agent_run_id)
+        )
         await self._session.commit()
         return True
 

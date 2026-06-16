@@ -105,3 +105,28 @@ async def test_get_feedback_empty_for_unrated(db_session) -> None:
     repo = ConversationRepository(db_session)
     assert await repo.get_feedback_for_runs([run.id]) == {}
     assert await repo.get_feedback_for_runs([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_clear_feedback_toggles_back_to_neutral(db_session) -> None:
+    run = _run("fb5")
+    db_session.add(run)
+    await db_session.flush()
+    repo = ConversationRepository(db_session)
+    await repo.upsert_feedback(
+        agent_run_id=run.id, firm_id=FIRM, user_id=None, rating=1, reasons=[], comment=None
+    )
+    # Clear → the row is removed (back to neutral). Idempotent on a second call.
+    assert await repo.clear_feedback(agent_run_id=run.id, firm_id=FIRM, user_id=None)
+    assert await repo.get_feedback_for_runs([run.id]) == {}
+    assert await repo.clear_feedback(agent_run_id=run.id, firm_id=FIRM, user_id=None)
+
+
+@pytest.mark.asyncio
+async def test_cannot_clear_another_principals_feedback(db_session) -> None:
+    run = _run("fb6", firm_id=OTHER_FIRM)
+    db_session.add(run)
+    await db_session.flush()
+    repo = ConversationRepository(db_session)
+    # FIRM can't clear a rating on OTHER_FIRM's run.
+    assert not await repo.clear_feedback(agent_run_id=run.id, firm_id=FIRM, user_id=None)
