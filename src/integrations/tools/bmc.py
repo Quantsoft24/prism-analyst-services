@@ -30,7 +30,6 @@ import logging
 import httpx
 
 from src.config import settings
-from src.core.agent_context import current_firm_id
 from src.integrations.tools._errors import make_error
 
 logger = logging.getLogger(__name__)
@@ -72,11 +71,11 @@ async def _request(method: str, path: str, *, timeout: float, body: dict | None 
     fix themselves in 250 ms).
     """
     url = f"{_base_url()}{path}"
-    # Pin every BMC call to THIS run's firm so the agent reads/writes the SAME
-    # tenant the frontend `/bmc` proxy uses (BMC persists by firm_id). Without
-    # this the service falls back to DEFAULT_FIRM_ID and the canvas is invisible
-    # on /bmc + never cache-hits. GET → query param; POST → body.
-    firm_id = current_firm_id.get()
+    # BMC is a FIRM-WIDE shared library — pin every call to the single shared
+    # firm_id (NOT this run's per-user firm) so the agent reads/writes the same
+    # pool the /bmc page shows to everyone. Matches the proxy's get_bmc_firm_id.
+    # GET → query param; POST → body.
+    firm_id = settings.BMC_SHARED_FIRM_ID
     if firm_id:
         if method.upper() == "GET":
             params = {**(params or {}), "firm_id": firm_id}

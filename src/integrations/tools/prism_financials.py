@@ -1,40 +1,38 @@
 """prism-financials — the teammate-built numeric-Q&A service, as an agent tool.
 
-The service (FastAPI) exposes one agent-relevant endpoint, ``POST /ask``: it
-turns a natural-language finance question into safe, read-only Postgres SQL
-over CMIE Prowess data and returns structured ``rows`` + the executed ``sql``.
-This is PRISM's exact-numbers path — balance sheet, P&L, cash flow, quarterly,
-shareholding, market multiples, and derived ratios (D/E, margins, CAGR, YoY,
-sector rank). Narrative ("what did X *say*") still goes to ``stock_filings_read``.
+The service (FastAPI) answers a natural-language finance question about Indian
+listed companies and returns a structured, **operation-typed** result plus a
+human-readable ``answer``. This is PRISM's exact-numbers path — single metrics,
+trends, growth/CAGR, derived ratios, whole statements (balance sheet / P&L),
+head-to-head comparisons, and market-wide screening / ranking. Narrative
+("what did X *say*") still goes to ``stock_filings_read``.
 
-We wire ONE typed tool (``financials_query``) rather than auto-generating from
-an OpenAPI spec — the service has no spec yet, and the surface is a single
-endpoint. (``GET /healthz`` is a liveness probe, not an agent tool.)
+**Contract (security_id migration, 2026-06):** the service no longer resolves a
+company from the question text — the agent resolves the company FIRST via
+``resolve_company`` (clarifying if ambiguous) and passes the resulting
+``security_id`` (or ``security_ids`` for a comparison). For a market-wide
+screen / ranking ("top 10 NBFCs by ROE", "midcap high-ROCE low-debt") the agent
+passes NEITHER id — the service detects the universe from the question.
+
+``POST /ask`` always returns HTTP 200 with a ``status`` field:
+  * ``ok``                  — answered; carries operation-specific fields.
+  * ``no_data``             — no value for that company/period (not an error).
+  * ``needs_clarification`` — the METRIC isn't derivable from the catalog;
+                              carries ``suggestions`` (closest fields). NOT a
+                              company-disambiguation (that happens upstream now).
+HTTP 404 means the supplied ``security_id`` doesn't exist (resolver mismatch);
+422 means ``question`` was missing.
 
 Base URL: ``settings.PRISM_FINANCIALS_URL`` (env ``PRISM_FINANCIALS_URL``; prod
-``http://35.234.221.166:8000``). No caller auth today — the endpoint is open.
+``http://35.234.221.166:8090``). No caller auth today — the endpoint is open.
 When the service adds ``X-API-Key`` auth, set ``PRISM_FINANCIALS_API_KEY`` and
-the wrapper attaches the header automatically; until then it sends nothing.
-
-The ``/ask`` contract is unusual: it ALWAYS returns HTTP 200 for four logical
-shapes, with ``error: null`` on success. The wrapper branches on them:
-
-  1. Normal       — ``rows`` non-empty, ``error`` null → pass through.
-  2. Clarification — ``needs_clarification: true`` → pass through (still a
-                     SUCCESS result; the agent re-asks the user). ``error`` is
-                     null so ``is_error`` correctly reads it as non-error.
-  3. NOT IN DATABASE refusal — ``rows: [{"note": "NOT IN DATABASE: …"}]``,
-                     ``error`` null → pass through. The agent surfaces it and
-                     does NOT retry or answer from its own knowledge.
-  4. Error        — ``error`` is a non-empty string → convert to the standard
-                     ``make_error`` shape so the agent gets a ``next_action``.
+the wrapper attaches the header automatically.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 
 import httpx
 
@@ -47,13 +45,14 @@ logger = logging.getLogger(__name__)
 # bmc._request. 250ms clears most TCP/DNS/load-spike blips without feeling slow.
 _RETRY_DELAY_S = 0.25
 
-# Intake latency budget: recipe path 0.6-1.5s, text-to-SQL cold 8-15s, refusal
-# ~12s. A single 30s ceiling covers the slow LLM-SQL path with headroom.
-_TIMEOUT = 30.0
+# Latency budget (intake): single-company lookups/trends ~1-4s, comparisons a
+# few s, rankings ~5-15s, screens ~5-40s (first market-wide screen after a
+# restart ~30s). A 75s ceiling covers the slowest screen with headroom.
+_TIMEOUT = 75.0
 
 
 def _base_url() -> str:
-    return (settings.PRISM_FINANCIALS_URL or "http://localhost:8000").rstrip("/")
+    return (settings.PRISM_FINANCIALS_URL or "http://localhost:8090").rstrip("/")
 
 
 def _auth_headers() -> dict[str, str]:
@@ -66,11 +65,9 @@ def _auth_headers() -> dict[str, str]:
 async def _post(path: str, payload: dict, timeout: float) -> dict:
     """POST helper with transparent, graceful error reporting (Part-A).
 
-    Transient transport failures (timeout / network error) get **one silent
-    retry** after 250 ms; on retry success the response carries
-    ``retry_count: 1`` so the runner can emit a ``ToolRetryEvent`` (↻ chip).
-    4xx/5xx are never retried — those are bad input or upstream issues that
-    won't fix themselves in 250 ms.
+    Transient transport failures (timeout / network) get one silent retry after
+    250 ms; on retry success the response carries ``retry_count: 1`` so the
+    runner can emit a ToolRetryEvent (↻ chip). 4xx/5xx are never retried.
     """
     url = f"{_base_url()}{path}"
     headers = _auth_headers()
@@ -118,7 +115,6 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
                 detail=f"{path}: {exc}",
             )
     else:
-        # Defensive — both branches above return on the second failure.
         return make_error(
             message="The financials service is unreachable.",
             code="prism_financials_unreachable",
@@ -135,6 +131,16 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
             retriable=True,
             detail=resp.text,
         )
+    if resp.status_code == 404:
+        # The supplied security_id doesn't exist in the financials DB — almost
+        # always a resolver mismatch. Ask the user to re-pick rather than retry.
+        return make_error(
+            message="That company id wasn't found in the financials database — please re-pick the company.",
+            code="prism_financials_security_not_found",
+            next_action="ask_user_to_clarify",
+            retriable=False,
+            detail=resp.text,
+        )
     if resp.status_code == 422:
         return make_error(
             message="The financials service rejected the request — the question may need more detail.",
@@ -142,18 +148,6 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
             next_action="ask_user_to_clarify",
             retriable=False,
             detail=resp.text,
-        )
-    if resp.status_code == 404:
-        # 404 from this service almost always means the base URL is wrong (most
-        # often the env var is unset and the wrapper hit PRISM's own :8000).
-        # There's no useful "alternate tool" — surface the misconfig so it gets
-        # fixed instead of asking the LLM to retry against a different path.
-        return make_error(
-            message="The financials service is unavailable (404 — the URL looks misconfigured).",
-            code="prism_financials_http_404",
-            next_action="ask_user_to_retry_later",
-            retriable=False,
-            detail=f"GET {url} returned 404. Check PRISM_FINANCIALS_URL env var.",
         )
     if resp.status_code != 200:
         return make_error(
@@ -169,185 +163,127 @@ async def _post(path: str, payload: dict, timeout: float) -> dict:
     return data
 
 
-def _latest_period_end(rows: list[dict]) -> str | None:
-    """Max ISO ``period_end`` across rows — used as the data_freshness signal so
-    the runner can emit a DataFreshnessEvent ("as of …")."""
-    return max(
-        (r.get("period_end") for r in rows if isinstance(r, dict) and r.get("period_end")),
-        default=None,
-    )
+def _data_freshness(data: dict) -> str | None:
+    """Latest period covered by the answer — drives the DataFreshnessEvent
+    ("as of FY2024"). Single-period ops carry ``period``; trends carry a
+    ``series`` of ``{period, value}``; comparisons carry per-company periods."""
+    periods: list[str] = []
+    if isinstance(data.get("period"), str):
+        periods.append(data["period"])
+    for row in data.get("series") or []:
+        if isinstance(row, dict) and isinstance(row.get("period"), str):
+            periods.append(row["period"])
+    for row in data.get("comparison") or []:
+        if isinstance(row, dict) and isinstance(row.get("period"), str):
+            periods.append(row["period"])
+    # FY/quarter labels sort lexate-correctly enough for "latest" (FY2025 > FY2024).
+    return max(periods, default=None)
 
 
-# Regex for the clarification format the upstream emits:
-#
-#   "Which one did you mean?
-#     1. Reliance Industries Ltd. (NSE: RELIANCE, prowess_id=500325)
-#     2. Reliance Power Ltd. (NSE: RPOWER, prowess_id=532792)
-#     ..."
-#
-# We pull the company name from line "1." — the top-ranked candidate by the
-# service's own similarity gate. Two patterns: with-parenthetical (the
-# canonical shape) and bare (defensive fallback if the format ever shifts).
-_CANDIDATE_LINE_RE = re.compile(r"^\s*1[.)]\s+(.+?)\s*\(", re.MULTILINE)
-_CANDIDATE_BARE_RE = re.compile(r"^\s*1[.)]\s+(.+?)\s*$", re.MULTILINE)
-
-
-def _extract_top_candidate(clarification: str) -> str | None:
-    """Return the top-ranked candidate company name from a financials_query
-    clarification block, or ``None`` if the format doesn't match.
-
-    The service ranks candidates by similarity to the user's input, so the
-    item at position #1 is the highest-confidence match. Auto-picking it is
-    the same as a human typing "1" — which is the intended human flow per
-    SKILL.md section 2.
-
-    Returns None when the format is unrecognised; the wrapper then skips
-    the auto-disambig retry and surfaces the clarification verbatim (safe
-    degradation — no wrong answer, just a clarification round-trip).
-    """
-    if not clarification or not isinstance(clarification, str):
-        return None
-    match = _CANDIDATE_LINE_RE.search(clarification)
-    if match is None:
-        match = _CANDIDATE_BARE_RE.search(clarification)
-    if match is None:
-        return None
-    name = match.group(1).strip()
-    # Filter out obvious non-name lines (the regex could grab a header
-    # like "1) Pick one of these:" — defensively reject very-short strings).
-    if len(name) < 3:
-        return None
-    return name
+# Structured fields worth keeping for the deterministic frontend render + the
+# composer. Operation-specific arrays are passed through untouched (the service
+# is canonical — do NOT re-rank or mutate). ``provenance`` (SQL) is intentionally
+# dropped: there's no SQL viewer, and it bloats the agent's context.
+_KEEP_FIELDS = (
+    "operation", "answer", "value", "period", "field", "company",
+    "series", "comparison", "ranking", "matches", "line_items",
+    "attributes", "count", "names", "results", "note",
+)
 
 
 async def financials_query(
     question: str,
-    answer_mode: str = "off",
-    user_id: str | None = None,
+    security_id: int | None = None,
+    security_ids: list[int] | None = None,
 ) -> dict:
-    """Answer a NUMERICAL question about an Indian listed company (CMIE Prowess)
-    — exact figures, ratios, rankings, time-series, ownership %, and market
-    multiples. Generates safe read-only SQL and returns structured ``rows`` plus
-    the executed ``sql``. This is the EXACT-NUMBERS path.
+    """Answer a NUMERICAL question about Indian listed companies (fundamentals,
+    ratios, valuation, statements, screening, rankings) — exact figures with
+    structured, operation-typed results. This is the EXACT-NUMBERS path.
 
-    WHEN TO USE: the user wants a number, a ranking, a breakdown, or a trend —
-      * balance sheet (assets, debt, equity, cash, reserves, working capital),
-      * income statement (revenue, sales, EBITDA, PBT, PAT, margins) annual OR
-        quarterly,
-      * cash flow (operating / investing / financing, capex, dividends),
-      * ownership (promoter / FII / DII / mutual-fund / retail %),
-      * market multiples (P/E, P/B, market cap, EPS, dividend yield),
-      * derived ratios (D/E, current ratio, ROCE, net profit margin, total
-        debt, YoY growth, CAGR),
-      * cross-company top-N / sector rankings / peer benchmarks.
-    Coverage: balance sheet FY15 onward, P&L and cash flow FY17 onward,
-    quarterly from Q1 FY18 onward. Indian listed companies only.
+    WHEN TO USE: the user wants a number, a ratio, a trend, a comparison, a whole
+    statement, or a screen/ranking:
+      * single metric — revenue, PAT, margins, total assets, deposits, borrowings
+        (FY or quarter); trends / YoY / QoQ / CAGR over years/quarters,
+      * derived ratios — ROE, ROA, ROCE, D/E, current/quick ratio, interest
+        coverage, P/E, P/B, EV/EBITDA, EPS, book value/share, working capital,
+      * whole statements — balance sheet, P&L / income statement, key ratios,
+      * comparisons — same metric across 2+ companies,
+      * screening / ranking — "top 10 NBFCs by ROE", "midcap high-ROCE low-debt
+        companies", "Nifty 50 with P/E > 60", "how many pharma companies".
+    Indian listed companies only.
 
-    WHEN NOT TO USE: live/intra-day or historical stock-price series (use
-    ``stock_technicals`` for live), filings narrative / MD&A / what a company
-    *said* (use ``stock_filings_read``), credit ratings / analyst estimates /
-    forecasts, investment advice, general company facts (CEO, founding year),
-    or any non-Indian company. The tool will refuse out-of-scope asks itself
-    with a ``NOT IN DATABASE`` note — but routing those here wastes a round trip.
+    WHEN NOT TO USE: live/intra-day price series (use ``stock_technicals``),
+    filings narrative / what a company *said* (use ``stock_filings_read``),
+    business-model overview (use ``bmc_*``), news/sentiment (use ``news_*``),
+    analyst estimates / forecasts / advice, or non-Indian companies.
 
-    **Pass the user's question VERBATIM.** Do not normalise case, strip aliases
-    or punctuation, or reword it. The service's own resolver handles aliases
-    ("HUL", "L&T", "M&M"), Indian fiscal quarters ("Q3 FY25"), and sector hints.
+    **RESOLVE THE COMPANY FIRST.** The service no longer resolves names — it
+    needs the ``master_securities`` ``security_id``:
+      * ONE company  → call ``resolve_company`` first, pass its ``security_id``.
+      * COMPARISON   → resolve EACH company, pass all ids as ``security_ids``
+        (takes precedence over ``security_id``).
+      * SCREEN / RANK / market-wide (no specific company named) → pass NEITHER
+        id; the service infers the universe (sector / index / size band / all)
+        from the question.
+    Pass the user's ``question`` VERBATIM (the service parses the metric, period,
+    operation, and any screen criteria itself — do not normalise or pre-fill).
 
-    Handle the four response shapes (see Returns):
-      * ``needs_clarification: true`` → show ``clarification`` to the user
-        verbatim and ask them to pick; do NOT choose a candidate yourself.
-      * ``rows[0].note`` starts with "NOT IN DATABASE:" → surface that
-        explanation; do NOT retry and do NOT answer from your own knowledge.
-      * ``ok: False`` → follow ``next_action`` (the service was briefly down).
-      * otherwise → render the ``rows``; cite the ``sql`` if useful.
+    Handle the returned ``status``:
+      * ``needs_clarification`` → the METRIC isn't in the catalog; show ``answer``
+        and the ``suggestions`` (closest fields) and ask which the user wants.
+        Do NOT answer from your own knowledge.
+      * ``no_data`` → there's no value for that company/period; relay ``answer``.
+      * otherwise (``ok``) → relay ``answer`` and render the structured fields.
+    On a service failure the standard ``{"ok": False, ...}`` shape is returned
+    with a ``next_action`` hint.
 
     Args:
-        question: The user's natural-language question, passed verbatim (required).
-        answer_mode: "off" (default — return rows only; you write the prose),
-            "table" (also get a ready markdown table), or "llm" (service writes
-            analyst prose). Leave at "off" for PRISM — the agent owns the final
-            cited answer.
-        user_id: Optional session/user id — written to the service's audit log
-            only; has no effect on the answer. Omit if you don't have one.
+        question: The user's natural-language question, verbatim (required).
+        security_id: ``master_securities`` id from ``resolve_company`` for a
+            SINGLE company. Omit for screens/rankings.
+        security_ids: ids for a multi-company COMPARISON (resolve each first).
+            Takes precedence over ``security_id``. Omit for screens/rankings.
 
     Returns:
-        On success, a dict with ``rows`` (the canonical data — do NOT re-rank or
-        mutate before display), ``sql`` (the executed query, for citation),
-        ``needs_clarification`` / ``clarification``, ``provider``,
-        ``duration_ms``, and ``data_freshness`` (latest period in the rows).
-        On a service-side failure returns the standard ``{"ok": False, ...}``
-        error shape with a ``next_action`` hint.
+        dict with ``status``, ``operation``, ``answer`` (NL), and the
+        operation-specific fields: ``value``/``period``/``field``/``company``
+        (lookup), ``series`` (trend), ``comparison`` (compare), ``ranking`` /
+        ``matches`` (rank/screen), ``line_items`` (statement), ``attributes`` /
+        ``count`` / ``names`` (classification), plus ``data_freshness``. On a
+        clarification: ``needs_clarification: True`` + ``suggestions``.
     """
-    payload: dict = {"question": question, "answer_mode": answer_mode, "debug": False}
-    if user_id:
-        payload["user_id"] = user_id
+    payload: dict = {"question": question}
+    if security_ids:
+        payload["security_ids"] = security_ids
+    elif security_id is not None:
+        payload["security_id"] = security_id
 
     data = await _post("/ask", payload, _TIMEOUT)
     # Transport / HTTP failure already in the standard error shape.
     if data.get("ok") is False:
         return data
 
-    # Shape 4 — the service tried but hit a transient failure (LLM timeout, DB
-    # blip). It puts a graceful message in ``answer``; we map ``error`` onto the
-    # standard shape so the agent gets a structured next_action.
-    if data.get("error"):
-        return make_error(
-            message="The financials service couldn't complete the query just now. Try again in a moment.",
-            code="prism_financials_upstream_error",
-            next_action="ask_user_to_retry_later",
-            retriable=True,
-            detail=str(data.get("error")),
-        )
+    status = data.get("status")
 
-    # Auto-disambiguation (SKILL.md §2 says the human flow is: pick the top
-    # candidate and re-call). In an autonomous agent turn the orchestrator
-    # can't pause for user input, so the wrapper does it. We retry ONCE on
-    # `needs_clarification: true`, prepending the top-ranked candidate name
-    # to the original question. The retry's response is tagged with
-    # `auto_disambiguated_to` so the agent can NOTE the assumption in prose
-    # ("Interpreting TCS as Tata Consultancy Services Ltd.") and the UI can
-    # render a small chip on the tool card.
-    #
-    # Capped at one retry — if the retry STILL needs clarification (the
-    # remaining ambiguity is on a different entity in a multi-company query),
-    # we surface that clarification cleanly. No looping.
-    auto_disambiguated_to: str | None = None
-    if data.get("needs_clarification"):
-        top = _extract_top_candidate(data.get("clarification") or "")
-        if top:
-            retry_question = f"{top}. {question}"
-            logger.info(
-                "prism-financials auto-disambig: picking top candidate %r and re-calling",
-                top,
-            )
-            retry_payload = {**payload, "question": retry_question}
-            retry_data = await _post("/ask", retry_payload, _TIMEOUT)
-            # If the retry itself errored, fall back to the original
-            # clarification (better to surface that than an error).
-            if not (retry_data.get("ok") is False or retry_data.get("error")):
-                # Take the retry as the canonical response IF it actually
-                # resolved (no clarification) OR if it gave us rows.
-                still_ambiguous = retry_data.get("needs_clarification") is True
-                got_rows = bool(retry_data.get("rows"))
-                if got_rows or not still_ambiguous:
-                    data = retry_data
-                    auto_disambiguated_to = top
+    # Metric-level clarification — the company is already resolved; this means
+    # the requested METRIC isn't derivable. Surface it + the closest fields.
+    if status == "needs_clarification":
+        out: dict = {
+            "status": "needs_clarification",
+            "needs_clarification": True,
+            "answer": data.get("answer"),
+            "suggestions": data.get("suggestions") or [],
+        }
+        if "retry_count" in data:
+            out["retry_count"] = data["retry_count"]
+        return out
 
-    # Shapes 1-3 are all SUCCESS envelopes (error is null). Trim operational
-    # fields (debug, echoed answer) and keep the canonical rows + sql.
-    rows = data.get("rows") or []
-    out: dict = {
-        "rows": rows,
-        "sql": data.get("sql"),
-        "needs_clarification": data.get("needs_clarification", False),
-        "clarification": data.get("clarification"),
-        "provider": data.get("provider"),
-        "duration_ms": data.get("duration_ms"),
-        "data_freshness": _latest_period_end(rows),
-    }
-    if auto_disambiguated_to:
-        out["auto_disambiguated_to"] = auto_disambiguated_to
+    # ok / no_data are both success envelopes. Keep the canonical structured
+    # fields (operation-specific arrays pass through untouched); drop bulky/
+    # irrelevant ones (provenance SQL, question echo, granularity, data_type).
+    out = {k: data[k] for k in _KEEP_FIELDS if k in data and data[k] is not None}
+    out["status"] = status or "ok"
+    out["data_freshness"] = _data_freshness(data)
     if "retry_count" in data:
         out["retry_count"] = data["retry_count"]
     return out
