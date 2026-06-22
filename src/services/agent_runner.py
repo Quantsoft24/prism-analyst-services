@@ -54,6 +54,7 @@ from src.schemas.chat import (
     ErrorEvent,
     FinalAnswer,
     FinalEvent,
+    FinalFinancials,
     MetaEvent,
     PlanEvent,
     PlanStep,
@@ -710,6 +711,21 @@ class AgentRunner:
         # the UI deep-links to — rather than trusting the LLM to transcribe URLs.
         structured = _merge_filing_citations(structured, self._tool_trace)
 
+        # Deterministic financials block: attach the structured numeric result
+        # from financials_query (value/series/comparison/ranking/line_items) so
+        # the UI renders the value-card / chart / tables faithfully — not from
+        # LLM-composed prose. (Same trust model as filing citations / BMC.)
+        structured = _merge_financials(structured, self._tool_trace)
+
+        # Strip page-LESS citation markers the model sometimes invents for
+        # financial numbers (e.g. "[TCS | p.N]", "[Infosys Ltd. | ]") — those
+        # have no real page and would render as ugly literal text. A valid filing
+        # citation ALWAYS has a digit page (`[Co | p.44]`), so this only removes
+        # the broken ones; real filing/BMC cites are untouched.
+        prose = _strip_pageless_cites(prose)
+        if structured is not None and structured.text:
+            structured = structured.model_copy(update={"text": _strip_pageless_cites(structured.text)})
+
         # Safety net for the "still no prose" case — the quality composer ran
         # above for substantive turns; this catches (a) trivial turns where the
         # fast model emitted nothing, and (b) the rare case the composer itself
@@ -1160,50 +1176,41 @@ def _summarize_tool_response(response: dict[str, Any]) -> str:
     if not isinstance(response, dict):
         return str(response)[:120]
 
-    # ── financials_query shapes — check FIRST so they don't fall through to
-    # the generic "ok · keys" path. The financials envelope always carries
-    # rows + sql + needs_clarification + clarification, so the bare-key
-    # fallback below would render an unreadable "ok · rows, sql, needs_…"
-    # for every call. Explicit branches:
-    if (
-        "rows" in response and "sql" in response
-        and "needs_clarification" in response
+    # ── financials_query shapes (security_id migration) — check FIRST so they
+    # don't fall through to the generic "ok · keys" path. The envelope carries
+    # ``status`` + ``operation`` (+ operation-specific arrays). Explicit branches:
+    if "operation" in response and (
+        "value" in response or "series" in response or "comparison" in response
+        or "ranking" in response or "matches" in response or "line_items" in response
+        or response.get("status") in ("ok", "no_data")
     ):
-        rows = response.get("rows") or []
-        clarif = response.get("needs_clarification")
-        # NOT IN DATABASE refusal — the upstream returns a one-row stub.
-        if (
-            isinstance(rows, list) and len(rows) == 1
-            and isinstance(rows[0], dict)
-            and isinstance(rows[0].get("note"), str)
-            and rows[0]["note"].startswith("NOT IN DATABASE")
-        ):
-            return "no data · NOT IN DATABASE"
-        # Clarification gate fired (and the wrapper's auto-disambig couldn't
-        # resolve, so the user has to pick).
-        if clarif:
-            # Count candidates in the clarification text — gives the UI a
-            # quick sense of how much ambiguity there is.
-            text = response.get("clarification") or ""
-            n_candidates = sum(
-                1 for line in text.splitlines()
-                if line.strip().startswith(("1.", "2.", "3.", "4.", "5.",
-                                            "1)", "2)", "3)", "4)", "5)"))
-            )
-            n_label = f"{n_candidates} candidates" if n_candidates else "ambiguous"
-            return f"needs clarification · {n_label}"
-        # Happy path — non-empty rows.
-        if rows:
-            n = len(rows)
-            chip = ""
-            picked = response.get("auto_disambiguated_to")
-            if picked:
-                # Trim to keep the chip readable in the tool card.
-                picked_short = (picked[:24] + "…") if len(picked) > 25 else picked
-                chip = f" · auto-resolved: {picked_short}"
-            return f"{n} row{'s' if n != 1 else ''}{chip}"
-        # Empty rows, no clarification, no NOT IN DATABASE — odd but possible.
-        return "no data"
+        if response.get("status") == "no_data":
+            return "no data"
+        # Branch on the populated array FIRST (a compare is tagged
+        # operation:"lookup" but carries `comparison`), then fall to the metric.
+        if response.get("comparison"):
+            return f"compared {len(response['comparison'])} cos"
+        if response.get("ranking"):
+            return f"ranked top {len(response['ranking'])}"
+        if response.get("matches"):
+            return f"screen · {len(response['matches'])} matches"
+        if response.get("series"):
+            return f"trend · {len(response['series'])} pts"
+        if response.get("line_items"):
+            return f"statement · {len(response['line_items'])} items"
+        if response.get("value") is not None:
+            fld = response.get("field") or {}
+            label = fld.get("label") or fld.get("key") or "value"
+            period = response.get("period")
+            return f"{label}{(' ' + period) if period else ''}"
+        if response.get("count") is not None or response.get("names"):
+            return f"list · {response.get('count') or len(response.get('names') or [])}"
+        return str(response.get("operation") or "result")
+    # Metric-level clarification from financials (the company is already resolved;
+    # the requested metric isn't in the catalog → suggestions for the user).
+    if response.get("needs_clarification") and isinstance(response.get("suggestions"), list):
+        n = len(response.get("suggestions") or [])
+        return f"needs clarification · {n} suggestion{'s' if n != 1 else ''}"
 
     # Company list / filings list / generic items array
     if "items" in response and isinstance(response["items"], list):
@@ -2115,6 +2122,73 @@ def _merge_filing_citations(
             Citation(label=f"[{company} | p.{page}]", url=url, source_kind="filing", page=page)
         )
     return structured.model_copy(update={"citations": out})
+
+
+# A `[Company | …]` citation marker whose pipe-tail has NO digit — i.e. an
+# invented page-less cite ("[TCS | p.N]", "[Infosys Ltd. | ]"). A real filing
+# cite always carries a digit page ("[Co | p.44]"), so it never matches here.
+# Eats one leading space so stripping doesn't leave "word  ." double-spaces.
+_PAGELESS_CITE_RE = re.compile(r"[ \t]*\[[^\[\]|]+\|[^\]\d]*\]")
+
+
+def _strip_pageless_cites(text: str) -> str:
+    """Remove page-less `[X | …]` citation markers the model sometimes attaches
+    to financial numbers (which have no filing page). Leaves valid filing/BMC
+    cites (those carry a digit page) untouched."""
+    if not text or "|" not in text:
+        return text
+    return _PAGELESS_CITE_RE.sub("", text)
+
+
+def _merge_financials(
+    structured: FinalAnswer | None, tool_trace: list[dict[str, Any]],
+) -> FinalAnswer | None:
+    """Attach the structured numeric result from ``financials_query`` so the UI
+    renders the value-card / trend chart / comparison & ranking tables / statement
+    deterministically (not from LLM prose). Picks the LAST successful financials
+    call in the turn (the one the answer is about). No-op when none ran, when it
+    clarified, or when there's nothing renderable. Trust model mirrors
+    ``_merge_filing_citations`` — the service is canonical; we pass it through."""
+    if structured is None:
+        return structured
+    fin: dict[str, Any] | None = None
+    for entry in tool_trace:
+        if str(entry.get("tool", "")) != "financials_query":
+            continue
+        resp = entry.get("response")
+        if not isinstance(resp, dict):
+            continue
+        if resp.get("ok") is False or resp.get("needs_clarification"):
+            continue
+        if "operation" in resp:
+            fin = resp  # keep last successful one
+    if fin is None:
+        return structured
+
+    block = FinalFinancials(
+        operation=str(fin.get("operation") or "result"),
+        answer=fin.get("answer"),
+        value=fin.get("value") if isinstance(fin.get("value"), (int, float)) else None,
+        period=fin.get("period"),
+        field=fin.get("field") if isinstance(fin.get("field"), dict) else None,
+        company=fin.get("company") if isinstance(fin.get("company"), dict) else None,
+        series=[r for r in (fin.get("series") or []) if isinstance(r, dict)],
+        comparison=[r for r in (fin.get("comparison") or []) if isinstance(r, dict)],
+        ranking=[r for r in (fin.get("ranking") or []) if isinstance(r, dict)],
+        matches=[r for r in (fin.get("matches") or []) if isinstance(r, dict)],
+        line_items=[r for r in (fin.get("line_items") or []) if isinstance(r, dict)],
+        attributes=fin.get("attributes") if isinstance(fin.get("attributes"), dict) else None,
+        count=fin.get("count") if isinstance(fin.get("count"), int) else None,
+        names=[str(n) for n in (fin.get("names") or []) if isinstance(n, str)],
+    )
+    # Only attach if there's actually something to render beyond the prose.
+    has_content = any((
+        block.value is not None, block.series, block.comparison, block.ranking,
+        block.matches, block.line_items, block.attributes, block.count is not None, block.names,
+    ))
+    if not has_content:
+        return structured
+    return structured.model_copy(update={"financials": block})
 
 
 def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:

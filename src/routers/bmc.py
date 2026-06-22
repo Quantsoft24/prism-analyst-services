@@ -80,6 +80,18 @@ async def _forward_json(
     return resp.json()
 
 
+async def get_bmc_firm_id(
+    _firm: Annotated[str, Depends(get_current_firm_id)],
+) -> str:
+    """BMC is a FIRM-WIDE shared library — every canvas is visible to everyone
+    (guest or signed-in), not scoped to the caller. We still resolve the
+    principal (keeps the auth surface / rate-limit identical) but IGNORE its
+    per-user firm and return the single shared firm_id, so all reads + writes hit
+    one pool. This also makes BMC immune to the per-user firm_id churn the Neon
+    DB fallbacks introduce."""
+    return settings.BMC_SHARED_FIRM_ID
+
+
 # ── Request models — match the upstream API; we inject firm_id ────────────────
 
 
@@ -109,7 +121,7 @@ class BMCDiffRequest(BaseModel):
 async def run_bmc(
     ticker: str,
     body: BMCRunRequest,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     return await _forward_json(
         "POST",
@@ -121,7 +133,7 @@ async def run_bmc(
 
 @router.get("/library", summary="All saved canvases for this firm (latest per company)")
 async def list_all_canvases(
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     # MUST be declared BEFORE GET /{ticker} so the literal "library" segment is
     # not captured as a ticker (FastAPI matches in declaration order). Upstream
@@ -134,7 +146,7 @@ async def list_all_canvases(
 @router.get("/{ticker}", summary="Latest persisted BMC for this firm + ticker")
 async def get_latest_bmc(
     ticker: str,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     return await _forward_json(
         "GET", f"/bmc/{ticker}", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
@@ -144,7 +156,7 @@ async def get_latest_bmc(
 @router.get("/{ticker}/library", summary="All saved versions (header-level)")
 async def list_versions(
     ticker: str,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     return await _forward_json(
         "GET", f"/bmc/{ticker}/library", params={"firm_id": firm_id}, timeout=_LIGHT_TIMEOUT
@@ -159,7 +171,7 @@ async def chat_about_block(
     ticker: str,
     block_id: str,
     body: BMCChatRequest,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     payload = body.model_dump(exclude_none=True)
     # The upstream tracks chat history in `bmc_chats`. Until real users exist,
@@ -177,7 +189,7 @@ async def chat_about_block(
 async def diff_bmc(
     ticker: str,
     body: BMCDiffRequest,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     return await _forward_json(
         "POST",
@@ -193,7 +205,7 @@ async def diff_bmc(
 )
 async def export_latest(
     ticker: str,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
     format: str = Query("pdf", pattern="^(json|pdf|xlsx)$"),
 ) -> Response:
     """Fetch latest version then forward the export bytes."""
@@ -213,7 +225,7 @@ async def export_latest(
 async def export_version(
     ticker: str,
     version: int,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
     format: str = Query("pdf", pattern="^(json|pdf|xlsx)$"),
 ) -> Response:
     return await _export_version(ticker, version, firm_id, format)
@@ -249,7 +261,7 @@ async def _export_version(ticker: str, version: int, firm_id: str, fmt: str) -> 
 async def get_version(
     ticker: str,
     version: int,
-    firm_id: Annotated[str, Depends(get_current_firm_id)],
+    firm_id: Annotated[str, Depends(get_bmc_firm_id)],
 ) -> Any:
     return await _forward_json(
         "GET",

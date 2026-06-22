@@ -224,6 +224,31 @@ class DeepDiveSuggestion(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)  # deep-link params (may be empty)
 
 
+class FinalFinancials(BaseModel):
+    """Structured numeric result from ``financials_query`` (prism-financials),
+    attached DETERMINISTICALLY by the runner from the tool trace (not composed by
+    the LLM) so the frontend renders the value card / trend chart / comparison &
+    ranking tables / statement faithfully. The prose ``text`` answer is still the
+    lead; this drives the rich render beneath it. Fields are operation-specific —
+    all optional; the frontend switches on ``operation``."""
+
+    # lookup|trend|yoy_growth|cagr|qoq|rank|screen|statement|attribute|list|formula|compare
+    operation: str
+    answer: str | None = None  # the service's NL one-liner (fallback/caption)
+    value: float | None = None
+    period: str | None = None
+    field: dict[str, Any] | None = None      # {key,label,unit}
+    company: dict[str, Any] | None = None     # {security_id,name,symbol}
+    series: list[dict[str, Any]] = Field(default_factory=list)        # trend: [{period,value}]
+    comparison: list[dict[str, Any]] = Field(default_factory=list)    # compare: [{security_id,name,value,period}]
+    ranking: list[dict[str, Any]] = Field(default_factory=list)       # rank: [{rank?,name,value,...}]
+    matches: list[dict[str, Any]] = Field(default_factory=list)       # screen: [{name, ...metrics}]
+    line_items: list[dict[str, Any]] = Field(default_factory=list)    # statement: [{key,label,value,unit,display}]
+    attributes: dict[str, Any] | None = None  # classification lookup
+    count: int | None = None                  # list/count
+    names: list[str] = Field(default_factory=list)
+
+
 class FinalAnswer(BaseModel):
     """Structured answer payload. Replaces the bare string in ``FinalEvent.answer``.
 
@@ -246,6 +271,10 @@ class FinalAnswer(BaseModel):
     # news, regulatory, portfolio). Rule-based, capped + deduped + silent by
     # default; synthesized in ``src/services/deep_dive.py``.
     suggested_actions: list[DeepDiveSuggestion] = Field(default_factory=list)
+    # Deterministic structured numeric result from ``financials_query`` — drives
+    # the rich value-card / chart / table render under the prose. None when the
+    # turn used no financials tool (or it clarified / errored).
+    financials: FinalFinancials | None = None
 
 
 class FinalEvent(BaseModel):
