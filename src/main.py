@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.config import settings
-from src.core.database import dispose_engine, init_engine
+from src.core.database import dispose_engine, ensure_engine
 from src.core.investment_database import (
     dispose_investment_engine,
     init_investment_engine,
@@ -121,7 +121,9 @@ async def lifespan(app: FastAPI):
     """Initialize DB pools + ModelRouter on startup; dispose cleanly on shutdown."""
     _configure_adk_env()
     _configure_auth()
-    init_engine()
+    # Failover-aware boot: probe the primary DB and rotate to a configured
+    # fallback URL if it's unreachable (e.g. a capped Neon project).
+    await ensure_engine()
 
     # Read-only engine for the investment DB (AWS RDS) — powers the Stock
     # Dashboard (/api/v1/stocks/*). Skipped silently if not configured; a
