@@ -24,6 +24,11 @@ COPY src/ src/
 COPY alembic/ alembic/
 COPY config/ config/
 COPY alembic.ini .
+# `scripts/` carries operational entrypoints run inside the container — notably
+# `migrate_all_dbs.py`, which the deploy migrates the primary + every fallback DB
+# with (deploy.yml). Without this COPY the deploy's migration step fails with
+# "can't open file '/app/scripts/migrate_all_dbs.py'".
+COPY scripts/ scripts/
 
 EXPOSE 8000
 
