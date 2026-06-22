@@ -58,16 +58,18 @@ jobs:
               exit 1
             fi
 
-            echo "📦 Applying database migrations (alembic upgrade head)..."
-            # The new image ships the latest migration files; run them against
-            # the live DB so the schema matches the code. Idempotent (no-op if
-            # already at head). Backend is already up + healthy so the DB
-            # connection settings are known good.
+            echo "📦 Applying database migrations to the primary + all fallback DBs..."
+            # Migrate every DB in DATABASE_URL + DATABASE_URL_FALLBACKS so the app
+            # can fail over to any of them. Capped/unreachable URLs (e.g. a Neon
+            # project past its compute quota) are skipped with a warning — the
+            # step fails ONLY if every database is unreachable. Idempotent (no-op
+            # if already at head). A plain `alembic upgrade head` here would hard-
+            # fail the deploy whenever the primary alone is capped.
             if docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml \
-                 exec -T backend alembic upgrade head; then
-              echo "✅ Migrations up to date — $(docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml exec -T backend alembic current 2>/dev/null | tail -1)"
+                 exec -T backend python scripts/migrate_all_dbs.py; then
+              echo "✅ Migrations applied to all reachable databases"
             else
-              echo "❌ Alembic upgrade failed — see logs above"
+              echo "❌ Migration failed — every configured database was unreachable"
               docker compose -f ~/PRISM/prism-analyst-platform/docker-compose.prod.yml logs backend --tail 30
               exit 1
             fi
