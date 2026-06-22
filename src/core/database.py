@@ -53,7 +53,7 @@ _active_idx: int = 0
 # Error classes that mean "this database isn't accepting our connection" and we
 # should try the next URL. Broad on purpose — a capped Neon endpoint can surface
 # as any of these (connect refused, endpoint disabled, too many connections).
-_FAILOVER_ERRORS = (OperationalError, InterfaceError, DBAPIError, OSError, ConnectionError)
+FAILOVER_ERRORS = (OperationalError, InterfaceError, DBAPIError, OSError, ConnectionError)
 
 
 def _build_engine(url: str) -> AsyncEngine:
@@ -183,7 +183,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
                 raise
             finally:
                 await session.close()
-    except _FAILOVER_ERRORS as exc:
+    except FAILOVER_ERRORS as exc:
         logger.warning("DB connection error (%s) — attempting failover.", type(exc).__name__)
         await ensure_engine()
         raise
@@ -203,7 +203,7 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
                 raise
             finally:
                 await session.close()
-    except _FAILOVER_ERRORS as exc:
+    except FAILOVER_ERRORS as exc:
         logger.warning("DB connection error (%s) — attempting failover.", type(exc).__name__)
         await ensure_engine()
         raise
