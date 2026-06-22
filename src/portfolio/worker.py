@@ -18,7 +18,12 @@ import logging
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.core.database import dispose_engine, get_sessionmaker, init_engine
+from src.core.database import (
+    FAILOVER_ERRORS,
+    dispose_engine,
+    ensure_engine,
+    get_sessionmaker,
+)
 from src.core.investment_database import (
     dispose_investment_engine,
     get_investment_sessionmaker,
@@ -65,20 +70,36 @@ async def process_one(primary_sm: async_sessionmaker, invest_sm: async_sessionma
 
 
 async def worker_loop(poll_interval: float = POLL_INTERVAL_S) -> None:
-    init_engine()
+    # Failover-aware boot (same as the API lifespan): probe the primary DB and
+    # rotate to a configured fallback if it's unreachable (e.g. a capped Neon
+    # project). Without this the worker binds to a dead primary and crash-loops.
+    await ensure_engine()
     init_investment_engine()
-    primary_sm = get_sessionmaker()
     invest_sm = get_investment_sessionmaker()
     logger.info("portfolio backtest worker started")
     try:
         while True:
-            processed = await process_one(primary_sm, invest_sm)
-            if not processed:
-                # Idle tick: requeue any stalled jobs, then wait.
-                async with primary_sm() as s:
-                    n = await JobRepository(s).reclaim_stale(STALE_TIMEOUT_MIN)
-                    if n:
-                        logger.warning("requeued %d stalled backtest(s)", n)
+            try:
+                # Re-fetch the sessionmaker each tick so a runtime DB failover
+                # (which rebuilds the engine) is picked up rather than reusing a
+                # stale binding to the dead DB.
+                primary_sm = get_sessionmaker()
+                processed = await process_one(primary_sm, invest_sm)
+                if not processed:
+                    # Idle tick: requeue any stalled jobs, then wait.
+                    async with primary_sm() as s:
+                        n = await JobRepository(s).reclaim_stale(STALE_TIMEOUT_MIN)
+                        if n:
+                            logger.warning("requeued %d stalled backtest(s)", n)
+                    await asyncio.sleep(poll_interval)
+            except FAILOVER_ERRORS as exc:
+                # Primary DB dropped connections mid-loop — rotate to a healthy
+                # fallback and keep going instead of crashing the process.
+                logger.warning(
+                    "worker DB connection error (%s) — failing over and retrying",
+                    type(exc).__name__,
+                )
+                await ensure_engine()
                 await asyncio.sleep(poll_interval)
     finally:
         await dispose_engine()
