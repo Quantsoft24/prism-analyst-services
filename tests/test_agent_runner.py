@@ -143,74 +143,49 @@ class TestSummarizeToolResponse:
             _summarize_tool_response({"result": 12.5, "unit": "%"}) == "= 12.5%"
         )
 
-    # ── financials_query shape — explicit branches (added 2026-05-29) ──
+    # ── financials_query shape — new operation/status branches (2026-06) ──
 
-    def test_financials_query_rows_summary(self) -> None:
+    def test_financials_lookup_summary(self) -> None:
         resp = {
-            "rows": [{"a": 1}, {"a": 2}, {"a": 3}],
-            "sql": "SELECT ...",
-            "needs_clarification": False,
-            "clarification": None,
+            "status": "ok", "operation": "lookup", "value": 65446.5, "period": "FY2024",
+            "field": {"key": "net_profit", "label": "Net Profit (PAT)", "unit": "₹ cr"},
         }
-        assert _summarize_tool_response(resp) == "3 rows"
+        assert _summarize_tool_response(resp) == "Net Profit (PAT) FY2024"
 
-    def test_financials_query_single_row_singular(self) -> None:
+    def test_financials_trend_summary(self) -> None:
         resp = {
-            "rows": [{"a": 1}],
-            "sql": "SELECT 1",
-            "needs_clarification": False,
-            "clarification": None,
+            "status": "ok", "operation": "trend",
+            "series": [{"period": "FY2022", "value": 1}, {"period": "FY2023", "value": 2}],
         }
-        assert _summarize_tool_response(resp) == "1 row"
+        assert _summarize_tool_response(resp) == "trend · 2 pts"
 
-    def test_financials_query_auto_disambig_chip(self) -> None:
+    def test_financials_compare_summary(self) -> None:
+        # The service tags compares as operation:"lookup" but carries `comparison`.
         resp = {
-            "rows": [{"a": 1}],
-            "sql": "SELECT 1",
-            "needs_clarification": False,
-            "clarification": None,
-            "auto_disambiguated_to": "Tata Consultancy Services Ltd.",
+            "status": "ok", "operation": "lookup",
+            "comparison": [{"name": "TCS", "value": 19.1}, {"name": "Infosys", "value": 16.4}],
         }
-        summary = _summarize_tool_response(resp)
-        assert "1 row" in summary
-        assert "auto-resolved" in summary
-        assert "Tata Consultancy" in summary
+        assert _summarize_tool_response(resp) == "compared 2 cos"
 
-    def test_financials_query_needs_clarification_counts_candidates(self) -> None:
+    def test_financials_rank_summary(self) -> None:
+        resp = {"status": "ok", "operation": "rank", "ranking": [{"name": "A"}, {"name": "B"}, {"name": "C"}]}
+        assert _summarize_tool_response(resp) == "ranked top 3"
+
+    def test_financials_statement_summary(self) -> None:
+        resp = {"status": "ok", "operation": "statement", "line_items": [{"key": "x"}, {"key": "y"}]}
+        assert _summarize_tool_response(resp) == "statement · 2 items"
+
+    def test_financials_needs_clarification_counts_suggestions(self) -> None:
         resp = {
-            "rows": [],
-            "sql": None,
-            "needs_clarification": True,
-            "clarification": (
-                "Which one did you mean?\n"
-                "  1. Reliance Industries Ltd.\n"
-                "  2. Reliance Power Ltd.\n"
-                "  3. Reliance Infrastructure Ltd.\n"
-                "  4. Reliance Communications Ltd.\n"
-            ),
+            "status": "needs_clarification", "needs_clarification": True,
+            "suggestions": [{"key": "cash", "label": "Cash"}, {"key": "rf", "label": "Reserves"}],
         }
         summary = _summarize_tool_response(resp)
         assert "needs clarification" in summary
-        assert "4 candidates" in summary
+        assert "2 suggestion" in summary
 
-    def test_financials_query_not_in_database_refusal(self) -> None:
-        resp = {
-            "rows": [{"note": "NOT IN DATABASE: stock-price time series is not loaded."}],
-            "sql": None,
-            "needs_clarification": False,
-            "clarification": None,
-        }
-        assert _summarize_tool_response(resp) == "no data · NOT IN DATABASE"
-
-    def test_financials_query_empty_no_clarification(self) -> None:
-        # Edge case: tool returned no rows and no clarification — odd but
-        # possible. Should be clearly labelled, not bare "ok · keys".
-        resp = {
-            "rows": [],
-            "sql": "SELECT ...",
-            "needs_clarification": False,
-            "clarification": None,
-        }
+    def test_financials_no_data(self) -> None:
+        resp = {"status": "no_data", "operation": "lookup", "answer": "No value."}
         assert _summarize_tool_response(resp) == "no data"
 
 

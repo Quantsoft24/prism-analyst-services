@@ -148,19 +148,18 @@ class Settings(BaseSettings):
     STOCK_CHAT_URL: str = "http://localhost:8011"
 
     # ── Prism Financials (external numeric-Q&A service) ──
-    # Teammate-built text-to-SQL service over CMIE Prowess (FastAPI, prod
-    # `http://35.234.221.166:8000`). POST /ask turns a finance question into
-    # safe read-only Postgres SQL and returns structured rows + the SQL.
-    # Referenced by the prism-financials integration tool. The endpoint is
-    # currently open (no caller auth); PRISM_FINANCIALS_API_KEY stays empty
-    # until the service adds X-API-Key auth — the wrapper sends the header only
-    # when it's set, so no secret ever lands in git.
+    # Teammate-built finance Q&A service over the investment DB (FastAPI). As of
+    # the security_id migration (2026-06) it runs on prod `http://35.234.221.166:8090`
+    # and takes {question, security_id?/security_ids?}; POST /ask returns a typed,
+    # operation-specific result (lookup/trend/compare/rank/screen/statement) plus
+    # an NL answer + SQL provenance. Referenced by the prism-financials tool. The
+    # endpoint is open (no caller auth); PRISM_FINANCIALS_API_KEY stays empty until
+    # the service adds X-API-Key — the wrapper sends the header only when set.
     #
-    # NOTE: the upstream runs on :8000 — the same port PRISM itself binds to.
-    # The default below is :8013 (a placeholder), NOT :8000, so a missing env
-    # var fails loudly with "connection refused" instead of silently routing
-    # /ask back into PRISM's own FastAPI server (which would 404).
-    PRISM_FINANCIALS_URL: str = "http://localhost:8013"
+    # Default is the prod URL so it works out of the box; override in .env for a
+    # local `uvicorn` run. ⚠️ If .env still has the OLD :8000 port, update it to
+    # :8090.
+    PRISM_FINANCIALS_URL: str = "http://35.234.221.166:8090"
     PRISM_FINANCIALS_API_KEY: str = ""
 
     # ── Prism News (external financial-news + sentiment service) ──
@@ -210,6 +209,14 @@ class Settings(BaseSettings):
     # wrappers in src/integrations/tools/bmc.py). No caller auth — must be
     # network-restricted to the PRISM backend's IP. Dev: localhost; prod: VM IP.
     BMC_URL: str = "http://localhost:8012"
+
+    # BMC is a FIRM-WIDE shared library: every Business Model Canvas is visible to
+    # everyone in the app (guest OR signed-in), NOT scoped to the requesting user.
+    # So all BMC calls (the /api/v1/bmc/* proxy AND the agent's bmc_* tools) pin a
+    # single constant firm_id instead of the request principal's per-user/anonymous
+    # firm. This decouples BMC from auth identity (which now churns across the Neon
+    # DB fallbacks). Point it at wherever the canvases live if not "default".
+    BMC_SHARED_FIRM_ID: str = "default"
 
     # ── Investment DB (READ-ONLY secondary engine — new AWS RDS ``investment``
     # Postgres backing the Stock Dashboard). Two tables only: ``master_securities``
