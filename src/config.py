@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     # Either set DATABASE_URL directly (Neon / AWS RDS style),
     # or set DB_* parts individually and we'll assemble it.
     DATABASE_URL: str = ""
+    # Optional comma-separated FALLBACK DB URLs (e.g. spare Neon projects). When
+    # the active DB rejects connections — e.g. a Neon free-tier project whose
+    # monthly compute allowance is spent and whose endpoint is disabled — the app
+    # automatically fails over to the next URL here. NOTE: these are independent
+    # databases (data is NOT replicated); a failover lands on a separate dataset.
+    # Acceptable for an internal/dev tool where losing data is fine.
+    DATABASE_URL_FALLBACKS: str = ""
     DB_HOST: str = "localhost"
     DB_PORT: int = 5432
     DB_NAME: str = "prism"
@@ -279,6 +286,39 @@ class Settings(BaseSettings):
         SSL is controlled via ``db_connect_args`` instead.
         """
         return self._build_url("asyncpg", strip_sslmode=True)
+
+    @staticmethod
+    def _to_asyncpg(raw: str) -> str:
+        """Normalize an arbitrary raw Postgres URL to ``postgresql+asyncpg://``
+        with the ``sslmode`` query param stripped (asyncpg rejects it; SSL goes
+        through ``db_connect_args``). Used for the fallback URLs, which are
+        always full connection strings."""
+        url = raw.strip()
+        if url.startswith("postgresql+"):
+            _, _, rest = url.partition("://")
+            url = f"postgresql+asyncpg://{rest}"
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        elif url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        return _strip_sslmode(url)
+
+    @property
+    def async_database_urls(self) -> list[str]:
+        """The primary async URL followed by any configured fallbacks, in order,
+        de-duplicated. The failover engine (``src/core/database.py``) walks this
+        list when the active DB stops accepting connections."""
+        urls = [self.async_database_url]
+        for raw in self.DATABASE_URL_FALLBACKS.split(","):
+            if raw.strip():
+                urls.append(self._to_asyncpg(raw))
+        seen: set[str] = set()
+        out: list[str] = []
+        for u in urls:
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
 
     @property
     def sync_database_url(self) -> str:
