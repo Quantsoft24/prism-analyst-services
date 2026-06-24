@@ -16,8 +16,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.config import settings
 from src.services.model_router import (
     ModelRouter,
+    _provider_of,
     dispose_router,
     get_router,
     init_router,
@@ -64,6 +66,9 @@ def test_every_model_has_a_pricing_entry():
 def test_virtual_model_name_roundtrip():
     for tier in TIER_CONFIGS:
         assert tier_from_virtual(virtual_model_name(tier)) == tier
+    # Provider-fallback sub-groups resolve back to their base tier.
+    assert tier_from_virtual("prism-fast-fb1") == "fast"
+    assert tier_from_virtual("prism-quality-fb2") == "quality"
     assert tier_from_virtual("gemini-direct") is None
     assert tier_from_virtual("prism-not-a-real-tier") is None
 
@@ -76,40 +81,85 @@ def test_router_rejects_empty_api_keys():
         ModelRouter(api_keys=[])
 
 
-def test_build_model_list_expands_tier_by_keys():
-    """N models × K keys = N*K deployments per tier."""
+def _count_models(tier: str, provider: str) -> int:
+    """Number of models of ``provider`` in a tier's config."""
+    return sum(1 for m in TIER_CONFIGS[tier]["models"] if _provider_of(m) == provider)
+
+
+def test_gemini_only_collapses_to_single_group_per_tier(monkeypatch):
+    """With NO openai/deepseek keys, each tier has ONE group named
+    ``prism-<tier>`` containing only its gemini models — identical to the
+    pre-multi-provider behavior (gemini models × K keys)."""
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "")
     router = ModelRouter(api_keys=["key-a", "key-b", "key-c"])
-    # Call internal builder directly — no need to spin up litellm.Router.
     model_list, fallbacks = router._build_model_list_and_fallbacks()
 
-    # Each tier should contribute (num_models × 3 keys) entries.
-    expected_total = sum(len(cfg["models"]) * 3 for cfg in TIER_CONFIGS.values())
+    # Only gemini models survive (openai/* + deepseek/* skipped → no key).
+    expected_total = sum(_count_models(t, "gemini") * 3 for t in TIER_CONFIGS)
+    assert len(model_list) == expected_total
+    # No provider-fallback sub-groups exist when only one provider is present.
+    assert not any(e["model_name"].endswith(("-fb1", "-fb2")) for e in model_list)
+    for entry in model_list:
+        assert entry["litellm_params"]["model"].startswith("gemini/")
+        assert entry["litellm_params"]["api_key"] in {"key-a", "key-b", "key-c"}
+    # Cross-tier net still wired (fast↔quality, classify→fast).
+    fb = {k: v for d in fallbacks for k, v in d.items()}
+    assert "prism-fast" in fb["prism-quality"]
+    assert "prism-quality" in fb["prism-fast"]
+
+
+def test_provider_priority_groups_and_failover_chain(monkeypatch):
+    """With OpenAI + DeepSeek keys set, each generative tier splits into
+    per-provider groups (openai = head, deepseek = fb1, gemini = fb2) chained
+    as strict fallbacks: prism-<tier> → -fb1 → -fb2 → cross-tier head."""
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "ok-key")
+    monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "ds-key")
+    router = ModelRouter(api_keys=["g1", "g2", "g3"])  # 3 gemini keys
+    model_list, fallbacks = router._build_model_list_and_fallbacks()
+
+    # Per-provider key multiplicity: openai/deepseek = 1 key, gemini = 3.
+    expected_total = sum(
+        _count_models(t, "openai") * 1
+        + _count_models(t, "deepseek") * 1
+        + _count_models(t, "gemini") * 3
+        for t in TIER_CONFIGS
+    )
     assert len(model_list) == expected_total
 
-    # Spot-check: every entry has the right shape.
-    for entry in model_list:
-        assert entry["model_name"].startswith("prism-")
-        assert "litellm_params" in entry
-        assert entry["litellm_params"]["api_key"] in {"key-a", "key-b", "key-c"}
-        assert entry["rpm"] > 0
-        assert entry["tpm"] > 0
+    # The fast HEAD group is OpenAI-only; its first model is the config's first.
+    fast_head = [e for e in model_list if e["model_name"] == "prism-fast"]
+    assert fast_head and all(
+        e["litellm_params"]["model"].startswith("openai/") for e in fast_head
+    )
+    assert fast_head[0]["litellm_params"]["model"] == TIER_CONFIGS["fast"]["models"][0]
+    # fb1 = deepseek, fb2 = gemini.
+    assert all(
+        e["litellm_params"]["model"].startswith("deepseek/")
+        for e in model_list if e["model_name"] == "prism-fast-fb1"
+    )
+    assert all(
+        e["litellm_params"]["model"].startswith("gemini/")
+        for e in model_list if e["model_name"] == "prism-fast-fb2"
+    )
 
-    # Fallbacks: quality should cascade to fast.
-    fallback_targets = {k: v for d in fallbacks for k, v in d.items()}
-    assert "prism-fast" in fallback_targets["prism-quality"]
+    # Strict failover chain for the head, then the cross-tier net.
+    fb = {k: v for d in fallbacks for k, v in d.items()}
+    assert fb["prism-fast"][:2] == ["prism-fast-fb1", "prism-fast-fb2"]
+    assert "prism-quality" in fb["prism-fast"]  # cross-tier last resort
 
 
-def test_build_model_list_preserves_tier_chain_order():
-    """First entry for ``prism-fast`` must be the first model in the config —
-    LiteLLM's usage-based-routing-v2 honors order on ties."""
-    router = ModelRouter(api_keys=["k"])
-    model_list, _ = router._build_model_list_and_fallbacks()
-
-    fast_entries = [e for e in model_list if e["model_name"] == "prism-fast"]
-    assert fast_entries, "Expected at least one prism-fast deployment"
-    first_model = fast_entries[0]["litellm_params"]["model"]
-    expected_first = TIER_CONFIGS["fast"]["models"][0]
-    assert first_model == expected_first
+def test_embedding_tier_never_falls_back(monkeypatch):
+    """Embedding stays single-model, single-group, and is in NO fallback chain
+    (mixing embedding models corrupts the vector space)."""
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "ok-key")
+    monkeypatch.setattr(settings, "DEEPSEEK_API_KEY", "ds-key")
+    router = ModelRouter(api_keys=["g1"])
+    _model_list, fallbacks = router._build_model_list_and_fallbacks()
+    fb = {k: v for d in fallbacks for k, v in d.items()}
+    assert "prism-embedding" not in fb
+    # And nothing falls back INTO embedding.
+    assert all("prism-embedding" not in targets for targets in fb.values())
 
 
 # ── Singleton lifecycle + acquire ────────────────────────────────────────
