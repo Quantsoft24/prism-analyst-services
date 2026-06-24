@@ -38,58 +38,84 @@ Tier = Literal["fast", "quality", "classify", "embedding"]
 
 class TierConfig(TypedDict):
     description: str
-    # Ordered model IDs in LiteLLM provider/model format.
-    # Earlier entries are preferred; later entries are fallbacks.
-    # The router replicates each entry per available API key.
+    # Ordered model IDs in LiteLLM ``provider/model`` format, listed in
+    # PROVIDER-PRIORITY order (e.g. all openai/* first, then deepseek/*, then
+    # gemini/*). The router groups consecutive same-provider models into
+    # sub-groups and chains them as strict fallbacks: the PRIMARY provider's
+    # group is fully exhausted/cooled before the next provider is touched
+    # (NOT load-balanced across providers — see ModelRouter
+    # ._build_model_list_and_fallbacks). Within one provider's group, multiple
+    # models + multiple API keys DO load-balance. A model whose provider key
+    # isn't configured is skipped, so the chain auto-collapses (e.g. with only
+    # Gemini keys set, a tier behaves exactly as the Gemini-only list it used
+    # to be).
     models: list[str]
-    # Per-deployment soft caps used by ``usage-based-routing-v2`` to spread
-    # load BEFORE we hit the actual provider's 429. Conservative defaults
-    # below the published free-tier RPM, to leave headroom.
+    # Per-deployment soft caps used by ``usage-based-routing-v2`` WITHIN a
+    # provider group. Conservative defaults below the published free-tier RPM.
     rpm: int
     tpm: int
 
 
-# ── Free-tier configuration (May 2026 Google AI Studio limits, 2 keys) ──
+# ── Provider-priority configuration: OpenAI (primary) → DeepSeek → Gemini ──
 #
-# Numbers are PER-KEY caps (not totals). Router multiplies by number of
-# configured keys at startup. Conservative — sits ~20% below published
-# Gemini AI Studio limits to absorb burst + clock drift.
+# Strategy (2026-06): OpenAI is primary (free daily-token program — 2.5M/day
+# across the mini pool, 250k/day across the large pool; paid overflow past
+# that), DeepSeek is the 1st fallback (cheap, OpenAI-compatible), Gemini the
+# 2nd fallback (free, multi-key — the final safety net). Map the chatty `fast`
+# orchestrator onto OpenAI's big *mini* pool and the low-volume `quality`
+# synthesis onto the scarcer *large* pool.
+#
+# MODEL-ID VERIFICATION (2026-06-13, against the live accounts):
+#   • OpenAI: gpt-5.4 / gpt-5.4-mini / gpt-5.4-nano all exist; gpt-5.4-mini
+#     verified to accept tool-calls + temperature=0.2 (no reasoning-model
+#     param restriction) → safe as the agent primary.
+#   • DeepSeek: the live model ids are `deepseek-v4-flash` / `deepseek-v4-pro`
+#     (NOT deepseek-chat/-reasoner). The key currently has NO balance
+#     ("Insufficient Balance") → DeepSeek deployments error-through to Gemini
+#     until the account is funded. That's fine (graceful), just inert for now.
+#   • gemini/* ids verified against AI Studio ListModels (2026-05).
+# A 404 on an unknown id is non-retryable — re-verify before adding new ids.
+# rpm/tpm are per-deployment caps WITHIN each provider group (per-key).
 TIER_CONFIGS: Final[dict[Tier, TierConfig]] = {
-    # NOTE: every model ID below is verified against the live AI Studio
-    # ListModels for this account (2026-05). Do NOT add a model name without
-    # confirming it exists — a 404 is non-retryable and kills the request with
-    # no fallback. `gemini-3-flash` (no suffix) does NOT exist; the real names
-    # are `gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-3.1-flash-lite`.
     "fast": {
         "description": "Tool-using agent steps, intent detection, Q&A. Function-calling required.",
-        # gemini-2.5-flash is PRIMARY: the company_intel orchestrator (the only
-        # `fast` consumer) needs strong instruction-following so it keeps the
-        # user's qualifiers (period/topic) in tool-call args. flash-lite drops
-        # them ("…board meetings 2025" → "summary of board meetings"), fetching
-        # the wrong data. flash-lite stays as a fast fallback for burst capacity.
+        # PRIMARY: OpenAI mini pool (2.5M/day free w/ data-sharing) — strong,
+        #   reliable tool-use for the company_intel orchestrator (only `fast`
+        #   consumer). FB1: DeepSeek v4-flash (cheap; inert until funded).
+        #   FB2: Gemini flash (free, multi-key) — keeps strong instruction-
+        #   following so tool-call qualifiers (period/topic) survive.
         "models": [
-            "gemini/gemini-2.5-flash",          # primary — best tool-use / instruction-following
-            "gemini/gemini-2.5-flash-lite",     # fast fallback — burst capacity
-            "gemini/gemini-3.1-flash-lite",     # newer-gen flash-lite — extra capacity
+            "openai/gpt-5.4-mini",              # PRIMARY (OpenAI mini pool)
+            "deepseek/deepseek-v4-flash",       # FB1 (DeepSeek)
+            "gemini/gemini-2.5-flash",          # FB2 primary Gemini — best tool-use
+            "gemini/gemini-2.5-flash-lite",     # FB2 burst capacity
+            "gemini/gemini-3.1-flash-lite",     # FB2 extra capacity
         ],
         "rpm": 12,
         "tpm": 200_000,
     },
     "quality": {
         "description": "Final answer composition, BMC drafting, multi-step reasoning.",
+        # PRIMARY: OpenAI large pool (250k/day free) — best synthesis/reasoning.
+        # FB1: DeepSeek v4-pro. FB2: Gemini pro/flash (free).
         "models": [
-            "gemini/gemini-2.5-flash",          # proven, strong for drafting
-            "gemini/gemini-2.5-pro",            # highest quality (low free RPD — used as needed)
-            "gemini/gemini-2.5-flash-lite",     # last resort so quality never 100% fails
+            "openai/gpt-5.4",                   # PRIMARY (OpenAI large pool)
+            "deepseek/deepseek-v4-pro",         # FB1 (DeepSeek)
+            "gemini/gemini-2.5-flash",          # FB2 — proven for drafting
+            "gemini/gemini-2.5-pro",            # FB2 — highest quality (low free RPD)
+            "gemini/gemini-2.5-flash-lite",     # FB2 — last resort so quality never 100% fails
         ],
         "rpm": 4,
         "tpm": 200_000,
     },
     "classify": {
         "description": "Pure classification/tagging — no tools. Cheap + abundant.",
+        # PRIMARY: OpenAI nano (mini pool, cheapest). FB1: DeepSeek. FB2: Gemini.
         "models": [
-            "gemini/gemini-2.5-flash-lite",     # cheap + reliable
-            "gemini/gemma-4-26b-a4b-it",        # high RPD, no tools needed here
+            "openai/gpt-5.4-nano",              # PRIMARY (OpenAI nano, mini pool)
+            "deepseek/deepseek-v4-flash",       # FB1
+            "gemini/gemini-2.5-flash-lite",     # FB2 — cheap + reliable
+            "gemini/gemma-4-26b-a4b-it",        # FB2 — high RPD
             "gemini/gemma-4-31b-it",
         ],
         "rpm": 12,
@@ -124,12 +150,16 @@ def virtual_model_name(tier: Tier) -> str:
 
 def tier_from_virtual(name: str) -> Tier | None:
     """Reverse lookup — useful when ADK hands us back a model name on an event.
-    Returns None if the name isn't one of ours (e.g. a direct model override)."""
+    Returns None if the name isn't one of ours (e.g. a direct model override).
+    Also resolves provider-fallback sub-group names (``prism-fast-fb1`` → ``fast``)
+    that the router creates for strict OpenAI→DeepSeek→Gemini failover."""
     if not name.startswith("prism-"):
         return None
     suffix = name[len("prism-") :]
-    if suffix in TIER_CONFIGS:
-        return suffix  # type: ignore[return-value]
+    # Strip a provider-fallback sub-group marker, e.g. "fast-fb1" → "fast".
+    base = suffix.split("-fb", 1)[0]
+    if base in TIER_CONFIGS:
+        return base  # type: ignore[return-value]
     return None
 
 
@@ -147,8 +177,16 @@ MODEL_PRICING_USD_PER_1M: Final[dict[str, tuple[float, float]]] = {
     "gemini/gemma-4-26b-a4b-it": (0.0, 0.0),
     "gemini/gemma-4-31b-it": (0.0, 0.0),
     "gemini/gemini-embedding-001": (0.0, 0.0),
+    # ── OpenAI (primary) — APPROXIMATE rates (USD/1M in,out); refine from the
+    #    billing dashboard. NOTE: with the data-sharing free program these are
+    #    effectively $0 until the daily budget (2.5M mini / 250k large), then
+    #    billed at ~these rates → this is a conservative cost CEILING. ──
+    "openai/gpt-5.4": (1.25, 10.00),         # large pool (quality primary)
+    "openai/gpt-5.4-mini": (0.25, 2.00),     # mini pool (fast primary)
+    "openai/gpt-5.4-nano": (0.05, 0.40),     # mini pool (classify primary)
+    # ── DeepSeek (1st fallback) — APPROXIMATE; verify when account is funded ──
+    "deepseek/deepseek-v4-flash": (0.28, 0.42),
+    "deepseek/deepseek-v4-pro": (0.55, 2.19),
     # ── Paid (Vertex AI, Mumbai region) — fill when migrating to paid ──
     # "vertex_ai/gemini-2.5-pro": (1.25, 5.00),
-    # "vertex_ai/gemini-3.1-pro": (1.25, 5.00),
-    # "bedrock/anthropic.claude-sonnet-4-6-v1:0": (3.00, 15.00),
 }

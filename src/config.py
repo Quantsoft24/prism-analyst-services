@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # ``quality`` tier without touching router code.
     OPENAI_API_KEY: str = ""
 
+    # ── LLM: DeepSeek (fallback after OpenAI, before Gemini) ──
+    # Blank by default — inert until set. When present, the router pairs any
+    # ``deepseek/<model>`` entries in a tier (``model_router_config.py``) with
+    # this key (via the generic ``<PROVIDER>_API_KEY`` convention in
+    # ``ModelRouter._keys_for_provider``). DeepSeek's API is OpenAI-compatible
+    # and cheap; used as the 1st fallback when the OpenAI group errors/cools.
+    DEEPSEEK_API_KEY: str = ""
+
     # ── LLM: OpenRouter (fallback) ──
     OPENROUTER_API_KEY: str = ""
 

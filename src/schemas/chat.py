@@ -249,6 +249,42 @@ class FinalFinancials(BaseModel):
     names: list[str] = Field(default_factory=list)
 
 
+class VisualPoint(BaseModel):
+    """One categorical/temporal datum in a chart visual."""
+
+    label: str
+    value: float
+
+
+class VisualKpi(BaseModel):
+    """One headline scalar metric in a KPI-strip visual."""
+
+    label: str
+    value: float
+    unit: str | None = None
+
+
+class Visual(BaseModel):
+    """UNIVERSAL, tool-agnostic chart/metric block, attached DETERMINISTICALLY by
+    the runner from ANY tool's result (see ``agent_runner._attach_visuals``) — NOT
+    composed by the LLM. The frontend renders it with a generic kind-switch
+    renderer (reusing the recharts primitives). Any current OR future tool that
+    returns a recognised shape (a list of ``{label,value}`` rows → bar/line, a
+    bounded metric → gauge, or named scalar metrics → KPI strip) gets an
+    interactive chart for free — no per-tool UI or runner code. ``financials_query``
+    is excluded: it has its own richer typed block (``FinalAnswer.financials``)."""
+
+    kind: Literal["line", "area", "bar", "gauge", "kpi"]
+    title: str | None = None
+    unit: str | None = None
+    orientation: Literal["vertical", "horizontal"] | None = None
+    series: list[VisualPoint] = Field(default_factory=list)   # line/area/bar
+    value: float | None = None                                # gauge (single bounded metric)
+    kpis: list[VisualKpi] = Field(default_factory=list)       # kpi strip
+    source_tool: str | None = None
+    call_id: str | None = None
+
+
 class FinalAnswer(BaseModel):
     """Structured answer payload. Replaces the bare string in ``FinalEvent.answer``.
 
@@ -275,6 +311,11 @@ class FinalAnswer(BaseModel):
     # the rich value-card / chart / table render under the prose. None when the
     # turn used no financials tool (or it clarified / errored).
     financials: FinalFinancials | None = None
+    # UNIVERSAL visualizations from NON-financials tools (technicals, news, …, and
+    # ANY future tool) — attached deterministically by the runner from recognised
+    # result shapes, rendered by a generic kind-switch renderer. financials uses
+    # its own richer `financials` block above.
+    visuals: list[Visual] = Field(default_factory=list)
 
 
 class FinalEvent(BaseModel):
