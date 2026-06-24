@@ -146,64 +146,102 @@ class ModelRouter:
         key = (getattr(settings, f"{provider.upper()}_API_KEY", "") or "").strip()
         return [key] if key else []
 
-    def _build_model_list_and_fallbacks(self) -> tuple[list[dict], list[dict]]:
-        """Expand TIER_CONFIGS × api_keys into a flat deployment list.
+    # Cross-tier safety net (HEADS only), appended AFTER a tier's own
+    # provider-failover chain. Free-tier Gemini still 503/429s, and a whole
+    # provider chain could (rarely) cool out — so each generative tier can
+    # still spill into another rather than failing the user. classify (no
+    # tools) spills into fast. Embedding is deliberately absent — mixing
+    # embedding models would corrupt the vector space.
+    _CROSS_TIER: dict[str, list[str]] = {
+        "fast": ["quality"],
+        "quality": ["fast"],
+        "classify": ["fast"],
+    }
 
-        Returns the ``model_list`` and ``fallbacks`` arguments LiteLLM
-        ``Router`` expects.
+    def _build_model_list_and_fallbacks(self) -> tuple[list[dict], list[dict]]:
+        """Expand TIER_CONFIGS × api_keys into a flat deployment list, grouped
+        by PROVIDER so providers fail over in strict priority order.
+
+        For each tier, models are bucketed by provider in first-appearance
+        order (e.g. openai → deepseek → gemini). Each bucket becomes its own
+        LiteLLM model group: the first available provider is the tier HEAD
+        (``prism-<tier>``, what ``acquire()`` returns); the rest are
+        ``prism-<tier>-fb1``, ``-fb2`` … chained as the head's ``fallbacks``.
+        LiteLLM only moves to the next provider group once the current one is
+        exhausted/cooled (it does NOT load-balance across providers) — within a
+        single provider group, multiple models + keys DO load-balance.
+
+        A model whose provider key isn't set is skipped, so the chain
+        auto-collapses: with only Gemini keys configured, a tier has a single
+        group named ``prism-<tier>`` — identical to the pre-multi-provider
+        behavior.
         """
         model_list: list[dict] = []
         self._deployments = []
 
+        # Pass 1 — bucket each tier's models by provider (first-appearance
+        # order), dropping providers with no key. Record which tiers built a
+        # head group (so cross-tier fallbacks only target real groups).
+        tier_groups: dict[str, list[tuple[str, list[str]]]] = {}
         for tier_name, config in TIER_CONFIGS.items():
-            virtual = virtual_model_name(tier_name)
+            order: list[str] = []
+            bucket: dict[str, list[str]] = {}
             for real_model in config["models"]:
-                # Provider-aware keys: each model uses the key pool for ITS
-                # provider (gemini/* → Gemini keys, openai/* → OPENAI_API_KEY,
-                # etc.). A model whose provider key isn't configured is skipped
-                # (no broken deployment) — so adding `openai/<model>` to a tier
-                # is inert until OPENAI_API_KEY is set.
                 provider = _provider_of(real_model)
-                keys = self._keys_for_provider(provider)
-                if not keys:
+                if not self._keys_for_provider(provider):
                     logger.info(
                         "Router: skipping %r in tier %r — no %s API key configured.",
                         real_model, tier_name, provider,
                     )
                     continue
-                for idx, api_key in enumerate(keys):
-                    spec = DeploymentSpec(
-                        virtual_name=virtual,
-                        real_model=real_model,
-                        api_key_index=idx,
-                        rpm=config["rpm"],
-                        tpm=config["tpm"],
-                    )
-                    self._deployments.append(spec)
-                    model_list.append(
-                        {
-                            "model_name": virtual,
-                            "litellm_params": {
-                                "model": real_model,
-                                "api_key": api_key,
-                            },
-                            "rpm": config["rpm"],
-                            "tpm": config["tpm"],
-                        }
-                    )
+                if provider not in bucket:
+                    bucket[provider] = []
+                    order.append(provider)
+                bucket[provider].append(real_model)
+            groups = [(p, bucket[p]) for p in order]
+            if groups:
+                tier_groups[tier_name] = groups
 
-        # Inter-tier fallback. Free-tier Gemini returns transient 503 ("model
-        # overloaded") and 429 constantly, so each generative tier MUST be able
-        # to spill into another rather than failing the user (this is what
-        # dropped a BMC block in the first live run). Both fast↔quality
-        # directions are wired since both support tool-calling; classify (no
-        # tools) spills into fast. Embedding is deliberately NOT in any chain —
-        # mixing embedding models would corrupt the vector space.
-        fallbacks: list[dict] = [
-            {"prism-fast": ["prism-quality"]},
-            {"prism-quality": ["prism-fast"]},
-            {"prism-classify": ["prism-fast"]},
-        ]
+        # Pass 2 — build deployments + per-tier fallback chains.
+        fallbacks: list[dict] = []
+        for tier_name, groups in tier_groups.items():
+            config = TIER_CONFIGS[tier_name]
+            head = virtual_model_name(tier_name)
+            # Group names: head, head-fb1, head-fb2, … (one per provider bucket).
+            group_names = [head] + [f"{head}-fb{i}" for i in range(1, len(groups))]
+            for gname, (_provider, models) in zip(group_names, groups):
+                keys = self._keys_for_provider(_provider)
+                for real_model in models:
+                    for idx, api_key in enumerate(keys):
+                        spec = DeploymentSpec(
+                            virtual_name=gname,
+                            real_model=real_model,
+                            api_key_index=idx,
+                            rpm=config["rpm"],
+                            tpm=config["tpm"],
+                        )
+                        self._deployments.append(spec)
+                        model_list.append(
+                            {
+                                "model_name": gname,
+                                "litellm_params": {
+                                    "model": real_model,
+                                    "api_key": api_key,
+                                },
+                                "rpm": config["rpm"],
+                                "tpm": config["tpm"],
+                            }
+                        )
+            # Head's fallback chain: this tier's provider sub-groups (fb1, fb2…)
+            # then the cross-tier heads that actually built.
+            chain = group_names[1:]
+            for xt in self._CROSS_TIER.get(tier_name, []):
+                xt_head = virtual_model_name(xt)
+                if xt in tier_groups and xt_head not in chain and xt_head != head:
+                    chain.append(xt_head)
+            if chain:
+                fallbacks.append({head: chain})
+
         return model_list, fallbacks
 
     # ── Public API ────────────────────────────────────────────────────────

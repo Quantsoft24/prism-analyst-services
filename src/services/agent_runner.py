@@ -62,6 +62,9 @@ from src.schemas.chat import (
     ToolCallEvent,
     ToolResultEvent,
     ToolRetryEvent,
+    Visual,
+    VisualKpi,
+    VisualPoint,
 )
 from src.services.deep_dive import synthesize as synthesize_deep_dive
 
@@ -717,14 +720,22 @@ class AgentRunner:
         # LLM-composed prose. (Same trust model as filing citations / BMC.)
         structured = _merge_financials(structured, self._tool_trace)
 
-        # Strip page-LESS citation markers the model sometimes invents for
-        # financial numbers (e.g. "[TCS | p.N]", "[Infosys Ltd. | ]") — those
-        # have no real page and would render as ugly literal text. A valid filing
-        # citation ALWAYS has a digit page (`[Co | p.44]`), so this only removes
-        # the broken ones; real filing/BMC cites are untouched.
-        prose = _strip_pageless_cites(prose)
+        # UNIVERSAL visuals from NON-financials tools (technicals, news, …, and any
+        # future tool) — deterministic, tool-agnostic shape detection. Additive:
+        # no-op when no tool returned a recognised chartable shape.
+        structured = _attach_visuals(structured, self._tool_trace)
+
+        # Deterministic answer hygiene (the model ignores prompt rules for these):
+        #  • page-less `[X | …]` cites on financial numbers → removed,
+        #  • machinery leaks (citation-absence Notes, "tool output/evidence", raw
+        #    status dumps) → removed,
+        #  • internal `security_id` (rows + inline) → removed.
+        # Table de-duplication is intentionally OFF (user: keep duplication as-is).
+        prose = _clean_answer_text(prose)
         if structured is not None and structured.text:
-            structured = structured.model_copy(update={"text": _strip_pageless_cites(structured.text)})
+            structured = structured.model_copy(
+                update={"text": _clean_answer_text(structured.text)}
+            )
 
         # Safety net for the "still no prose" case — the quality composer ran
         # above for substantive turns; this catches (a) trivial turns where the
@@ -2140,6 +2151,105 @@ def _strip_pageless_cites(text: str) -> str:
     return _PAGELESS_CITE_RE.sub("", text)
 
 
+# Prose that LEAKS internal machinery — the model keeps editorialising about
+# citation availability / tool output / raw status despite prompt rules, so we
+# strip it deterministically. Phrases are distinctive enough that legitimate
+# analyst notes ("All figures are consolidated", "operating margin = PBIT/Revenue",
+# "Data freshness is live") contain NONE of them and survive.
+_MACHINERY_PHRASES = re.compile(
+    r"(tool output|tool evidence|filing[- ]page citation|page citations?|"
+    r"citation strings?|references to attach|no filing excerpts|"
+    r"the evidence is from|included in the evidence|"
+    r"empty_history|all key fields were null)",
+    re.IGNORECASE,
+)
+# Raw status dump inside a sentence or table cell (e.g. "status: empty_history; …").
+_RAW_STATUS_RE = re.compile(
+    r"\bstatus:\s*\w+\s*;?\s*(all key fields were null[^|\n]*)?", re.IGNORECASE,
+)
+_ORPHAN_NOTE_RE = re.compile(r"(?im)^\s*\*{0,2}Notes?\*{0,2}:?\s*$")
+# Internal security_id — as a markdown table row, or inline "— security_id 84".
+_SECID_ROW_RE = re.compile(r"(?im)^\s*\|\s*security[ _]?id\b[^\n]*\n?")
+_SECID_INLINE_RE = re.compile(r"(?i)\s*[—–-]?\s*\bsecurity[ _]?id\b\s*[:#]?\s*\d+")
+
+
+def _strip_machinery_notes(text: str) -> str:
+    """Remove machinery-leaking prose: citation-absence commentary, 'tool
+    output/evidence' talk, raw status dumps. Operates on whole PROSE lines (never
+    on `|`-table rows, to keep tables intact) plus a targeted status-dump regex."""
+    if not text:
+        return text
+    text = _RAW_STATUS_RE.sub("", text)  # kill raw status dumps even inside cells
+    kept: list[str] = []
+    for line in text.split("\n"):
+        if not line.lstrip().startswith("|") and _MACHINERY_PHRASES.search(line):
+            continue  # drop the machinery prose line
+        kept.append(line)
+    text = "\n".join(kept)
+    # Drop an orphan "Note(s)" heading left with no body (next non-blank is blank/EOF).
+    lines = text.split("\n")
+    out: list[str] = []
+    for i, line in enumerate(lines):
+        if _ORPHAN_NOTE_RE.match(line):
+            nxt = next((ln for ln in lines[i + 1:] if ln.strip()), "")
+            if not nxt:
+                continue  # nothing follows → orphan heading, drop it
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def _strip_security_id(text: str) -> str:
+    """Remove the internal `security_id` — a 'Security ID' table row or an inline
+    '— security_id 84'. Users must never see it."""
+    if not text:
+        return text
+    text = _SECID_ROW_RE.sub("", text)
+    text = _SECID_INLINE_RE.sub("", text)
+    return text
+
+
+# GFM markdown table = a pipe row followed by a dashed separator row.
+_MD_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+_MD_TABLE_SEP = re.compile(r"^\s*\|[\s:|-]*\|\s*$")
+
+
+def _strip_markdown_tables(text: str) -> str:
+    """Remove GFM markdown tables from prose. Called ONLY when the structured
+    render is ITSELF a table (statement/screen) — there the model's table is a
+    duplicate. (No-duplicate-TABLES; table+chart stays — see caller gate.)"""
+    if not text or "|" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if (
+            _MD_TABLE_ROW.match(lines[i])
+            and i + 1 < n
+            and _MD_TABLE_SEP.match(lines[i + 1])
+            and "-" in lines[i + 1]
+        ):
+            i += 2
+            while i < n and _MD_TABLE_ROW.match(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def _clean_answer_text(text: str, strip_tables: bool = False) -> str:
+    """Apply all deterministic answer-prose cleanups in order. ``strip_tables``
+    removes the model's markdown table — DISABLED by default per the user (keep
+    table+structured duplication as-is); the option is retained for later."""
+    text = _strip_pageless_cites(text)
+    text = _strip_machinery_notes(text)
+    text = _strip_security_id(text)
+    if strip_tables:
+        text = _strip_markdown_tables(text)
+    return text
+
+
 def _merge_financials(
     structured: FinalAnswer | None, tool_trace: list[dict[str, Any]],
 ) -> FinalAnswer | None:
@@ -2189,6 +2299,130 @@ def _merge_financials(
     if not has_content:
         return structured
     return structured.model_copy(update={"financials": block})
+
+
+# ── Universal visualizations (Phase 2) ──────────────────────────────────────
+# Tool-AGNOSTIC: any tool's result is matched against generic shapes → Visuals,
+# rendered by a generic kind-switch renderer on the client. Adding a new tool
+# needs NO code here as long as it returns a recognised shape (a list of rows
+# with a known value key → bar, a `sentiment_breakdown` dict → bar, or a mapped
+# scalar metric → KPI), or the tool emits Visuals directly. financials_query is
+# excluded — it has its own richer typed block (``FinalAnswer.financials``).
+
+# Declarative scalar-metric specs — matched against any result's top-level keys
+# to build a KPI strip. Extend by adding a row (data, not code).
+_METRIC_SPECS: dict[str, dict[str, Any]] = {
+    "current_price": {"label": "Price", "unit": "₹"},
+    "fifty_two_week_high": {"label": "52w high", "unit": "₹"},
+    "fifty_two_week_low": {"label": "52w low", "unit": "₹"},
+    "ma_20": {"label": "MA 20", "unit": "₹"},
+    "ma_50": {"label": "MA 50", "unit": "₹"},
+    "ma_200": {"label": "MA 200", "unit": "₹"},
+    "rsi_14": {"label": "RSI (14)", "unit": ""},
+    "avg_score": {"label": "Avg sentiment", "unit": ""},
+    "total_articles": {"label": "Articles", "unit": ""},
+}
+# Row label / numeric-value candidate keys for generic list→bar detection.
+_BAR_LABEL_KEYS = ("name", "company", "label", "symbol", "key")
+_BAR_VALUE_KEYS = ("value", "avg_score", "mentions", "score", "count")
+_MAX_VISUALS_PER_TOOL = 3
+
+
+def _num(v: Any) -> float | None:
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _bar_from_rows(rows: list[Any], title: str) -> Visual | None:
+    """A list of dict rows → a bar visual, IF each row exposes a recognised label
+    (name/company/…) + numeric value (value/avg_score/mentions/…). Rows without a
+    value key are skipped, so article/filing lists never become charts."""
+    pts: list[VisualPoint] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        label = next((str(r[k]) for k in _BAR_LABEL_KEYS if isinstance(r.get(k), str)), None)
+        val = next((_num(r.get(k)) for k in _BAR_VALUE_KEYS if _num(r.get(k)) is not None), None)
+        if label is None or val is None:
+            continue
+        pts.append(VisualPoint(label=label, value=val))
+    if len(pts) < 2:
+        return None
+    if not any(p.value for p in pts):  # all-zero → no-data, skip the empty chart
+        return None
+    longest = max((len(p.label) for p in pts), default=0)
+    horizontal = len(pts) > 6 or longest > 12
+    return Visual(kind="bar", title=title, orientation="horizontal" if horizontal else "vertical", series=pts)
+
+
+def _visuals_from_response(tool: str, resp: dict[str, Any], call_id: str | None) -> list[Visual]:
+    out: list[Visual] = []
+    # (a) any top-level list of rows with a recognised label + numeric value → bar
+    for key, val in resp.items():
+        if isinstance(val, list) and val:
+            bar = _bar_from_rows(val, str(key).replace("_", " ").capitalize())
+            if bar is not None:
+                out.append(bar)
+    # (b) a top-level sentiment_breakdown dict → bar (skip an all-zero no-data set)
+    sb = resp.get("sentiment_breakdown")
+    if isinstance(sb, dict):
+        pts = [VisualPoint(label=str(k).capitalize(), value=n)
+               for k, v in sb.items() if (n := _num(v)) is not None]
+        if len(pts) >= 2 and any(p.value for p in pts):
+            out.append(Visual(kind="bar", title="Sentiment", orientation="vertical", series=pts))
+    # (c) mapped scalar metrics → a single KPI strip (skip if every metric is 0)
+    kpis = [VisualKpi(label=spec["label"], value=n, unit=spec.get("unit") or None)
+            for key, spec in _METRIC_SPECS.items() if (n := _num(resp.get(key))) is not None]
+    if kpis and any(k.value for k in kpis):
+        out.append(Visual(kind="kpi", kpis=kpis))
+    out = out[:_MAX_VISUALS_PER_TOOL]
+    for v in out:
+        v.source_tool, v.call_id = tool, call_id
+    return out
+
+
+def _attach_visuals(
+    structured: FinalAnswer | None, tool_trace: list[dict[str, Any]],
+) -> FinalAnswer | None:
+    """Attach UNIVERSAL Visuals from tool results (deterministic, not LLM-composed).
+    Tool-agnostic shape detection — see ``Visual``. For ``financials_query`` it
+    emits a comparison BAR per metric so a multi-metric peer comparison charts
+    EVERY metric — EXCEPT the last financials call, which ``_merge_financials``
+    already renders (so no duplicate of that one). No-op when nothing is chartable."""
+    if structured is None:
+        return structured
+    # Index of the financials call _merge_financials renders (the last successful one).
+    fin_idxs = [
+        i for i, e in enumerate(tool_trace)
+        if str(e.get("tool")) == "financials_query"
+        and isinstance(e.get("response"), dict)
+        and "operation" in e["response"]
+        and not (e["response"].get("ok") is False or e["response"].get("needs_clarification"))
+    ]
+    last_fin_idx = fin_idxs[-1] if fin_idxs else -1
+
+    visuals: list[Visual] = []
+    for i, entry in enumerate(tool_trace):
+        tool = str(entry.get("tool", ""))
+        resp = entry.get("response")
+        if not tool or not isinstance(resp, dict):
+            continue
+        if resp.get("ok") is False or resp.get("needs_clarification"):
+            continue
+        if tool == "financials_query":
+            # Per-metric comparison bars for the compares NOT shown by the
+            # financials block (the last one) — so every metric of a multi-metric
+            # comparison gets a chart, with no duplicate of the block's metric.
+            if i != last_fin_idx and resp.get("operation") == "compare" and resp.get("comparison"):
+                title = str((resp.get("field") or {}).get("label") or "Comparison")
+                bar = _bar_from_rows([r for r in resp["comparison"] if isinstance(r, dict)], title)
+                if bar is not None:
+                    bar.source_tool, bar.call_id = tool, entry.get("call_id")
+                    visuals.append(bar)
+            continue
+        visuals.extend(_visuals_from_response(tool, resp, entry.get("call_id")))
+    if not visuals:
+        return structured
+    return structured.model_copy(update={"visuals": [*structured.visuals, *visuals]})
 
 
 def _synthesize_empty_answer_fallback(tool_trace: list[dict[str, Any]]) -> str:
